@@ -1,0 +1,19 @@
+node_modules/
+.next/
+out/
+dist/
+build/
+
+# env — never commit real secrets, only .env.example
+.env
+.env.*
+!.env.example
+
+*.log
+npm-debug.log*
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.tsbuildinfo
+coverage/

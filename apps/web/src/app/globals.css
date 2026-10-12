@@ -1,0 +1,57 @@
+@import 'tailwindcss';
+
+/* Dark mode follows the OS preference (Tailwind v4 default `dark:` variant). */
+
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    sans-serif;
+
+  /* Brand — a safe/vault feel: deep slate with an amber accent. */
+  --color-brand-50: #eef5ff;
+  --color-brand-100: #d9e8ff;
+  --color-brand-200: #bcd7ff;
+  --color-brand-300: #8ebdff;
+  --color-brand-400: #5998fb;
+  --color-brand-500: #3475f0;
+  --color-brand-600: #2059dc;
+  --color-brand-700: #1c46b2;
+  --color-brand-800: #1c3c8c;
+  --color-brand-900: #1c376f;
+  --color-brand-950: #152344;
+}
+
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  background-color: var(--color-slate-50);
+  color: var(--color-slate-900);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background-color: var(--color-slate-950);
+    color: var(--color-slate-100);
+  }
+}
+
+/* Visible focus ring for keyboard users on every interactive element. */
+:focus-visible {
+  outline: 2px solid var(--color-brand-500);
+  outline-offset: 2px;
+}
+
+/* Hide the browser's own password reveal control — we ship our own toggle. */
+input::-ms-reveal,
+input::-ms-clear {
+  display: none;
+}
