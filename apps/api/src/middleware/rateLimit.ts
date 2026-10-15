@@ -29,6 +29,12 @@ export interface RateLimitConfig {
   createOrder: LimitSpec;
   /** Per-user limiter on /payments/verify. */
   verifyPayment: LimitSpec;
+  /**
+   * Per-admin limiter on admin write routes. Generous, because a legitimate
+   * bulk import session is bursty — it exists to bound a runaway script or a
+   * compromised admin session, not to pace normal work.
+   */
+  adminWrite: LimitSpec;
 }
 
 export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
@@ -38,6 +44,7 @@ export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
   authIdentifier: { windowMs: 15 * 60 * 1000, limit: 5 },
   createOrder: { windowMs: 10 * 60 * 1000, limit: 5 },
   verifyPayment: { windowMs: 10 * 60 * 1000, limit: 20 },
+  adminWrite: { windowMs: 5 * 60 * 1000, limit: 60 },
 };
 
 const TOO_MANY_ATTEMPTS = 'Too many attempts. Please wait a few minutes and try again.';
@@ -117,6 +124,7 @@ export interface Limiters {
   authIdentifier: ReturnType<typeof rateLimit>;
   createOrder: ReturnType<typeof rateLimit>;
   verifyPayment: ReturnType<typeof rateLimit>;
+  adminWrite: ReturnType<typeof rateLimit>;
 }
 
 export function createLimiters(
@@ -177,6 +185,18 @@ export function createLimiters(
         },
       },
       stores.verifyPayment,
+    ),
+
+    adminWrite: build(
+      config.adminWrite,
+      'Too many admin actions in a short time. Please wait a moment and try again.',
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `admin:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.adminWrite,
     ),
   };
 }

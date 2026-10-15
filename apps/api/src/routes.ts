@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import type { Limiters } from './middleware/rateLimit';
 import { checkDatabase } from './lib/prisma';
+import { createAdminRouter } from './modules/admin/admin.routes';
 import { createAuthRouter } from './modules/auth/auth.routes';
 import { createDevicesRouter } from './modules/devices/devices.routes';
 import { createPaymentsRouter } from './modules/payments/payments.routes';
@@ -29,6 +30,7 @@ export function createApiRouter(limiters: Limiters): Router {
   router.use('/auth', createAuthRouter(limiters));
   router.use('/payments', createPaymentsRouter(limiters));
   router.use('/devices', createDevicesRouter());
+  router.use('/admin', createAdminRouter(limiters));
 
   return router;
 }

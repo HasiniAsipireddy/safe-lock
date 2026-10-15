@@ -32,6 +32,7 @@ export function app(options: CreateAppOptions = {}): Express {
       authIdentifier: { windowMs: 60_000, limit: 1000 },
       createOrder: { windowMs: 60_000, limit: 1000 },
       verifyPayment: { windowMs: 60_000, limit: 1000 },
+      adminWrite: { windowMs: 60_000, limit: 1000 },
       ...options.rateLimits,
     },
   });
@@ -143,6 +144,11 @@ export function cookieValue(
   if (!header) return undefined;
   const value = header.slice(name.length + 1).split(';')[0];
   return value ? decodeURIComponent(value) : undefined;
+}
+
+/** An ADMIN user with a ready-to-send session cookie. */
+export function createTestAdmin(): Promise<TestUser> {
+  return createTestUser({ role: 'ADMIN', name: 'Test Admin' });
 }
 
 // --- Device helpers ----------------------------------------------------------
