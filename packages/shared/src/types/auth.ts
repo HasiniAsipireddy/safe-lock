@@ -10,6 +10,14 @@ export interface PublicUser {
   phone: string;
   role: UserRole;
   createdAt: string;
+  /**
+   * True once the user has a server-verified `PAID` payment. Derived on every
+   * request — it is not a column, and a client cannot set it.
+   *
+   * The UI uses it to decide whether to show the "Complete payment" banner;
+   * actual gating is the API's `requirePaid` middleware.
+   */
+  hasPaid: boolean;
 }
 
 /** Response body of `POST /auth/login`, `POST /auth/signup` and `GET /auth/me`. */
@@ -24,5 +32,10 @@ export interface ApiErrorBody {
     message: string;
     /** Optional per-field messages for VALIDATION_ERROR. */
     fields?: Record<string, string>;
+    /**
+     * Correlation id, also sent as the `X-Request-Id` response header. Quote
+     * it in a support request to find the exact server-side log lines.
+     */
+    requestId?: string;
   };
 }

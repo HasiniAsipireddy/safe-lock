@@ -1,0 +1,182 @@
+import crypto from 'node:crypto';
+import rateLimit, { ipKeyGenerator, type Options, type Store } from 'express-rate-limit';
+import { ERROR_CODES, type ApiErrorBody } from '@safelock/shared';
+
+/**
+ * Rate limiters, built from a factory so limits and stores are injectable.
+ *
+ * Deliberately **not** skipped under NODE_ENV=test: a limiter that is disabled
+ * in the only environment that could test it is a limiter nobody has ever
+ * seen work. Tests build an app with small limits instead and assert the 429.
+ *
+ * The in-memory store is per-process, so each `createApp()` gets its own
+ * counters. A multi-instance deployment needs a shared store or the effective
+ * limit is multiplied by the instance count.
+ * TODO(scale): swap in a Redis store before running more than one instance.
+ */
+
+export interface LimitSpec {
+  windowMs: number;
+  limit: number;
+}
+
+export interface RateLimitConfig {
+  /** Per-IP limiter on /auth/login and /auth/signup. */
+  auth: LimitSpec;
+  /** Per-identifier (hashed email/phone) limiter on the same two routes. */
+  authIdentifier: LimitSpec;
+  /** Per-user limiter on /payments/order. */
+  createOrder: LimitSpec;
+  /** Per-user limiter on /payments/verify. */
+  verifyPayment: LimitSpec;
+}
+
+export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
+  auth: { windowMs: 15 * 60 * 1000, limit: 10 },
+  // Tighter than the per-IP limb: a single account being hammered from many
+  // addresses is the attack the per-IP limiter cannot see.
+  authIdentifier: { windowMs: 15 * 60 * 1000, limit: 5 },
+  createOrder: { windowMs: 10 * 60 * 1000, limit: 5 },
+  verifyPayment: { windowMs: 10 * 60 * 1000, limit: 20 },
+};
+
+const TOO_MANY_ATTEMPTS = 'Too many attempts. Please wait a few minutes and try again.';
+const TOO_MANY_PAYMENTS = 'Too many payment attempts. Please wait a few minutes and try again.';
+
+function rejection(message: string): Pick<Options, 'handler'> {
+  return {
+    handler: (req, res) => {
+      const body: ApiErrorBody = {
+        error: { code: ERROR_CODES.RATE_LIMITED, message, requestId: req.id },
+      };
+      res.status(429).json(body);
+    },
+  };
+}
+
+function build(spec: LimitSpec, message: string, extra: Partial<Options>, store?: Store) {
+  return rateLimit({
+    windowMs: spec.windowMs,
+    limit: spec.limit,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    ...rejection(message),
+    ...(store ? { store } : {}),
+    ...extra,
+  });
+}
+
+/**
+ * About the inline `ipKeyGenerator(req.ip)` calls below.
+ *
+ * It collapses an IPv6 address to its /64 prefix — keying on the raw address
+ * would let an IPv6 client rotate through the addresses it already controls
+ * and get a fresh quota for each one.
+ *
+ * The call is repeated inline in every `keyGenerator` rather than factored
+ * into a helper on purpose: express-rate-limit statically inspects each
+ * keyGenerator's source for this call and emits ERR_ERL_KEY_GEN_IPV6 at
+ * startup if it cannot see it. Behind a helper the behaviour is correct but
+ * the warning fires anyway, which trains people to ignore startup warnings.
+ */
+
+/**
+ * Extracts the account identifier a request is attempting, for the
+ * per-identifier limiter.
+ *
+ * Login sends `identifier` (email or phone); signup sends `email` and `phone`.
+ * The value is lowercased and trimmed first so `Foo@Example.com ` and
+ * `foo@example.com` share one bucket.
+ */
+function extractIdentifier(body: unknown): string | null {
+  if (!body || typeof body !== 'object') return null;
+  const candidate = body as Record<string, unknown>;
+
+  for (const field of ['identifier', 'email', 'phone'] as const) {
+    const value = candidate[field];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim().toLowerCase();
+    }
+  }
+  return null;
+}
+
+/**
+ * Hashes the identifier before it is used as a rate-limit key.
+ *
+ * The key lives in the limiter's store (and would live in Redis later). A
+ * plaintext email there is a list of registered users sitting outside the
+ * database; a SHA-256 is not.
+ */
+export function hashIdentifier(identifier: string): string {
+  return crypto.createHash('sha256').update(identifier).digest('hex');
+}
+
+export interface Limiters {
+  auth: ReturnType<typeof rateLimit>;
+  authIdentifier: ReturnType<typeof rateLimit>;
+  createOrder: ReturnType<typeof rateLimit>;
+  verifyPayment: ReturnType<typeof rateLimit>;
+}
+
+export function createLimiters(
+  config: RateLimitConfig = DEFAULT_RATE_LIMITS,
+  stores: Partial<Record<keyof RateLimitConfig, Store>> = {},
+): Limiters {
+  return {
+    auth: build(
+      config.auth,
+      TOO_MANY_ATTEMPTS,
+      { keyGenerator: (req) => (req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown') },
+      stores.auth,
+    ),
+
+    /**
+     * Per-identifier limb.
+     *
+     * The 429 is byte-identical whether or not the account exists — the
+     * limiter runs before any database lookup, and the response carries no
+     * account-specific detail. Otherwise this endpoint would become an
+     * account-enumeration oracle: "rate limited" would mean "real account".
+     *
+     * A request with no parseable identifier (malformed body) is keyed by IP
+     * so it still costs the caller something.
+     */
+    authIdentifier: build(
+      config.authIdentifier,
+      TOO_MANY_ATTEMPTS,
+      {
+        keyGenerator: (req) => {
+          const identifier = extractIdentifier(req.body);
+          if (identifier) return `id:${hashIdentifier(identifier)}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.authIdentifier,
+    ),
+
+    createOrder: build(
+      config.createOrder,
+      TOO_MANY_PAYMENTS,
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.createOrder,
+    ),
+
+    verifyPayment: build(
+      config.verifyPayment,
+      'Too many verification attempts. Please wait a few minutes and try again.',
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.verifyPayment,
+    ),
+  };
+}

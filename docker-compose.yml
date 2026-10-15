@@ -1,0 +1,33 @@
+# Local development database for the Safe Lock platform.
+#
+# Host port 5433 is used on purpose: the dev machine already runs a local
+# PostgreSQL 16 service on the default 5432, and this container must not clash
+# with it. Inside the container Postgres still listens on 5432.
+#
+# These credentials are development-only. Production uses a managed database
+# with secrets supplied through the environment.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: safelock-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: safelock
+      POSTGRES_PASSWORD: safelock_dev_only
+      POSTGRES_DB: safelock
+    ports:
+      - '5433:5432'
+    volumes:
+      - safelock-pgdata:/var/lib/postgresql/data
+      # Runs once, on an empty data directory, to add the test database.
+      - ./docker/postgres/init-test-db.sh:/docker-entrypoint-initdb.d/init-test-db.sh:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U safelock -d safelock']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  safelock-pgdata:

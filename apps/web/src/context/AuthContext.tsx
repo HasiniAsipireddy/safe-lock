@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from 'react';
 import type { AuthResponse, LoginInput, PublicUser, SignupInput } from '@safelock/shared';
-import { api } from '@/lib/api';
+import { api, registerUnauthorizedHandler } from '@/lib/api';
 import { ApiError } from '@/lib/apiError';
 
 export type AuthStatus = 'loading' | 'authenticated' | 'unauthenticated';
@@ -21,6 +21,11 @@ export interface AuthContextValue {
   login: (input: LoginInput) => Promise<PublicUser>;
   signup: (input: SignupInput) => Promise<PublicUser>;
   logout: () => Promise<void>;
+  /**
+   * Re-reads `GET /auth/me`. Needed after anything that changes server-side
+   * state the UI branches on — notably `hasPaid` once a payment is verified.
+   */
+  refreshUser: () => Promise<PublicUser | null>;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -35,6 +40,20 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<PublicUser | null>(null);
   const [status, setStatus] = useState<AuthStatus>('loading');
+
+  /**
+   * The API client calls this when a request 401s and the session could not be
+   * refreshed. Dropping the cached user is what makes the route guards send
+   * the visitor to /login — the client cannot inspect the httpOnly cookie, so
+   * this is how it learns the session ended.
+   */
+  useEffect(() => {
+    registerUnauthorizedHandler(() => {
+      setUser(null);
+      setStatus('unauthenticated');
+    });
+    return () => registerUnauthorizedHandler(null);
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -94,9 +113,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const refreshUser = useCallback(async () => {
+    try {
+      const { user: me } = await api.get<AuthResponse>('/auth/me');
+      setUser(me);
+      setStatus('authenticated');
+      return me;
+    } catch (error) {
+      // A 401 means the session ended; anything else leaves the cached user
+      // alone rather than signing someone out over a flaky network.
+      if (error instanceof ApiError && error.status === 401) {
+        setUser(null);
+        setStatus('unauthenticated');
+      }
+      return null;
+    }
+  }, []);
+
   const value = useMemo<AuthContextValue>(
-    () => ({ user, status, login, signup, logout }),
-    [user, status, login, signup, logout],
+    () => ({ user, status, login, signup, logout, refreshUser }),
+    [user, status, login, signup, logout, refreshUser],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

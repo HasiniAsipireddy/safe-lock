@@ -17,7 +17,11 @@ import {
   classifyIdentifier,
   type ApiErrorBody,
   type AuthResponse,
+  type CreateOrderResponse,
+  type PaymentMeResponse,
+  type PaymentSummary,
   type PublicUser,
+  type VerifyPaymentResponse,
 } from '@safelock/shared';
 import { apiErrorFromBody } from './apiError';
 import type { HttpMethod } from './api';
@@ -25,10 +29,24 @@ import type { HttpMethod } from './api';
 const LATENCY_MS = 650;
 const SESSION_KEY = 'safelock.mock.session';
 
+/** Mock activation price in paise. Mirrors the API's SAFE_PRICE_PAISE default. */
+const MOCK_PRICE_PAISE = 99_900;
+
+/**
+ * The only "signature" the mock verify endpoint accepts.
+ *
+ * It is not a real HMAC and could not pass the API's `timingSafeEqual` check —
+ * it exists so the mock /pay flow exercises the same request shape as the real
+ * one. The real signature is computed by Razorpay and checked server-side.
+ */
+export const MOCK_CHECKOUT_SIGNATURE = '0'.repeat(64);
+
 interface MockAccount {
   user: PublicUser;
   /** Mock-only, in memory, never persisted and never logged. */
   password: string;
+  /** Payment attempts for this account, newest last. */
+  payments: PaymentSummary[];
 }
 
 const accounts: MockAccount[] = [
@@ -40,8 +58,11 @@ const accounts: MockAccount[] = [
       phone: '9876543210',
       role: 'USER',
       createdAt: new Date('2026-01-01T00:00:00.000Z').toISOString(),
+      // Starts unpaid so the /pay flow can be walked through end to end.
+      hasPaid: false,
     },
     password: 'Demo1234',
+    payments: [],
   },
 ];
 
@@ -98,6 +119,14 @@ export async function mockRequest<T>(
       return null as T;
     case 'GET /auth/me':
       return handleMe() as T;
+    case 'POST /auth/refresh':
+      return handleRefresh() as T;
+    case 'GET /payments/me':
+      return handlePaymentMe() as T;
+    case 'POST /payments/order':
+      return handleCreateOrder() as T;
+    case 'POST /payments/verify':
+      return handleVerifyPayment(body) as T;
     default:
       return fail(
         404,
@@ -175,14 +204,31 @@ function handleSignup(body: unknown): AuthResponse {
     phone,
     role: 'USER',
     createdAt: new Date().toISOString(),
+    hasPaid: false,
   };
 
-  accounts.push({ user, password: input.password });
+  accounts.push({ user, password: input.password, payments: [] });
   setSessionUserId(user.id);
   return { user };
 }
 
 function handleMe(): AuthResponse {
+  return { user: requireAccount().user };
+}
+
+/**
+ * Stand-in for `POST /auth/refresh`.
+ *
+ * The mock has no access-token expiry to recover from, so this just confirms
+ * the fake session is still there. It exists so the API client's
+ * refresh-and-retry path resolves in mock mode instead of 404ing.
+ */
+function handleRefresh(): AuthResponse {
+  return { user: requireAccount().user };
+}
+
+/** The signed-in mock account, or a 401 exactly as the API would answer. */
+function requireAccount(): MockAccount {
   const id = getSessionUserId();
   const account = id ? accounts.find((candidate) => candidate.user.id === id) : undefined;
 
@@ -191,5 +237,98 @@ function handleMe(): AuthResponse {
     return fail(401, ERROR_CODES.UNAUTHENTICATED, 'You are not signed in.');
   }
 
-  return { user: account.user };
+  return account;
+}
+
+// --- Payments ----------------------------------------------------------------
+
+function latestPayment(account: MockAccount): PaymentSummary | null {
+  return account.payments.at(-1) ?? null;
+}
+
+function handlePaymentMe(): PaymentMeResponse {
+  const account = requireAccount();
+
+  return {
+    hasPaid: account.user.hasPaid,
+    payment: latestPayment(account),
+    priceInPaise: MOCK_PRICE_PAISE,
+    currency: 'INR',
+  };
+}
+
+function handleCreateOrder(): CreateOrderResponse {
+  const account = requireAccount();
+
+  if (account.user.hasPaid) {
+    return fail(
+      409,
+      ERROR_CODES.ALREADY_PAID,
+      'This account has already been activated. No further payment is needed.',
+    );
+  }
+
+  const suffix = Math.random().toString(36).slice(2, 12);
+  const payment: PaymentSummary = {
+    id: `pay_row_mock_${suffix}`,
+    amount: MOCK_PRICE_PAISE,
+    currency: 'INR',
+    status: 'CREATED',
+    razorpayOrderId: `order_mock${suffix}`,
+    createdAt: new Date().toISOString(),
+    paidAt: null,
+  };
+  account.payments.push(payment);
+
+  return {
+    orderId: payment.razorpayOrderId,
+    amount: payment.amount,
+    currency: payment.currency,
+    // A fake publishable key. The real one comes from the API's config, and
+    // the key *secret* exists only on the server in either mode.
+    keyId: 'rzp_test_mock_key_id',
+    paymentId: payment.id,
+  };
+}
+
+function handleVerifyPayment(body: unknown): VerifyPaymentResponse {
+  const account = requireAccount();
+  const input = (body ?? {}) as {
+    razorpay_order_id?: string;
+    razorpay_payment_id?: string;
+    razorpay_signature?: string;
+  };
+
+  const payment = account.payments.find(
+    (candidate) => candidate.razorpayOrderId === input.razorpay_order_id,
+  );
+
+  if (!payment) {
+    return fail(
+      404,
+      ERROR_CODES.NOT_FOUND,
+      'We could not find that payment. Please start the payment again.',
+    );
+  }
+
+  // Idempotent, like the API: a repeat call returns the settled row.
+  if (payment.status === 'PAID') {
+    return { payment, hasPaid: true };
+  }
+
+  if (input.razorpay_signature !== MOCK_CHECKOUT_SIGNATURE) {
+    return fail(
+      400,
+      ERROR_CODES.INVALID_SIGNATURE,
+      'We could not verify this payment. Please contact support before paying again.',
+    );
+  }
+
+  payment.status = 'PAID';
+  payment.paidAt = new Date().toISOString();
+  // hasPaid is derived from payments on the server; the mock mirrors that by
+  // updating the user object the UI reads.
+  account.user = { ...account.user, hasPaid: true };
+
+  return { payment, hasPaid: true };
 }

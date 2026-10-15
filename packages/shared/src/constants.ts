@@ -15,6 +15,35 @@ export const ERROR_CODES = {
   RATE_LIMITED: 'RATE_LIMITED',
   NETWORK_ERROR: 'NETWORK_ERROR',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
+
+  // --- Payments -------------------------------------------------------------
+  /** The user already has a PAID payment, so a second order is refused. */
+  ALREADY_PAID: 'ALREADY_PAID',
+  /** A feature was requested that requires a completed payment. */
+  PAYMENT_REQUIRED: 'PAYMENT_REQUIRED',
+  /** HMAC check on a Checkout callback or webhook body failed. */
+  INVALID_SIGNATURE: 'INVALID_SIGNATURE',
+  /** No Payment row matches the supplied Razorpay order id. */
+  PAYMENT_NOT_FOUND: 'PAYMENT_NOT_FOUND',
+  /** Razorpay's API could not be reached or returned an error. */
+  PAYMENT_GATEWAY_ERROR: 'PAYMENT_GATEWAY_ERROR',
+
+  // --- Sessions / CSRF ------------------------------------------------------
+  /**
+   * A state-changing request carried cookies but no acceptable `Origin`.
+   * Returned by the `originCheck` middleware.
+   */
+  CSRF_ORIGIN_REJECTED: 'CSRF_ORIGIN_REJECTED',
+  /**
+   * The refresh token was missing, unknown, expired or revoked. The client
+   * should treat this as "signed out" and stop retrying.
+   */
+  REFRESH_TOKEN_INVALID: 'REFRESH_TOKEN_INVALID',
+  /**
+   * A revoked refresh token was replayed outside the grace window. The whole
+   * token family has been revoked as a precaution.
+   */
+  REFRESH_REUSE_DETECTED: 'REFRESH_REUSE_DETECTED',
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];

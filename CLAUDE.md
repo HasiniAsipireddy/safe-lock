@@ -16,7 +16,7 @@ A web platform (mobile-first, later converted to a mobile app) to remotely lock/
 - **Frontend:** Next.js (App Router) + TypeScript + Tailwind CSS. Mobile-first, PWA-friendly. Keep all business logic in the backend so the future mobile app (React Native / Flutter) can reuse the same API.
 - **Backend:** Node.js + Express + TypeScript, REST API under `/api/v1`.
 - **Database:** PostgreSQL with Prisma ORM.
-- **Auth:** Email/phone + password (bcrypt/argon2), JWT access token (short-lived) + refresh token (httpOnly cookie).
+- **Auth:** Email/phone + password (argon2id). Short-lived JWT access token (15 min, `Path=/`) + **opaque, hashed, rotating** refresh token (7 days, `Path=/api/v1/auth`), both in httpOnly cookies. See "Session & Auth Rules" below.
 - **Payments:** Razorpay (Orders API + Checkout + Webhooks).
 - **OTP delivery:** SMS provider (MSG91 / Twilio) behind a `NotificationService` interface; email fallback.
 - **Device comms (later):** MQTT over TLS (e.g. EMQX / HiveMQ / AWS IoT Core). Use a mock device driver until hardware is ready.
@@ -51,10 +51,15 @@ middleware/    # auth, rateLimit, validate, errorHandler
 
 ## Data Model (Prisma — starting point)
 - **User**: id, name, email, phone, passwordHash, role (`USER` | `ADMIN`), createdAt
-- **Payment**: id, userId, razorpayOrderId, razorpayPaymentId, razorpaySignature, amount (paise), currency, status (`CREATED` | `PAID` | `FAILED` | `REFUNDED`), createdAt
+- **Payment**: id, userId, razorpayOrderId (unique), razorpayPaymentId (nullable, unique), amount (paise, Int), currency, status (`CREATED` | `PAID` | `FAILED` | `REFUNDED`), paidAt, createdAt
+  — **the signature is verified and discarded, never stored**: keeping it buys nothing and
+  widens what a database leak exposes.
+- **WebhookEvent**: id, eventId (unique — Razorpay's `x-razorpay-event-id`), type, processedAt
+  — the idempotency ledger. An event id already present is acknowledged and dropped.
 - **Device** (safe lock): id, serialNumber (unique), secretOrCertRef, status (`UNASSIGNED` | `ASSIGNED` | `RETIRED`), lockState (`LOCKED` | `UNLOCKED` | `UNKNOWN`), online (bool), lastSeenAt, ownerId (nullable)
 - **OtpRequest**: id, userId, deviceId, purpose (`UNLOCK`), codeHash, expiresAt, attempts, consumedAt, createdAt
 - **Command**: id, deviceId, userId, type (`LOCK` | `UNLOCK`), status (`PENDING` | `SENT` | `ACKED` | `FAILED` | `TIMEOUT`), createdAt, ackedAt
+- **RefreshToken**: id, userId, tokenHash (unique — sha256 of an opaque token; the raw value is never stored), familyId, expiresAt, revokedAt, replacedById, graceUsedAt, userAgent, ip, createdAt
 - **AuditLog**: id, userId, deviceId, action, ip, userAgent, metadata (json), createdAt
 
 ## Business Rules
@@ -77,6 +82,37 @@ middleware/    # auth, rateLimit, validate, errorHandler
 - Never trust the frontend's claim that payment succeeded.
 - Use Razorpay **test mode** keys in development; test cards/UPI are in Razorpay docs.
 - Handle refunds/failed payments: do not allocate (or revoke allocation per policy).
+
+## Session & Auth Rules
+- **Access token**: signed JWT, 15 min, cookie `safelock_at` at `Path=/`. Stateless.
+- **Refresh token**: 32 opaque random bytes, 7 days, cookie `safelock_rt` at
+  **`Path=/api/v1/auth`** so it is never sent to payment/device/admin routes.
+  Only `sha256(token)` is stored — a JWT was rejected because it cannot be revoked.
+- **Rotation**: `POST /auth/refresh` revokes the presented token and issues a
+  successor in the same `familyId` (one login = one family), linked by `replacedById`.
+- **Reuse detection**: replaying a rotated token after the grace window — or a
+  second time — revokes the whole family *and* every other refresh token for that
+  user, audits `REFRESH_REUSE_DETECTED`, and returns 401.
+- **Grace window**: `REFRESH_GRACE_WINDOW_MS` (10s, in `refreshToken.service.ts`).
+  A replay inside it mints **one** sibling in the family (two tabs racing), tracked
+  by `graceUsedAt` and audited as `REFRESH_GRACE_USED`. **Set to 0 to disable.**
+  Applies only to tokens revoked *by rotation* — never to a logout or cascade
+  revocation. Tradeoff documented in `docs/decisions.md`.
+- **Logout** revokes the presented refresh token server-side, then clears cookies.
+  Cookies must be cleared with the same `Path` they were set with.
+- Cookies are `httpOnly`, `sameSite=lax`, `secure` in production. **This requires
+  web and API to be same-site in production.** The mobile app will need a bearer
+  token flow, not cookies.
+- **CSRF**: `originCheck` on every POST/PUT/PATCH/DELETE except the Razorpay
+  webhook. Exact string match against `WEB_ORIGIN` — **never** a prefix or regex.
+  Missing `Origin` + auth cookies → 403 `CSRF_ORIGIN_REJECTED`.
+- **Rate limiting**: login/signup carry two limbs — per IP and per
+  `sha256(lowercased identifier)`. The 429 must be identical whether or not the
+  account exists. Limiters are **not** skipped in tests; build an app with small
+  limits instead.
+- **Request IDs**: `X-Request-Id` honoured if it matches `[A-Za-z0-9._-]{1,64}`,
+  else generated. Present in every log line, every error body (`error.requestId`)
+  and the response header. Never log request bodies on auth routes.
 
 ## OTP Rules (Unlock)
 - 6-digit numeric code generated with `crypto.randomInt`, **not** `Math.random`.
@@ -130,34 +166,70 @@ interface DeviceDriver {
 - `/admin` (role ADMIN) — payments list, device inventory, allocate device
 - UX: big touch-friendly buttons, clear status colors, loading/disabled states while a command is pending, confirm dialog on Lock.
 
-## Environment Variables (`.env.example`)
+## Environment Variables
+Authoritative copies: `apps/api/.env.example` and `apps/web/.env.example`.
+
+Backend (`apps/api/.env`):
 ```
 NODE_ENV=development
-DATABASE_URL=postgresql://user:pass@localhost:5432/safelock
-JWT_ACCESS_SECRET=change_me
-JWT_REFRESH_SECRET=change_me
+PORT=4000
+WEB_ORIGIN=http://localhost:3000   # exact-match allowlist; CORS_ORIGINS is a legacy alias
+TRUST_PROXY=false                  # only `true`/hop-count when actually behind a proxy
+LOG_LEVEL=info
+SEED_ADMIN_EMAIL=                  # db:seed; password must be 12+ chars, no default
+SEED_ADMIN_PASSWORD=
+SEED_ADMIN_NAME=
+SEED_ADMIN_PHONE=
+# SEED_ALLOW_PRODUCTION=true       # required for db:seed when NODE_ENV=production
+# Dev DB runs in Docker on host port 5433 (see docker-compose.yml) to avoid
+# clashing with a local PostgreSQL install on 5432.
+DATABASE_URL=postgresql://safelock:safelock_dev_only@localhost:5433/safelock
+TEST_DATABASE_URL=postgresql://safelock:safelock_dev_only@localhost:5433/safelock_test
+JWT_ACCESS_SECRET=change_me   # signs the access token only
+ACCESS_TOKEN_TTL=15m
+REFRESH_TOKEN_TTL_DAYS=7      # refresh tokens are opaque, not signed
+# JWT_REFRESH_SECRET          # legacy, unused — refresh tokens are not JWTs
+SAFE_PRICE_PAISE=99900        # paise; the ONLY source of the price
 RAZORPAY_KEY_ID=rzp_test_xxxxx
 RAZORPAY_KEY_SECRET=xxxxx
 RAZORPAY_WEBHOOK_SECRET=xxxxx
-OTP_HMAC_SECRET=change_me
-SMS_PROVIDER_API_KEY=xxxxx
-MQTT_URL=mqtts://broker.example.com
-MQTT_USERNAME=
-MQTT_PASSWORD=
-DEVICE_DRIVER=mock   # mock | mqtt
+# Not yet used — added with the OTP / device work:
+# OTP_HMAC_SECRET=change_me
+# SMS_PROVIDER_API_KEY=xxxxx
+# MQTT_URL=mqtts://broker.example.com
+# MQTT_USERNAME=
+# MQTT_PASSWORD=
+# DEVICE_DRIVER=mock   # mock | mqtt
 ```
+
+Frontend (`apps/web/.env.local`):
+```
+NEXT_PUBLIC_API_URL=http://localhost:4000/api/v1
+NEXT_PUBLIC_USE_MOCK_API=true
+```
+There is no `NEXT_PUBLIC_RAZORPAY_KEY_ID`: the key id comes back from
+`POST /payments/order`, so the browser holds no payment config of its own.
 
 ## Commands
 This repo uses **npm workspaces** (not pnpm) — see `docs/decisions.md`.
 Target runtime is **Node 22 LTS** (`.nvmrc`, root `package.json` `engines`).
+Setup and Razorpay/webhook instructions are in `README.md`.
 ```
 npm install
-npm run dev                                  # run web (add api to the root dev script when it exists)
-npm run dev --workspace apps/web
+npm run db:up                                # PostgreSQL 16 in Docker, host port 5433
+npm run dev:api                              # tsx watch, :4000  (separate terminal)
+npm run dev:web                              # next dev,   :3000  (separate terminal)
 npm --workspace apps/api run prisma:migrate  # prisma migrate dev
-npm --workspace apps/api test
+npm --workspace apps/api run db:seed         # create/update the ADMIN from SEED_ADMIN_*
+npm --workspace apps/api run db:cleanup-tokens  # prune dead refresh tokens
+npm test                                     # vitest + supertest against safelock_test
 npm run lint && npm run typecheck            # runs across all workspaces
 ```
+Dependencies are **pinned exactly** (`.npmrc` → `save-exact=true`). Do not
+reintroduce carets in `apps/api`, and keep `zod` on the same exact version in
+all three workspaces — two copies break schema type assignability.
+There is no root `dev` that runs both servers: `&` backgrounding is not
+portable to PowerShell, so use two terminals.
 
 ## Coding Guidelines for Claude
 - Use TypeScript strict mode; no `any` unless justified.
@@ -169,18 +241,32 @@ npm run lint && npm run typecheck            # runs across all workspaces
 - Make small, reviewable commits; update this file when architecture decisions change.
 
 ## Open Questions (to decide)
-- Price and plan structure (one-time vs subscription)?
+- ~~Price and plan structure~~ → **provisionally** one-time ₹999 (`SAFE_PRICE_PAISE=99900`),
+  changeable via env. Confirm the real figure and whether GST is included.
 - OTP channel: SMS, email, or both?
 - Auto-allocation vs manual admin allocation of devices?
 - Hardware protocol finalized? (MQTT vs HTTP/WebSocket, Wi-Fi vs GSM module)
-- Refund / device return policy?
-- Number of safes per user?
+- **Refund / device return policy — still open, and now blocking.** `/refund-policy`
+  is a published placeholder; the 11 decisions needed are listed on that page and in
+  `apps/web/src/app/refund-policy/page.tsx`.
+- Number of safes per user? (The API currently refuses a second order once a user has
+  one `PAID` payment, which implies **one**.)
+- Business details for the legal pages: `[BUSINESS NAME]`, `[ADDRESS]`, `[EMAIL]`,
+  `[PHONE]`, GSTIN, support hours, grievance officer.
 
 ## Roadmap
-1. Auth + user model
-2. Razorpay payment (test mode) + webhook
+1. ✅ Auth + user model — argon2id, rotating opaque refresh tokens with reuse
+   detection, `/auth/signup|login|refresh|logout|me`, Origin check, two-limb rate
+   limiting, pino + request ids, DB-backed `/health`, ADMIN seed script
+2. ✅ Razorpay payment (test mode) + webhook — order / verify / webhook / `payments/me`,
+   `requirePaid` middleware, legal pages
 3. Device inventory + allocation (admin)
 4. Lock/Unlock flow with OTP using MockDriver
-5. Audit log + history page
+5. Audit log + history page (the `AuditLog` table and writes exist; the `/history` page does not)
 6. Real hardware via MQTT
 7. Convert to mobile app (reuse `/api/v1`)
+
+**Postponed (deliberately not built):** WhatsApp/SMS phone verification. There
+is no `phoneVerifiedAt` column and no `requireVerifiedPhone` middleware. The
+places it will hook in are marked `TODO(phone-verification)` in
+`apps/api/src/modules/payments/payments.routes.ts` and the Prisma schema.

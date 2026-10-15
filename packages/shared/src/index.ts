@@ -1,5 +1,9 @@
 // Extensionless relative imports: the package is consumed as raw TypeScript by
-// the Next.js bundler (`transpilePackages`), which resolves `.ts` directly.
+// the Next.js bundler (`transpilePackages`) and by tsx in the API, both of
+// which resolve `.ts` directly.
 export * from './constants';
+export * from './money';
 export * from './schemas/auth';
+export * from './schemas/payments';
 export * from './types/auth';
+export * from './types/payments';

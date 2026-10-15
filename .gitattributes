@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+# Shell scripts mounted into Linux containers must stay LF even on Windows
+# checkouts — bash inside the container cannot run a CRLF script.
+*.sh text eol=lf

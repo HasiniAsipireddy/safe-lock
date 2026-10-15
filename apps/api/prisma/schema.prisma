@@ -1,0 +1,136 @@
+// Safe Lock platform — database schema.
+//
+// Scope note: this migration covers the user model and the payment flow only.
+// Device, OtpRequest and Command (see CLAUDE.md "Data Model") land with the
+// device-allocation and lock/unlock tasks.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum PaymentStatus {
+  CREATED
+  PAID
+  FAILED
+  REFUNDED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  phone        String   @unique
+  passwordHash String
+  role         UserRole @default(USER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // TODO(phone-verification): add `phoneVerifiedAt DateTime?` when WhatsApp /
+  // SMS verification is built. Deliberately absent for now so no route can
+  // start depending on a column that is never populated.
+
+  payments      Payment[]
+  auditLogs     AuditLog[]
+  refreshTokens RefreshToken[]
+}
+
+/// One row per issued refresh token.
+///
+/// Refresh tokens are **opaque random bytes**, not JWTs, so they can be
+/// revoked server-side the instant theft is suspected. Only the SHA-256 of the
+/// token is stored: a database leak therefore yields no usable session.
+///
+/// Rotation: redeeming a token revokes it and links the successor through
+/// `replacedById`. Tokens sharing a `familyId` are one login's chain — if a
+/// revoked token is replayed outside the grace window the whole family is
+/// revoked at once. See refreshToken.service.ts.
+model RefreshToken {
+  id String @id @default(cuid())
+
+  userId String
+  /// SHA-256 hex of the opaque token. Unique so a hash collision or a double
+  /// insert cannot produce two live rows for one secret. The raw token is
+  /// never stored, logged, or recoverable from this row.
+  tokenHash String @unique
+  /// Shared by every token descended from one login.
+  familyId  String
+
+  expiresAt DateTime
+  revokedAt DateTime?
+  /// The token issued when this one was redeemed.
+  replacedById String?
+  /// Set when this already-revoked token was replayed inside the grace window
+  /// and allowed to mint one sibling. A second such replay is treated as
+  /// reuse: at most one sibling per rotated token.
+  graceUsedAt DateTime?
+
+  /// Captured at issue time to make an audit trail useful, never for auth.
+  userAgent String?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+}
+
+/// One row per Razorpay order. Amounts are integers in paise — never floats.
+model Payment {
+  id                String        @id @default(cuid())
+  userId            String
+  razorpayOrderId   String        @unique
+  razorpayPaymentId String?       @unique
+  amount            Int
+  currency          String        @default("INR")
+  status            PaymentStatus @default(CREATED)
+  /// Set when the payment first reaches PAID, by whichever of
+  /// /payments/verify or the webhook gets there first.
+  paidAt            DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+}
+
+/// Razorpay webhook idempotency ledger. A delivery whose event id is already
+/// here is acknowledged and dropped without being applied a second time.
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  /// Razorpay's `x-razorpay-event-id` header.
+  eventId     String   @unique
+  type        String
+  processedAt DateTime @default(now())
+
+  @@index([type])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  deviceId  String?
+  action    String
+  ip        String?
+  userAgent String?
+  /// Never holds secrets, signatures or OTPs — see audit.service.ts.
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+}
