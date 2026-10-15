@@ -3,6 +3,7 @@ import './globals.css';
 import { AuthProvider } from '@/context/AuthContext';
 import { MockModeBadge } from '@/components/MockModeBadge';
 import { SiteFooter } from '@/components/SiteFooter';
+import { AppHeader } from '@/components/AppHeader';
 
 export const metadata: Metadata = {
   title: 'Safe Lock',
@@ -25,6 +26,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className="flex min-h-dvh flex-col antialiased">
         <AuthProvider>
           <MockModeBadge />
+          <AppHeader />
           {children}
           <SiteFooter />
         </AuthProvider>

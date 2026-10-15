@@ -55,6 +55,36 @@ export function Protected({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
+/**
+ * Wraps pages only ADMIN users should see (/admin).
+ *
+ * Non-admins are redirected to the dashboard rather than shown a 403 — they
+ * have an account, they simply have no business here. Real enforcement is the
+ * API's `requireAdmin`; this only keeps the UI honest.
+ */
+export function AdminOnly({ children }: { children: ReactNode }) {
+  const { status, user } = useAuth();
+  const router = useRouter();
+
+  const allowed = status === 'authenticated' && user?.role === 'ADMIN';
+
+  useEffect(() => {
+    if (status === 'unauthenticated') {
+      router.replace('/login');
+      return;
+    }
+    if (status === 'authenticated' && user?.role !== 'ADMIN') {
+      router.replace('/dashboard');
+    }
+  }, [status, user?.role, router]);
+
+  if (!allowed) {
+    return <FullPageSpinner label="Checking your access…" />;
+  }
+
+  return <>{children}</>;
+}
+
 /** Wraps pages only guests should see (/login, /signup). */
 export function GuestOnly({ children }: { children: ReactNode }) {
   const { status } = useAuth();

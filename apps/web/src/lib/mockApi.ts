@@ -15,9 +15,20 @@ import {
   ERROR_CODES,
   GENERIC_LOGIN_ERROR,
   classifyIdentifier,
+  normaliseSerial,
+  serialNumberSchema,
+  type AdminAuditRow,
+  type AdminDeviceRow,
+  type AdminPaymentRow,
+  type AdminUserRow,
   type ApiErrorBody,
   type AuthResponse,
+  type BulkCreateResult,
+  type BulkCreateRowResult,
   type CreateOrderResponse,
+  type DeviceStatus,
+  type MyDeviceResponse,
+  type Paginated,
   type PaymentMeResponse,
   type PaymentSummary,
   type PublicUser,
@@ -73,6 +84,61 @@ export const MOCK_DEMO_CREDENTIALS = {
   password: 'Demo1234',
 } as const;
 
+// --- Devices (mock inventory) ------------------------------------------------
+
+interface MockDevice {
+  id: string;
+  serialNumber: string;
+  status: DeviceStatus;
+  lockState: 'LOCKED' | 'UNLOCKED' | 'UNKNOWN';
+  online: boolean;
+  lastSeenAt: string | null;
+  ownerId: string | null;
+  allocatedAt: string | null;
+  createdAt: string;
+}
+
+/**
+ * Seeded inventory so the admin panel has something to show in mock mode.
+ * Two devices in stock, one already retired.
+ */
+const devices: MockDevice[] = [
+  makeMockDevice('SAFE-0001', 0),
+  makeMockDevice('SAFE-0002', 1),
+  { ...makeMockDevice('SAFE-0003', 2), status: 'RETIRED' },
+];
+
+function makeMockDevice(serialNumber: string, ageIndex: number): MockDevice {
+  return {
+    id: `dev_mock_${serialNumber.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+    serialNumber,
+    status: 'UNASSIGNED',
+    lockState: 'UNKNOWN',
+    online: false,
+    lastSeenAt: null,
+    ownerId: null,
+    allocatedAt: null,
+    // Older index = created earlier, so "next available" ordering is stable.
+    createdAt: new Date(Date.UTC(2026, 0, 1) + ageIndex * 60_000).toISOString(),
+  };
+}
+
+/** A mock audit trail, newest last. */
+const auditLog: AdminAuditRow[] = [];
+
+function recordAudit(action: string, extra: Partial<AdminAuditRow> = {}): void {
+  auditLog.push({
+    id: `aud_mock_${auditLog.length + 1}`,
+    action,
+    userId: extra.userId ?? null,
+    deviceId: extra.deviceId ?? null,
+    ip: '127.0.0.1',
+    userAgent: 'MockApi/1.0',
+    metadata: extra.metadata ?? { mock: true },
+    createdAt: new Date().toISOString(),
+  });
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -101,14 +167,23 @@ function setSessionUserId(id: string | null): void {
   }
 }
 
-/** Routes a request from the API client to a fake handler. */
+/**
+ * Routes a request from the API client to a fake handler.
+ *
+ * Paths arrive with their query string attached, and the admin routes carry
+ * ids in the path, so this splits the two apart and falls through to pattern
+ * matching for the parameterised routes.
+ */
 export async function mockRequest<T>(
   method: HttpMethod,
   path: string,
   body: unknown,
 ): Promise<T> {
   await delay(LATENCY_MS);
-  const route = `${method} ${path}`;
+
+  const [pathname = path, rawQuery = ''] = path.split('?');
+  const query = new URLSearchParams(rawQuery);
+  const route = `${method} ${pathname}`;
 
   switch (route) {
     case 'POST /auth/login':
@@ -128,13 +203,41 @@ export async function mockRequest<T>(
       return handleCreateOrder() as T;
     case 'POST /payments/verify':
       return handleVerifyPayment(body) as T;
+    case 'GET /devices/mine':
+      return handleMyDevice() as T;
+    case 'GET /admin/devices':
+      return handleAdminDevices(query) as T;
+    case 'POST /admin/devices':
+      return handleAdminCreateDevice(body) as T;
+    case 'POST /admin/devices/bulk':
+      return handleAdminBulkCreate(body) as T;
+    case 'POST /admin/allocate-next':
+      return handleAdminAllocate(body, undefined) as T;
+    case 'GET /admin/users':
+      return handleAdminUsers(query) as T;
+    case 'GET /admin/payments':
+      return handleAdminPayments(query) as T;
+    case 'GET /admin/audit':
+      return handleAdminAudit(query) as T;
     default:
-      return fail(
-        404,
-        ERROR_CODES.NOT_FOUND,
-        `Mock API has no handler for ${route}. Turn off NEXT_PUBLIC_USE_MOCK_API to use the real API.`,
-      );
+      break;
   }
+
+  // Parameterised admin device routes.
+  const deviceAction = /^\/admin\/devices\/([^/]+)\/(allocate|unassign|retire)$/.exec(pathname);
+  if (method === 'POST' && deviceAction) {
+    const [, deviceId, action] = deviceAction as unknown as [string, string, string];
+
+    if (action === 'allocate') return handleAdminAllocate(body, deviceId) as T;
+    if (action === 'unassign') return handleAdminUnassign(deviceId) as T;
+    return handleAdminRetire(deviceId) as T;
+  }
+
+  return fail(
+    404,
+    ERROR_CODES.NOT_FOUND,
+    `Mock API has no handler for ${route}. Turn off NEXT_PUBLIC_USE_MOCK_API to use the real API.`,
+  );
 }
 
 function handleLogin(body: unknown): AuthResponse {
@@ -333,4 +436,427 @@ function handleVerifyPayment(body: unknown): VerifyPaymentResponse {
   account.user = { ...account.user, hasPaid: true };
 
   return { payment, hasPaid: true };
+}
+
+// --- Devices -----------------------------------------------------------------
+
+function deviceOwner(device: MockDevice): { id: string; name: string; email: string } | null {
+  if (!device.ownerId) return null;
+  const account = accounts.find((candidate) => candidate.user.id === device.ownerId);
+  if (!account) return null;
+  return {
+    id: account.user.id,
+    name: account.user.name,
+    email: account.user.email,
+  };
+}
+
+/** Mirrors the API's AdminDeviceRow — note there is no credentialHash here. */
+function toAdminDevice(device: MockDevice): AdminDeviceRow {
+  return {
+    id: device.id,
+    serialNumber: device.serialNumber,
+    status: device.status,
+    lockState: device.lockState,
+    online: device.online,
+    lastSeenAt: device.lastSeenAt,
+    allocatedAt: device.allocatedAt,
+    createdAt: device.createdAt,
+    owner: deviceOwner(device),
+  };
+}
+
+function paginateMock<T>(items: T[], query: URLSearchParams): Paginated<T> {
+  const page = Math.max(1, Number(query.get('page') ?? 1) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number(query.get('pageSize') ?? 20) || 20));
+  const start = (page - 1) * pageSize;
+
+  return {
+    items: items.slice(start, start + pageSize),
+    page,
+    pageSize,
+    total: items.length,
+    totalPages: Math.max(1, Math.ceil(items.length / pageSize)),
+  };
+}
+
+/** Recomputes `deviceAllocated` on the cached user object the UI reads. */
+function syncAllocationFlag(userId: string): void {
+  const account = accounts.find((candidate) => candidate.user.id === userId);
+  if (!account) return;
+
+  const owns = devices.some((device) => device.ownerId === userId);
+  account.user = { ...account.user, deviceAllocated: owns };
+}
+
+function handleMyDevice(): MyDeviceResponse {
+  const account = requireAccount();
+
+  // Same gate as the real API's requirePaid on this route.
+  if (!account.user.hasPaid) {
+    return fail(402, ERROR_CODES.PAYMENT_REQUIRED, 'Complete your payment to activate your safe.');
+  }
+
+  const device = devices.find((candidate) => candidate.ownerId === account.user.id);
+  if (!device) return { device: null };
+
+  return {
+    device: {
+      id: device.id,
+      serialNumber: device.serialNumber,
+      lockState: device.lockState,
+      online: device.online,
+      lastSeenAt: device.lastSeenAt,
+      allocatedAt: device.allocatedAt,
+    },
+  };
+}
+
+// --- Admin -------------------------------------------------------------------
+
+/** Mirrors requireAdmin: 403 for anyone who is not an ADMIN. */
+function requireAdminAccount(): MockAccount {
+  const account = requireAccount();
+
+  if (account.user.role !== 'ADMIN') {
+    return fail(403, ERROR_CODES.FORBIDDEN, 'You do not have access to this resource.');
+  }
+  return account;
+}
+
+function handleAdminDevices(query: URLSearchParams): Paginated<AdminDeviceRow> {
+  requireAdminAccount();
+
+  const status = query.get('status');
+  const q = (query.get('q') ?? '').trim().toLowerCase();
+
+  const filtered = devices
+    .filter((device) => (status ? device.status === status : true))
+    .filter((device) => {
+      if (!q) return true;
+      const owner = deviceOwner(device);
+      return (
+        device.serialNumber.toLowerCase().includes(q) ||
+        (owner?.name.toLowerCase().includes(q) ?? false) ||
+        (owner?.email.toLowerCase().includes(q) ?? false)
+      );
+    })
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .map(toAdminDevice);
+
+  return paginateMock(filtered, query);
+}
+
+function handleAdminCreateDevice(body: unknown): { device: AdminDeviceRow } {
+  requireAdminAccount();
+
+  const input = (body ?? {}) as { serialNumber?: string };
+  const parsed = serialNumberSchema.safeParse(input.serialNumber ?? '');
+
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Invalid serial number',
+    );
+  }
+
+  if (devices.some((device) => device.serialNumber === parsed.data)) {
+    return fail(
+      409,
+      ERROR_CODES.DUPLICATE_SERIAL,
+      `A safe with serial ${parsed.data} is already in the inventory.`,
+    );
+  }
+
+  const device = makeMockDevice(parsed.data, devices.length);
+  // Newest-first ordering needs a real "now" rather than a seeded offset.
+  device.createdAt = new Date().toISOString();
+  devices.push(device);
+  recordAudit('device.created', {
+    deviceId: device.id,
+    metadata: { serialNumber: device.serialNumber },
+  });
+
+  return { device: toAdminDevice(device) };
+}
+
+function handleAdminBulkCreate(body: unknown): BulkCreateResult {
+  requireAdminAccount();
+
+  const input = (body ?? {}) as { serialNumbers?: unknown };
+  const rows = Array.isArray(input.serialNumbers) ? (input.serialNumbers as string[]) : [];
+
+  if (rows.length === 0) {
+    return fail(400, ERROR_CODES.VALIDATION_ERROR, 'Provide at least one serial number');
+  }
+  if (rows.length > 500) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      'Too many rows: at most 500 serial numbers per request',
+    );
+  }
+
+  const results: BulkCreateRowResult[] = [];
+  const seen = new Set<string>();
+
+  rows.forEach((raw, index) => {
+    const row = index + 1;
+    const parsed = serialNumberSchema.safeParse(raw);
+
+    if (!parsed.success) {
+      results.push({
+        row,
+        serialNumber: normaliseSerial(String(raw)),
+        status: 'invalid',
+        message: parsed.error.issues[0]?.message ?? 'Invalid serial number',
+      });
+      return;
+    }
+
+    const serialNumber = parsed.data;
+
+    if (seen.has(serialNumber)) {
+      results.push({ row, serialNumber, status: 'duplicate', message: 'Repeated in this list' });
+      return;
+    }
+    seen.add(serialNumber);
+
+    if (devices.some((device) => device.serialNumber === serialNumber)) {
+      results.push({ row, serialNumber, status: 'duplicate', message: 'Already in the inventory' });
+      return;
+    }
+
+    const device = makeMockDevice(serialNumber, devices.length);
+    device.createdAt = new Date().toISOString();
+    devices.push(device);
+    results.push({ row, serialNumber, status: 'created' });
+  });
+
+  const created = results.filter((row) => row.status === 'created').length;
+  recordAudit('device.bulk_created', { metadata: { submitted: rows.length, created } });
+
+  return {
+    created,
+    duplicates: results.filter((row) => row.status === 'duplicate').length,
+    invalid: results.filter((row) => row.status === 'invalid').length,
+    results,
+  };
+}
+
+function handleAdminAllocate(body: unknown, deviceId?: string): { device: AdminDeviceRow } {
+  requireAdminAccount();
+
+  const input = (body ?? {}) as { userId?: string };
+  const target = accounts.find((candidate) => candidate.user.id === input.userId);
+
+  if (!target) return fail(404, ERROR_CODES.USER_NOT_FOUND, 'No user with that id.');
+
+  if (!target.user.hasPaid) {
+    return fail(
+      402,
+      ERROR_CODES.NOT_PAID,
+      'This user has no verified payment, so no safe can be allocated.',
+    );
+  }
+
+  if (devices.some((device) => device.ownerId === target.user.id)) {
+    return fail(
+      409,
+      ERROR_CODES.ALREADY_HAS_DEVICE,
+      'This user already has a safe allocated. Unassign it first.',
+    );
+  }
+
+  let device: MockDevice | undefined;
+
+  if (deviceId) {
+    device = devices.find((candidate) => candidate.id === deviceId);
+    if (!device) return fail(404, ERROR_CODES.NOT_FOUND, 'No safe with that id.');
+    if (device.status !== 'UNASSIGNED') {
+      return fail(
+        409,
+        ERROR_CODES.DEVICE_NOT_AVAILABLE,
+        `That safe is ${device.status.toLowerCase()}, so it cannot be allocated.`,
+      );
+    }
+  } else {
+    // Oldest in stock first, matching the API's ordering.
+    device = devices
+      .filter((candidate) => candidate.status === 'UNASSIGNED')
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+
+    if (!device) {
+      return fail(
+        409,
+        ERROR_CODES.NO_DEVICES_IN_STOCK,
+        'No unassigned safes left in stock. Add more devices to the inventory.',
+      );
+    }
+  }
+
+  device.status = 'ASSIGNED';
+  device.ownerId = target.user.id;
+  device.allocatedAt = new Date().toISOString();
+  syncAllocationFlag(target.user.id);
+  recordAudit('device.allocated', {
+    userId: target.user.id,
+    deviceId: device.id,
+    metadata: { serialNumber: device.serialNumber, mode: deviceId ? 'specific' : 'next' },
+  });
+
+  return { device: toAdminDevice(device) };
+}
+
+interface MockDeviceMutation {
+  device: AdminDeviceRow;
+  previousOwnerId: string | null;
+}
+
+function handleAdminUnassign(deviceId: string): MockDeviceMutation {
+  requireAdminAccount();
+
+  const device = devices.find((candidate) => candidate.id === deviceId);
+  if (!device) return fail(404, ERROR_CODES.NOT_FOUND, 'No safe with that id.');
+
+  if (device.status !== 'ASSIGNED' || !device.ownerId) {
+    return fail(
+      409,
+      ERROR_CODES.DEVICE_NOT_AVAILABLE,
+      'That safe is not currently assigned to anyone.',
+    );
+  }
+
+  const previousOwnerId = device.ownerId;
+  device.status = 'UNASSIGNED';
+  device.ownerId = null;
+  device.allocatedAt = null;
+  device.lockState = 'UNKNOWN';
+  syncAllocationFlag(previousOwnerId);
+  recordAudit('device.unassigned', {
+    userId: previousOwnerId,
+    deviceId: device.id,
+    metadata: { serialNumber: device.serialNumber },
+  });
+
+  return { device: toAdminDevice(device), previousOwnerId };
+}
+
+function handleAdminRetire(deviceId: string): MockDeviceMutation {
+  requireAdminAccount();
+
+  const device = devices.find((candidate) => candidate.id === deviceId);
+  if (!device) return fail(404, ERROR_CODES.NOT_FOUND, 'No safe with that id.');
+
+  if (device.status === 'ASSIGNED') {
+    return fail(
+      409,
+      ERROR_CODES.DEVICE_STILL_ASSIGNED,
+      'That safe is still assigned to a user. Unassign it before retiring it.',
+    );
+  }
+  if (device.status === 'RETIRED') {
+    return fail(409, ERROR_CODES.DEVICE_NOT_AVAILABLE, 'That safe is already retired.');
+  }
+
+  device.status = 'RETIRED';
+  device.online = false;
+  recordAudit('device.retired', {
+    deviceId: device.id,
+    metadata: { serialNumber: device.serialNumber },
+  });
+
+  return { device: toAdminDevice(device), previousOwnerId: null };
+}
+
+function handleAdminUsers(query: URLSearchParams): Paginated<AdminUserRow> {
+  requireAdminAccount();
+
+  const paid = query.get('paid');
+  const allocated = query.get('allocated');
+  const q = (query.get('q') ?? '').trim().toLowerCase();
+
+  const rows: AdminUserRow[] = accounts.map((account) => {
+    const device = devices.find((candidate) => candidate.ownerId === account.user.id);
+    const deviceSerial = device?.serialNumber ?? null;
+
+    return {
+      id: account.user.id,
+      name: account.user.name,
+      email: account.user.email,
+      phone: account.user.phone,
+      role: account.user.role,
+      createdAt: account.user.createdAt,
+      hasPaid: account.user.hasPaid,
+      deviceSerial,
+      refundedWithDevice: !account.user.hasPaid && deviceSerial !== null,
+    };
+  });
+
+  const filtered = rows
+    .filter((row) => (paid === null ? true : row.hasPaid === (paid === 'true')))
+    .filter((row) =>
+      allocated === null ? true : (row.deviceSerial !== null) === (allocated === 'true'),
+    )
+    .filter((row) => {
+      if (!q) return true;
+      return (
+        row.name.toLowerCase().includes(q) ||
+        row.email.toLowerCase().includes(q) ||
+        row.phone.includes(q)
+      );
+    });
+
+  // Same work-queue ordering as the API.
+  const rank = (row: AdminUserRow): number => {
+    if (row.refundedWithDevice) return 0;
+    if (row.hasPaid && !row.deviceSerial) return 1;
+    return 2;
+  };
+  filtered.sort((a, b) => rank(a) - rank(b));
+
+  return paginateMock(filtered, query);
+}
+
+function handleAdminPayments(query: URLSearchParams): Paginated<AdminPaymentRow> {
+  requireAdminAccount();
+
+  const status = query.get('status');
+
+  const rows: AdminPaymentRow[] = accounts.flatMap((account) =>
+    account.payments.map((payment) => ({
+      id: payment.id,
+      amount: payment.amount,
+      currency: payment.currency,
+      status: payment.status,
+      razorpayOrderId: payment.razorpayOrderId,
+      createdAt: payment.createdAt,
+      paidAt: payment.paidAt,
+      user: {
+        id: account.user.id,
+        name: account.user.name,
+        email: account.user.email,
+      },
+    })),
+  );
+
+  const filtered = rows
+    .filter((row) => (status ? row.status === status : true))
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+  return paginateMock(filtered, query);
+}
+
+function handleAdminAudit(query: URLSearchParams): Paginated<AdminAuditRow> {
+  requireAdminAccount();
+
+  const action = (query.get('action') ?? '').trim().toLowerCase();
+
+  const filtered = auditLog
+    .filter((entry) => (action ? entry.action.toLowerCase().includes(action) : true))
+    .slice()
+    .reverse();
+
+  return paginateMock(filtered, query);
 }
