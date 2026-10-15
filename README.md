@@ -11,8 +11,10 @@ packages/shared Types, zod schemas and constants used by both
 ```
 
 **Built so far:** auth (signup / login / rotating sessions), the one-time
-Razorpay payment flow, and the legal pages. Device allocation, lock/unlock, OTP
-and phone verification are **not** built yet.
+Razorpay payment flow, the legal pages, and device inventory + manual
+allocation with an admin panel. Lock/unlock, OTP and phone verification are
+**not** built yet — the safe card's Lock and Unlock buttons are deliberately
+disabled.
 
 ---
 
@@ -271,15 +273,90 @@ verification, signature failure and webhook.
 | `POST` | `/api/v1/auth/login` | none | Email-or-phone + password |
 | `POST` | `/api/v1/auth/refresh` | refresh cookie | Rotate the session |
 | `POST` | `/api/v1/auth/logout` | optional | Revoke the refresh token, clear cookies |
-| `GET` | `/api/v1/auth/me` | access cookie | Current user, including `hasPaid` |
+| `GET` | `/api/v1/auth/me` | access cookie | Current user, incl. `hasPaid` and `deviceAllocated` |
+| `GET` | `/api/v1/devices/mine` | cookie + paid | The caller's device, or `null` while awaiting allocation |
+| `GET` | `/api/v1/admin/devices` | ADMIN | Inventory, with `status`, `q`, `page` |
+| `POST` | `/api/v1/admin/devices` · `/devices/bulk` | ADMIN | Add one, or up to 500 with per-row results |
+| `POST` | `/api/v1/admin/devices/:id/allocate` · `/allocate-next` | ADMIN | Allocate a specific or the next device |
+| `POST` | `/api/v1/admin/devices/:id/unassign` · `/retire` | ADMIN | Return to stock, or take out of service |
+| `GET` | `/api/v1/admin/users` · `/payments` · `/audit` | ADMIN | Paginated admin listings |
 | `POST` | `/api/v1/payments/order` | cookie | Create a Razorpay order at the server price. `409` if already paid. |
 | `POST` | `/api/v1/payments/verify` | cookie | Verify the Checkout signature and mark `PAID`. Idempotent. |
 | `POST` | `/api/v1/payments/webhook` | HMAC | Razorpay's callback. Raw body, signature-verified, deduped by event id. |
 | `GET` | `/api/v1/payments/me` | cookie | `hasPaid` plus the latest payment summary and the current price. |
 
 `requirePaid` (`apps/api/src/middleware/requirePaid.ts`) returns `402` for a
-user without a verified payment. It is exported and tested, ready for the
-device and lock/unlock routes.
+user without a verified payment; `requireAdmin` returns `403` for non-admins
+and is applied to the whole `/admin` router.
+
+---
+
+## Admin workflow
+
+### Getting an admin account
+
+```bash
+# Set SEED_ADMIN_* in apps/api/.env (password must be 12+ characters), then:
+npm --workspace apps/api run db:seed
+```
+
+Sign in as that account and an **Admin** link appears in the header. The link
+is only rendered for admins, but that is cosmetic — every `/admin/*` endpoint
+is behind `requireAdmin` on the server, so typing the URL achieves nothing.
+
+### Adding devices to the inventory
+
+**Admin → Devices.** Two ways:
+
+- **Add a device** — one serial at a time.
+- **Bulk add** — paste one serial per line, up to **500** per request. Every
+  row comes back marked `created`, `duplicate` or `invalid` with the line
+  number, so one bad line does not reject the paste.
+
+Serials must match `SAFE-` followed by 4–12 digits or capitals (e.g.
+`SAFE-0001`). Input is **trimmed and uppercased** before validation, so
+`safe-0001` and `SAFE-0001` are the same device and cannot be added twice. The
+format is **provisional** — see `docs/decisions.md` before ordering hardware.
+
+### Allocating a safe
+
+A user who has paid shows up under **Admin → Users** as *Awaiting allocation*;
+that filter is the work queue. Click **Allocate** and choose:
+
+- **Next available** — takes the oldest device in stock. The right default: it
+  uses a row lock, so two admins allocating at the same moment get different
+  devices rather than colliding.
+- **A specific device** — when the physical unit in hand must match the record.
+
+The user's dashboard switches from the waiting timeline to their safe card on
+their next load. Allocation requires a `PAID` payment; an attempt for an unpaid
+user is refused with `402 NOT_PAID` and the failure is audited.
+
+### Unassigning and retiring
+
+- **Unassign** returns a device to stock and revokes the user's access. Its
+  lock state resets to `UNKNOWN` — the state of a safe nobody owns is not
+  something we know.
+- **Retire** takes a device permanently out of service. It is **refused while
+  the device is assigned** (`DEVICE_STILL_ASSIGNED`): unassign first, so
+  hardware is never retired out of someone's hands.
+
+Both ask for confirmation.
+
+### Refunded users who still hold a safe
+
+A refund sets `hasPaid` false but **does not** reclaim the device — that stays
+a human decision. Those users appear at the top of **Admin → Users**,
+highlighted and labelled *"Refunded — device still assigned"*, with
+**Unassign** on the row. Their dashboard shows an explicit "payment was
+refunded, contact support" state with no safe card and no controls.
+
+### Audit
+
+**Admin → Audit** lists every security-relevant action, newest first,
+filterable by action name (try `device.`). Both successes and failures are
+recorded; failures carry the error code, and every row carries the
+`requestId` that ties it to the server log lines.
 
 ## Tests
 
@@ -296,6 +373,20 @@ rotation, reuse detection (including that a post-window replay kills grace
 siblings), the 10-second grace window, cookie `Path` attributes, the Origin
 allowlist, both rate-limit limbs and 429 response parity, `/health` degraded,
 and seed idempotency.
+
+Device and admin coverage: allocation preconditions, next-available ordering,
+`NO_DEVICES_IN_STOCK`, unassign/retire rules, bulk per-row reporting and serial
+normalisation, cross-user device isolation, `requireAdmin` on **every** admin
+route (table-driven, so an unprotected new route shows up as a missing entry),
+a SQL-injection-shaped search term treated as literal text, and a recursive
+scan asserting no hash, token or credential field appears in any admin
+response.
+
+**Concurrency is tested against real Postgres**, not a mock — the row locking
+is the behaviour under test. Ten simultaneous allocations land on ten distinct
+devices; one device and two users yields exactly one winner and one clean
+`NO_DEVICES_IN_STOCK`; two simultaneous allocations for one user yield exactly
+one device.
 
 Rate limiters are **not** disabled in tests. The shared `app()` helper builds a
 fresh app per request (so limiter counters reset and unrelated tests don't

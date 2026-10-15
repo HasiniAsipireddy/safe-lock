@@ -56,7 +56,9 @@ middleware/    # auth, rateLimit, validate, errorHandler
   widens what a database leak exposes.
 - **WebhookEvent**: id, eventId (unique — Razorpay's `x-razorpay-event-id`), type, processedAt
   — the idempotency ledger. An event id already present is acknowledged and dropped.
-- **Device** (safe lock): id, serialNumber (unique), secretOrCertRef, status (`UNASSIGNED` | `ASSIGNED` | `RETIRED`), lockState (`LOCKED` | `UNLOCKED` | `UNKNOWN`), online (bool), lastSeenAt, ownerId (nullable)
+- **Device** (safe lock): id, serialNumber (unique), status (`UNASSIGNED` | `ASSIGNED` | `RETIRED`), lockState (`LOCKED` | `UNLOCKED` | `UNKNOWN`, default `UNKNOWN`), online (bool), lastSeenAt, **ownerId (nullable, UNIQUE — one device per user)**, allocatedAt, credentialHash (nullable, reserved for the hardware phase)
+  — `credentialHash` is **never populated or returned** today and appears in no `select` list.
+  The unique `ownerId`, not just a service check, is what makes concurrent allocation safe.
 - **OtpRequest**: id, userId, deviceId, purpose (`UNLOCK`), codeHash, expiresAt, attempts, consumedAt, createdAt
 - **Command**: id, deviceId, userId, type (`LOCK` | `UNLOCK`), status (`PENDING` | `SENT` | `ACKED` | `FAILED` | `TIMEOUT`), createdAt, ackedAt
 - **RefreshToken**: id, userId, tokenHash (unique — sha256 of an opaque token; the raw value is never stored), familyId, expiresAt, revokedAt, replacedById, graceUsedAt, userAgent, ip, createdAt
@@ -64,11 +66,31 @@ middleware/    # auth, rateLimit, validate, errorHandler
 
 ## Business Rules
 - A user cannot be allocated a device until a payment is **verified server-side** (status `PAID`).
-- One device belongs to one user at a time. Allocation is atomic (use a DB transaction to avoid double allocation).
-- Allocation can be automatic (pick next `UNASSIGNED` device) or manual by admin — implement admin endpoint first, automate later.
-- **Locking** requires only an authenticated session (+ ownership check).
-- **Unlocking** ALWAYS requires a valid OTP. No exceptions, no bypass flags in production.
+- One device belongs to one user at a time, and **a user owns at most one device**
+  (unique `Device.ownerId`). Same answer as the payment rule, which refuses a second
+  order once a user has a `PAID` payment.
+- **All allocation goes through `allocateDevice(userId, deviceId?)`** — one function, so
+  the admin endpoint and (later) webhook auto-allocation cannot drift. Omit `deviceId`
+  for "next available", which picks the oldest `UNASSIGNED` row under
+  `FOR UPDATE SKIP LOCKED` so two admins never collide.
+- Allocation is **manual by an ADMIN today**; the seam for automatic allocation from the
+  payment webhook is in place. See `docs/decisions.md`.
+- Retiring an `ASSIGNED` device is refused (`DEVICE_STILL_ASSIGNED`) — unassign first, so
+  hardware is never retired out of a user's hands.
+- **A refund does not reclaim the device.** `hasPaid: false` with
+  `deviceAllocated: true` is a real state: the dashboard shows an explicit
+  "payment refunded" state with no controls, and the admin Users tab flags the row.
+  Reclaiming is a deliberate admin action.
+- **Locking** requires an authenticated session + ownership check — and, per the refund
+  state above, must **also** require a paid user. Neither condition implies the other.
+- **Unlocking** ALWAYS requires a valid OTP, on top of paid + ownership. No exceptions,
+  no bypass flags in production.
 - Every lock/unlock attempt (success or fail) is written to `AuditLog`.
+- Admin responses are an **explicit allow-list** via Prisma `select` — never whole rows.
+  No password hashes, token hashes or `credentialHash`, ever.
+- Audit metadata holds ids, counts and error codes only; the audit service drops any
+  key matching `email|phone|password|secret|token|hash`. **Failed** admin actions are
+  audited too, with the error code.
 
 ## Razorpay Integration Rules
 - Keys in env: `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`. **Never expose the key secret to the frontend**; only `KEY_ID` goes to the client.
@@ -244,7 +266,15 @@ portable to PowerShell, so use two terminals.
 - ~~Price and plan structure~~ → **provisionally** one-time ₹999 (`SAFE_PRICE_PAISE=99900`),
   changeable via env. Confirm the real figure and whether GST is included.
 - OTP channel: SMS, email, or both?
-- Auto-allocation vs manual admin allocation of devices?
+- ~~Auto-allocation vs manual admin allocation~~ → **manual by ADMIN now**, with
+  `allocateDevice()` ready for the webhook to call. Decide when to switch it on.
+- **Serial number format is provisional** (`^SAFE-[0-9A-Z]{4,12}$`). Confirm what the
+  units are actually stamped with, and whether the serial is also the device's MQTT
+  identity, **before ordering hardware** — changing it later means a migration plus
+  re-labelling stock.
+- Should a refund auto-reclaim the device? Currently **no** (flagged for an admin
+  instead) — tied to the refund policy question below.
+- Admin list page size is 20 (max 100). Confirm if that is wrong for real volumes.
 - Hardware protocol finalized? (MQTT vs HTTP/WebSocket, Wi-Fi vs GSM module)
 - **Refund / device return policy — still open, and now blocking.** `/refund-policy`
   is a published placeholder; the 11 decisions needed are listed on that page and in
@@ -260,8 +290,11 @@ portable to PowerShell, so use two terminals.
    limiting, pino + request ids, DB-backed `/health`, ADMIN seed script
 2. ✅ Razorpay payment (test mode) + webhook — order / verify / webhook / `payments/me`,
    `requirePaid` middleware, legal pages
-3. Device inventory + allocation (admin)
+3. ✅ Device inventory + allocation (admin) — `Device` model, `allocateDevice` with
+   SKIP LOCKED, `requireAdmin`, `/admin` panel (devices / users / payments / audit),
+   `GET /devices/mine`, dashboard allocation states
 4. Lock/Unlock flow with OTP using MockDriver
+   — **must require paid AND assigned device**; unlock additionally requires a valid OTP
 5. Audit log + history page (the `AuditLog` table and writes exist; the `/history` page does not)
 6. Real hardware via MQTT
 7. Convert to mobile app (reuse `/api/v1`)

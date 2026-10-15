@@ -590,3 +590,172 @@ deliberate `next` 16 upgrade with a full build-and-test pass. The remaining
 advisories (`braces` via `eslint-config-next`, `deepmerge-ts` and `mysql2` via
 the `prisma` CLI) are all dev-only toolchain dependencies; `mysql2` in
 particular is dead code here, since the project uses Postgres.
+
+---
+
+## 2026-10-16 — Manual admin allocation first, behind one service function
+
+**Decision:** After payment a user is "waiting for allocation". An ADMIN
+allocates a physical safe by hand through `/admin`. All of it goes through a
+single function, `allocateDevice(userId, deviceId?)` in
+`apps/api/src/modules/devices/device.service.ts`.
+
+**Why manual first:** the hardware is physical. Someone has to put a specific
+unit in a box, and the record must match what was actually shipped. Automating
+that before anyone has shipped one would be automating a process that does not
+exist yet.
+
+**Why one function:** auto-allocation is the obvious next step — the payment
+webhook calling the same code on `payment.captured`. Keeping one entry point
+means the paid / one-per-user / availability rules cannot drift between the
+manual and automatic paths. The webhook can call it without re-deriving a
+single rule.
+
+**Consequence:** `CLAUDE.md`'s open question "auto-allocation vs manual" is
+answered for now as *manual, with the seam for automatic already in place*.
+The function takes an optional `deviceId`: omit it for "next available", pass
+it when the unit in hand must match.
+
+---
+
+## 2026-10-16 — One device per user, enforced by a unique constraint
+
+**Decision:** `Device.ownerId` is `UNIQUE`. A user owns at most one device.
+
+**Why a constraint rather than a service check:** the service checks too, but a
+check is a read followed by a write, and two concurrent allocations can both
+pass the read. The unique index is the only thing that makes "one device per
+user" true under concurrency. The service translates the resulting violation
+back into `ALREADY_HAS_DEVICE` so the client sees a clean 409 rather than a
+database error. There is a test that fires two simultaneous allocations for one
+user and asserts exactly one wins.
+
+**Consequence:** this matches the payment rule, which already refuses a second
+order once a user has a `PAID` payment — so "number of safes per user" is
+answered as **one** throughout. Supporting several safes per user later means
+dropping the unique index, giving `Device` a plain `ownerId` index, and
+revisiting both this and the payment rule together.
+
+---
+
+## 2026-10-16 — Allocation picks with FOR UPDATE SKIP LOCKED
+
+**Decision:** "Next available device" is chosen with a raw
+`SELECT id … WHERE status = 'UNASSIGNED' ORDER BY "createdAt" ASC LIMIT 1 FOR
+UPDATE SKIP LOCKED` inside the allocation transaction. This is the **only** raw
+query in the codebase.
+
+**Why:** two admins clicking Allocate at the same moment is an ordinary event.
+Without row locking both transactions read the same "oldest unassigned" row and
+one fails — or worse, with a weaker check, both succeed. `FOR UPDATE` locks the
+candidate row; `SKIP LOCKED` makes the second transaction step over it and take
+the *next* one instead of blocking. Both admins succeed, with different
+devices.
+
+**Why raw SQL:** Prisma has no row-locking API. The query interpolates nothing
+— there is no caller input in it — and every other query in the project,
+including all admin search, uses Prisma's parameterised filters.
+
+**Consequence:** verified by tests against real Postgres rather than a mock,
+because the locking is the behaviour under test: ten simultaneous allocations
+land on ten distinct devices; one device and two users yields exactly one
+winner and one clean `NO_DEVICES_IN_STOCK`. A `@@index([status, createdAt])`
+supports the pick.
+
+---
+
+## 2026-10-16 — Serial number format is provisional, and normalised before storage
+
+**Decision:** Serials match `^SAFE-[0-9A-Z]{4,12}$` (e.g. `SAFE-0001`), defined
+once as `SERIAL_NUMBER_REGEX` in `packages/shared/src/schemas/devices.ts`. Input
+is **trimmed and uppercased before validation and storage**.
+
+**Why normalise:** `safe-0001`, `SAFE-0001` and `" SAFE-0001 "` are one physical
+safe. Without normalisation a bulk paste from a spreadsheet creates duplicate
+inventory rows for the same unit, and the duplicate check silently misses them.
+Normalising first makes the uniqueness constraint mean what it should.
+
+**PROVISIONAL — needs confirming:** the format was chosen as a placeholder, not
+from a manufacturer's scheme. Before hardware is ordered, confirm what the
+units are actually stamped with, and whether the serial is also the identity the
+device presents over MQTT. Changing it later means a migration plus re-labelling
+anything already in stock. One regex in one file is the only thing to edit.
+
+**Consequence:** bulk import is capped at **500 rows** per request and reports
+every row as created / duplicate / invalid, so one bad line does not reject the
+paste. Duplicates are caught both within the submitted list and against the
+inventory.
+
+---
+
+## 2026-10-16 — A refund does not automatically reclaim the device
+
+**Decision:** When a payment is refunded, `hasPaid` becomes false but the
+device stays `ASSIGNED`. The Users tab flags the row as
+**"Refunded — device still assigned"** with Unassign reachable from the row. No
+webhook revokes hardware automatically.
+
+**Why:** the money and the hardware are separate facts. A refund may be a
+dispute, a goodwill gesture, or a mistake, and silently stripping someone's
+safe — possibly while their valuables are inside — is not a decision code
+should make. The refund policy is still undecided (see the open questions), so
+the conservative behaviour is to surface the state and let a human act.
+
+**Consequence — the state is reachable and must be handled everywhere:**
+`hasPaid: false` with `deviceAllocated: true` is a real combination.
+- The dashboard checks it **first**, before the not-paid branch, and shows an
+  explicit "Your payment was refunded — please contact support about returning
+  your safe" state with **no safe card and no controls**.
+- `/devices/mine` sits behind `requirePaid`, so it already refuses with 402;
+  the dashboard relies on `deviceAllocated` from `/auth/me` for this state
+  rather than on that endpoint.
+- **Lock/unlock, when built, must require BOTH a paid user AND an assigned
+  device.** Neither condition implies the other: a refunded user can hold
+  hardware, and a paid user may be waiting for allocation. `requirePaid` alone
+  is not sufficient, and an ownership check alone is not either.
+
+---
+
+## 2026-10-16 — Admin exposure is an explicit allow-list
+
+**Decision:** Every admin query uses an explicit Prisma `select`. The admin user
+row is exactly: `id`, `name`, `email`, `phone`, `role`, `createdAt`, `hasPaid`,
+`deviceSerial`, and the derived `refundedWithDevice` flag. Nothing else.
+
+**Why:** admin tooling is precisely where a convenient `include: { user: true }`
+starts shipping password hashes to a browser. With `select`, a column added to
+the schema later — a device credential, say — cannot leak into a response
+because nobody remembered to exclude it. `Device.credentialHash` exists in the
+schema already, reserved for the hardware phase, and appears in no select list.
+
+**Consequence:** a test walks every admin response recursively and fails on any
+key matching `passwordHash|tokenHash|credentialHash|refreshToken|secret|
+signature`, or any value that looks like an argon2 hash, with sentinel values
+planted in the database to prove the scan would catch them.
+
+**Audit metadata follows the same rule from the other direction:** the audit
+service drops any metadata key matching `email|phone|password|secret|token|
+hash`. People are identified by `userId`; look the rest up when an
+investigation needs it, rather than spreading personal data into a long-lived,
+widely-readable table. Failed admin actions are audited too, with the error
+code — a run of `NOT_PAID` attempts against one account is a pattern worth
+being able to see.
+
+---
+
+## 2026-10-16 — Admin list search is parameterised only
+
+**Decision:** The `q` parameter on every admin list goes through Prisma's
+`contains` filters, capped at 100 characters by the query schema. No admin
+query builds SQL from a string.
+
+**Why:** the one raw query in the project (the SKIP LOCKED pick) takes no input
+at all. Keeping search parameterised means the entire attack surface for
+injection is a query with no parameters in it. A test sends
+`'; DROP TABLE "Device"; --` as a search term and asserts it is treated as
+literal text and the table survives.
+
+**Consequence:** a new `validateQuery` middleware coerces and bounds every list
+query, so handlers receive a `page` that is a number and a `q` within the cap
+rather than raw strings. Express 5 exposes `req.query` as a getter, so it is
+redefined rather than assigned.
