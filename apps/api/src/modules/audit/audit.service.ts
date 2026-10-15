@@ -46,17 +46,66 @@ export const AUDIT_ACTIONS = {
   WEBHOOK_DUPLICATE: 'payment.webhook.duplicate',
   WEBHOOK_SIGNATURE_FAILED: 'payment.webhook.signature.failed',
   PAYMENT_REQUIRED_BLOCKED: 'payment.required.blocked',
+
+  // --- Devices / allocation -------------------------------------------------
+  DEVICE_CREATED: 'device.created',
+  DEVICE_BULK_CREATED: 'device.bulk_created',
+  DEVICE_ALLOCATED: 'device.allocated',
+  /** An allocation attempt that was refused. Metadata carries the error code. */
+  DEVICE_ALLOCATION_FAILED: 'device.allocation.failed',
+  DEVICE_UNASSIGNED: 'device.unassigned',
+  DEVICE_UNASSIGN_FAILED: 'device.unassign.failed',
+  DEVICE_RETIRED: 'device.retired',
+  DEVICE_RETIRE_FAILED: 'device.retire.failed',
+  /** A non-admin tried to reach an admin route. */
+  ADMIN_ACCESS_DENIED: 'admin.access.denied',
 } as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[keyof typeof AUDIT_ACTIONS];
 
-/** Request-derived context, truncated so a hostile header cannot bloat a row. */
-export function auditContext(req: Request): { ip: string | null; userAgent: string | null } {
+/**
+ * Request-derived context, truncated so a hostile header cannot bloat a row.
+ *
+ * `requestId` ties an audit row to the exact log lines for that request.
+ */
+export function auditContext(req: Request): {
+  ip: string | null;
+  userAgent: string | null;
+  requestId: string | null;
+} {
   const userAgent = req.get('user-agent');
   return {
     ip: req.ip ?? null,
     userAgent: userAgent ? userAgent.slice(0, 500) : null,
+    requestId: req.id ?? null,
   };
+}
+
+/**
+ * Metadata keys that must never be written.
+ *
+ * An audit log is a long-lived, widely-readable record. Identify a person by
+ * `userId` and look the rest up when an investigation actually needs it —
+ * copying emails and phone numbers into every row spreads personal data into
+ * a table nobody thinks of as holding any.
+ */
+const FORBIDDEN_METADATA_KEY = /email|phone|mobile|password|secret|token|signature|otp|hash/i;
+
+function scrubMetadata(
+  metadata: Record<string, unknown> | undefined,
+  action: string,
+): Record<string, unknown> | undefined {
+  if (!metadata) return undefined;
+
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (FORBIDDEN_METADATA_KEY.test(key)) {
+      logger.warn({ action, key }, 'Dropped a forbidden key from audit metadata');
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
 }
 
 export async function writeAudit(input: {
@@ -65,9 +114,12 @@ export async function writeAudit(input: {
   deviceId?: string | null;
   ip?: string | null;
   userAgent?: string | null;
+  requestId?: string | null;
   metadata?: Record<string, unknown>;
 }): Promise<void> {
   try {
+    const metadata = scrubMetadata(input.metadata, input.action);
+
     await prisma.auditLog.create({
       data: {
         action: input.action,
@@ -75,7 +127,10 @@ export async function writeAudit(input: {
         deviceId: input.deviceId ?? null,
         ip: input.ip ?? null,
         userAgent: input.userAgent ?? null,
-        metadata: (input.metadata ?? undefined) as never,
+        metadata: ({
+          ...(metadata ?? {}),
+          ...(input.requestId ? { requestId: input.requestId } : {}),
+        }) as never,
       },
     });
   } catch (cause) {

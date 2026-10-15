@@ -24,6 +24,18 @@ enum PaymentStatus {
   REFUNDED
 }
 
+enum DeviceStatus {
+  UNASSIGNED
+  ASSIGNED
+  RETIRED
+}
+
+enum LockState {
+  LOCKED
+  UNLOCKED
+  UNKNOWN
+}
+
 model User {
   id           String   @id @default(cuid())
   name         String
@@ -41,6 +53,38 @@ model User {
   payments      Payment[]
   auditLogs     AuditLog[]
   refreshTokens RefreshToken[]
+  /// At most one, enforced by the unique constraint on Device.ownerId.
+  device        Device?
+}
+
+/// A physical safe lock in the inventory.
+model Device {
+  id           String       @id @default(cuid())
+  serialNumber String       @unique
+  status       DeviceStatus @default(UNASSIGNED)
+  /// UNKNOWN until real hardware reports its state — the UI must show the
+  /// device's actual state, never "what the last button press implied".
+  lockState    LockState    @default(UNKNOWN)
+  online       Boolean      @default(false)
+  lastSeenAt   DateTime?
+
+  /// Unique: a user owns at most one device for now. The constraint, not just
+  /// a service check, is what makes concurrent allocation safe.
+  ownerId     String?   @unique
+  allocatedAt DateTime?
+
+  /// Reserved for the hardware phase: a hash or key-reference for per-device
+  /// credentials. **Never populated or returned by any endpoint today**, and
+  /// excluded from every `select` list. No device secrets are stored yet.
+  credentialHash String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner User? @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+
+  /// Supports the "oldest UNASSIGNED first" allocation pick.
+  @@index([status, createdAt])
 }
 
 /// One row per issued refresh token.

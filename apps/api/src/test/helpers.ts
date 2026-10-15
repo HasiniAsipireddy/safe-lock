@@ -145,6 +145,38 @@ export function cookieValue(
   return value ? decodeURIComponent(value) : undefined;
 }
 
+// --- Device helpers ----------------------------------------------------------
+
+let deviceSequence = 0;
+
+/** Adds an UNASSIGNED device to the inventory. */
+export async function seedDevice(
+  overrides: { serialNumber?: string; createdAt?: Date } = {},
+): Promise<{ id: string; serialNumber: string }> {
+  deviceSequence += 1;
+  const serialNumber =
+    overrides.serialNumber ?? `SAFE-${String(deviceSequence).padStart(4, '0')}`;
+
+  return prisma.device.create({
+    data: {
+      serialNumber,
+      ...(overrides.createdAt ? { createdAt: overrides.createdAt } : {}),
+    },
+    select: { id: true, serialNumber: true },
+  });
+}
+
+/** Adds `count` devices, oldest first so allocation order is predictable. */
+export async function seedDevices(count: number): Promise<Array<{ id: string; serialNumber: string }>> {
+  const devices: Array<{ id: string; serialNumber: string }> = [];
+  const base = Date.now() - count * 1000;
+
+  for (let index = 0; index < count; index += 1) {
+    devices.push(await seedDevice({ createdAt: new Date(base + index * 1000) }));
+  }
+  return devices;
+}
+
 /** Marks a user's payment PAID the way a settled payment would look. */
 export async function givePaidPayment(userId: string): Promise<{ id: string; orderId: string }> {
   const orderId = `order_PAID${crypto.randomBytes(6).toString('hex')}`;

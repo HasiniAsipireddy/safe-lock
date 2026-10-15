@@ -44,6 +44,22 @@ export const ERROR_CODES = {
    * token family has been revoked as a precaution.
    */
   REFRESH_REUSE_DETECTED: 'REFRESH_REUSE_DETECTED',
+
+  // --- Devices / allocation -------------------------------------------------
+  /** Allocation attempted for a user with no server-verified payment. */
+  NOT_PAID: 'NOT_PAID',
+  /** The user already holds a device (one per user for now). */
+  ALREADY_HAS_DEVICE: 'ALREADY_HAS_DEVICE',
+  /** The requested device is not `UNASSIGNED`. */
+  DEVICE_NOT_AVAILABLE: 'DEVICE_NOT_AVAILABLE',
+  /** No `UNASSIGNED` device left to allocate. */
+  NO_DEVICES_IN_STOCK: 'NO_DEVICES_IN_STOCK',
+  /** Retire was attempted on a device that is still assigned to a user. */
+  DEVICE_STILL_ASSIGNED: 'DEVICE_STILL_ASSIGNED',
+  /** The `userId` supplied to an admin action matches no user. */
+  USER_NOT_FOUND: 'USER_NOT_FOUND',
+  /** A serial number that already exists in the inventory. */
+  DUPLICATE_SERIAL: 'DUPLICATE_SERIAL',
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];

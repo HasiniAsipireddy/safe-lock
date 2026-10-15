@@ -1,0 +1,143 @@
+import { z } from 'zod';
+
+/**
+ * Device and admin request schemas.
+ *
+ * The serial format and the normalisation rule live here and nowhere else, so
+ * the web form, the API and the bulk importer cannot disagree about what a
+ * valid serial is.
+ */
+
+/**
+ * Safe lock serial number format. **Provisional** — see docs/decisions.md.
+ * Example: `SAFE-0001`, `SAFE-A1B2C3`.
+ */
+export const SERIAL_NUMBER_REGEX = /^SAFE-[0-9A-Z]{4,12}$/;
+
+export const SERIAL_NUMBER_HINT = 'Serial must look like SAFE-0001 (4-12 digits/capitals)';
+
+/** Largest number of rows one bulk-create request may carry. */
+export const BULK_CREATE_MAX_ROWS = 500;
+
+/** Admin list pagination. */
+export const DEFAULT_PAGE_SIZE = 20;
+export const MAX_PAGE_SIZE = 100;
+
+/** Longest accepted free-text search term on admin lists. */
+export const MAX_SEARCH_LENGTH = 100;
+
+/**
+ * A serial number, normalised then validated.
+ *
+ * Trim and uppercase happen **before** the regex check, so `" safe-0001 "` and
+ * `"SAFE-0001"` both parse to the same stored value and cannot become two
+ * devices for one physical safe.
+ */
+export const serialNumberSchema = z
+  .string()
+  .trim()
+  .toUpperCase()
+  .min(1, 'Serial number is required')
+  .max(32, 'Serial number is too long')
+  .regex(SERIAL_NUMBER_REGEX, SERIAL_NUMBER_HINT);
+
+/** Normalises a serial without asserting validity — for per-row bulk reports. */
+export function normaliseSerial(raw: string): string {
+  return raw.trim().toUpperCase();
+}
+
+// --- Admin write bodies ------------------------------------------------------
+
+export const createDeviceSchema = z
+  .object({
+    serialNumber: serialNumberSchema,
+  })
+  .strict();
+
+export const bulkCreateDevicesSchema = z
+  .object({
+    /**
+     * Raw, unvalidated serials. Each row is reported on individually, so one
+     * bad line does not reject the whole import — hence `z.string()` here
+     * rather than `serialNumberSchema`.
+     */
+    serialNumbers: z
+      .array(z.string().max(64, 'Serial number is too long'))
+      .min(1, 'Provide at least one serial number')
+      .max(
+        BULK_CREATE_MAX_ROWS,
+        `Too many rows: at most ${BULK_CREATE_MAX_ROWS} serial numbers per request`,
+      ),
+  })
+  .strict();
+
+export const allocateDeviceSchema = z
+  .object({
+    userId: z.string().trim().min(1, 'userId is required').max(64),
+  })
+  .strict();
+
+/** `POST /admin/devices/:id/unassign` and `/retire` take no body. */
+export const emptyBodySchema = z.object({}).strict();
+
+// --- Admin list queries ------------------------------------------------------
+
+const pageSchema = z.coerce.number().int().min(1).default(1);
+const pageSizeSchema = z.coerce.number().int().min(1).max(MAX_PAGE_SIZE).default(DEFAULT_PAGE_SIZE);
+
+/**
+ * Free-text search.
+ *
+ * Capped at {@link MAX_SEARCH_LENGTH}. It is always applied through Prisma's
+ * parameterised `contains` filters — never interpolated into SQL.
+ */
+const searchSchema = z
+  .string()
+  .trim()
+  .max(MAX_SEARCH_LENGTH, `Search term must be at most ${MAX_SEARCH_LENGTH} characters`)
+  .optional();
+
+export const deviceStatusFilterSchema = z
+  .enum(['UNASSIGNED', 'ASSIGNED', 'RETIRED'])
+  .optional();
+
+export const listDevicesQuerySchema = z.object({
+  status: deviceStatusFilterSchema,
+  q: searchSchema,
+  page: pageSchema,
+  pageSize: pageSizeSchema,
+});
+
+/** `paid` and `allocated` are tri-state: absent means "don't filter". */
+const booleanFilterSchema = z
+  .enum(['true', 'false'])
+  .optional()
+  .transform((value) => (value === undefined ? undefined : value === 'true'));
+
+export const listUsersQuerySchema = z.object({
+  paid: booleanFilterSchema,
+  allocated: booleanFilterSchema,
+  q: searchSchema,
+  page: pageSchema,
+  pageSize: pageSizeSchema,
+});
+
+export const listPaymentsQuerySchema = z.object({
+  status: z.enum(['CREATED', 'PAID', 'FAILED', 'REFUNDED']).optional(),
+  page: pageSchema,
+  pageSize: pageSizeSchema,
+});
+
+export const listAuditQuerySchema = z.object({
+  action: z.string().trim().max(MAX_SEARCH_LENGTH).optional(),
+  page: pageSchema,
+  pageSize: pageSizeSchema,
+});
+
+export type CreateDeviceInput = z.infer<typeof createDeviceSchema>;
+export type BulkCreateDevicesInput = z.infer<typeof bulkCreateDevicesSchema>;
+export type AllocateDeviceInput = z.infer<typeof allocateDeviceSchema>;
+export type ListDevicesQuery = z.infer<typeof listDevicesQuerySchema>;
+export type ListUsersQuery = z.infer<typeof listUsersQuerySchema>;
+export type ListPaymentsQuery = z.infer<typeof listPaymentsQuerySchema>;
+export type ListAuditQuery = z.infer<typeof listAuditQuerySchema>;

@@ -7,7 +7,7 @@ import {
 import { prisma } from '../../lib/prisma';
 import { HttpError, conflict } from '../../lib/httpError';
 import { hashPassword, verifyPassword } from './password';
-import { toPublicUser, userHasPaid } from '../users/user.mapper';
+import { toPublicUser, userHasDevice, userHasPaid } from '../users/user.mapper';
 
 const SELECT = {
   id: true,
@@ -52,8 +52,8 @@ export async function signup(input: {
     select: SELECT,
   });
 
-  // A brand-new account cannot have a payment yet.
-  return toPublicUser(user, false);
+  // A brand-new account cannot have a payment or a device yet.
+  return toPublicUser(user, { hasPaid: false, deviceAllocated: false });
 }
 
 /**
@@ -96,5 +96,9 @@ export async function login(input: {
   }
 
   const { passwordHash: _ignored, ...row } = user;
-  return toPublicUser(row, await userHasPaid(row.id));
+  const [hasPaid, deviceAllocated] = await Promise.all([
+    userHasPaid(row.id),
+    userHasDevice(row.id),
+  ]);
+  return toPublicUser(row, { hasPaid, deviceAllocated });
 }

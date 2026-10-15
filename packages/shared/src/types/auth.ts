@@ -18,6 +18,15 @@ export interface PublicUser {
    * actual gating is the API's `requirePaid` middleware.
    */
   hasPaid: boolean;
+  /**
+   * True when a device is currently assigned to this user. Derived per
+   * request, like {@link PublicUser.hasPaid} — not a column.
+   *
+   * `hasPaid: false` with `deviceAllocated: true` is a real, reachable state:
+   * a refunded payment while the hardware is still out. The dashboard has an
+   * explicit state for it, and lock/unlock must require **both** flags.
+   */
+  deviceAllocated: boolean;
 }
 
 /** Response body of `POST /auth/login`, `POST /auth/signup` and `GET /auth/me`. */

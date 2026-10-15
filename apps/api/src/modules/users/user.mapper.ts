@@ -30,7 +30,28 @@ export async function userHasPaid(
   return paid !== null;
 }
 
-export function toPublicUser(user: UserRow, hasPaid: boolean): PublicUser {
+/**
+ * Whether a device is currently assigned to this user.
+ *
+ * Derived, like {@link userHasPaid} — `Device.ownerId` is the single source of
+ * truth, so unassigning takes effect on the next request with no second flag
+ * to keep in step.
+ */
+export async function userHasDevice(
+  userId: string,
+  client: PrismaTransaction | typeof prisma = prisma,
+): Promise<boolean> {
+  const device = await client.device.findUnique({
+    where: { ownerId: userId },
+    select: { id: true },
+  });
+  return device !== null;
+}
+
+export function toPublicUser(
+  user: UserRow,
+  flags: { hasPaid: boolean; deviceAllocated: boolean },
+): PublicUser {
   return {
     id: user.id,
     name: user.name,
@@ -38,11 +59,12 @@ export function toPublicUser(user: UserRow, hasPaid: boolean): PublicUser {
     phone: user.phone,
     role: user.role,
     createdAt: user.createdAt.toISOString(),
-    hasPaid,
+    hasPaid: flags.hasPaid,
+    deviceAllocated: flags.deviceAllocated,
   };
 }
 
-/** Loads a user and their payment state in one go, for `GET /auth/me`. */
+/** Loads a user with their payment and allocation state, for `GET /auth/me`. */
 export async function loadPublicUser(userId: string): Promise<PublicUser | null> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -51,5 +73,10 @@ export async function loadPublicUser(userId: string): Promise<PublicUser | null>
 
   if (!user) return null;
 
-  return toPublicUser(user, await userHasPaid(userId));
+  const [hasPaid, deviceAllocated] = await Promise.all([
+    userHasPaid(userId),
+    userHasDevice(userId),
+  ]);
+
+  return toPublicUser(user, { hasPaid, deviceAllocated });
 }

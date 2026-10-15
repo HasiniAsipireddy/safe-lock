@@ -60,6 +60,7 @@ const accounts: MockAccount[] = [
       createdAt: new Date('2026-01-01T00:00:00.000Z').toISOString(),
       // Starts unpaid so the /pay flow can be walked through end to end.
       hasPaid: false,
+      deviceAllocated: false,
     },
     password: 'Demo1234',
     payments: [],
@@ -205,6 +206,7 @@ function handleSignup(body: unknown): AuthResponse {
     role: 'USER',
     createdAt: new Date().toISOString(),
     hasPaid: false,
+    deviceAllocated: false,
   };
 
   accounts.push({ user, password: input.password, payments: [] });

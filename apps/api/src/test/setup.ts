@@ -8,7 +8,14 @@ import { prisma } from '../lib/prisma';
  * foreign keys do not matter, and it is far faster than row-by-row deletes.
  */
 
-const TABLES = ['RefreshToken', 'Payment', 'WebhookEvent', 'AuditLog', 'User'] as const;
+const TABLES = [
+  'RefreshToken',
+  'Device',
+  'Payment',
+  'WebhookEvent',
+  'AuditLog',
+  'User',
+] as const;
 
 export async function resetDatabase(): Promise<void> {
   const list = TABLES.map((table) => `"${table}"`).join(', ');
