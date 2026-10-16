@@ -50,6 +50,38 @@ body {
   outline-offset: 2px;
 }
 
+/*
+ * Respect prefers-reduced-motion.
+ *
+ * Nothing here animates decoratively — the moving parts are colour
+ * transitions on buttons and links, and the loading spinners. The blanket rule
+ * collapses transitions to effectively nothing, which is what someone who gets
+ * motion sickness or has a vestibular disorder has asked the OS for.
+ *
+ * The spinner is the one exception, and is slowed rather than stopped. It
+ * carries meaning — "a command is in flight to a physical safe" — and a frozen
+ * arc reads as a broken page rather than a busy one. Every spinner in the app
+ * sits next to its own text ("Signing in…", "Loading your activity…") and an
+ * aria-busy or role="status", so the information survives either way; this just
+ * keeps the visual affordance without a fast rotation.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .animate-spin {
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
 /* Hide the browser's own password reveal control — we ship our own toggle. */
 input::-ms-reveal,
 input::-ms-clear {

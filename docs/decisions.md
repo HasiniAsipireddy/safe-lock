@@ -80,7 +80,9 @@ latency and one seeded demo account (`demo@example.com` / `Demo1234`).
 **Guard rails:**
 - `apps/web/src/lib/env.ts` **throws at startup** if `NODE_ENV === 'production'`
   and mock mode is on, so a production build cannot ship the fake backend.
-- A sticky amber **"Mock mode"** badge is visible on every page while it is on.
+- An amber **"Mock mode"** badge sits at the top of every page while it is on.
+  (It was sticky until 2026-10-16, when it turned out to park itself over the
+  `/history` sticky day headings — see the polish note at the end of this file.)
 - Mock accounts live in module memory only; nothing created by signup survives a
   full page reload. The mock "session" is a user id in `sessionStorage` — it is
   not a token and grants nothing.
@@ -1115,3 +1117,29 @@ sized to clear several visible tabs plus a fetch on every visibility change
 and bell open. A failed poll keeps the last good data rather than blanking the
 bell. If the staleness ever becomes a real complaint, the answer is a shorter
 interval or a push channel for unlocks specifically — not a socket for a badge.
+
+---
+
+## 2026-10-16 — Polish: the mock badge gives up the sticky slot, and reduced motion is honoured
+
+**Two small fixes, recorded because both were wrong in a way that only shows
+up on one page or one OS setting.**
+
+**The mock badge is no longer sticky.** It was `sticky top-0 z-50`; the
+`/history` day headings are `sticky top-0 z-10`. Both claim the same position
+and the badge wins on z-index, so scrolling the activity feed parked each day's
+heading underneath an opaque amber bar — on the one page where knowing which
+day you are looking at is the point. Raising the headings' z-index only inverts
+the problem (the heading then covers the banner's text), and offsetting them
+with `top-[height]` needs a height that changes when the banner wraps on a
+narrow screen or expands to show the demo credentials. A dev-only banner has no
+claim on the sticky slot: it now scrolls away with the rest of the page.
+
+**`prefers-reduced-motion: reduce` is now honoured**, which it previously was
+not at all. Transitions collapse to nothing; the loading spinner is **slowed to
+1.5s rather than stopped**. Stopping it leaves a static arc that reads as a
+broken page rather than a busy one, and the thing it reports — a command in
+flight to a physical safe — is exactly when a user should not be guessing.
+Every spinner already sits beside its own text and an `aria-busy` /
+`role="status"`, so the information survives regardless; the exception just
+keeps the visual affordance for people who can see it.

@@ -5,9 +5,19 @@ import { USE_MOCK_API } from '@/lib/env';
 import { MOCK_DEMO_CREDENTIALS } from '@/lib/mockApi';
 
 /**
- * Always-visible reminder that the auth API is faked, plus the seeded demo
- * credentials. Renders nothing when NEXT_PUBLIC_USE_MOCK_API is off (and mock
- * mode cannot be on in production — see lib/env.ts).
+ * Reminder that the auth API is faked, plus the seeded demo credentials.
+ * Renders nothing when NEXT_PUBLIC_USE_MOCK_API is off (and mock mode cannot
+ * be on in production — see lib/env.ts).
+ *
+ * **Deliberately not sticky.** It used to be `sticky top-0 z-50`, which put it
+ * in the same place as the `/history` day headings (`sticky top-0 z-10`) and
+ * won on z-index — so scrolling the activity feed parked each day's heading
+ * underneath an opaque amber bar and the reader lost track of which day they
+ * were looking at. Raising the headings' z-index would just invert the
+ * problem, and offsetting them needs this banner's height, which changes when
+ * it wraps or expands. A dev banner has no reason to follow the user down the
+ * page: it scrolls away, and the sticky slot belongs to the page's own
+ * content.
  */
 export function MockModeBadge() {
   const [expanded, setExpanded] = useState(false);
@@ -15,7 +25,7 @@ export function MockModeBadge() {
   if (!USE_MOCK_API) return null;
 
   return (
-    <div className="sticky top-0 z-50 border-b border-amber-300 bg-amber-100 text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
+    <div className="border-b border-amber-300 bg-amber-100 text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
       <div className="mx-auto flex max-w-md flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2 text-xs sm:px-6">
         <span className="inline-flex items-center gap-1.5 font-semibold tracking-wide uppercase">
           <span
