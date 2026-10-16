@@ -1279,3 +1279,305 @@ change, one for reset): the stale device is refused as an ended session, the
 caller's own refresh still succeeds, and no `reuse_detected` row is written.
 The existing reuse-detection tests are unchanged and still pass, so genuine
 replay still kills the family.
+
+---
+
+## 2026-10-16 — WhatsApp is the delivery channel; phone stays required
+
+**Decision:** OTP delivery, unlock alerts and password-reset notices go over
+the **Meta WhatsApp Cloud API**, behind a `WhatsAppClient` seam with a fake and
+a real implementation selected by `WHATSAPP_PROVIDER=fake|cloud`. `User.phone`
+stays **required and unique**, in the 10-digit national form it has always
+stored; E.164 is derived at the delivery boundary by `toE164`.
+
+**Why no nullable phone / email-only signup:** it was considered and is a
+deliberate non-goal for now. Making `phone` nullable touches signup, the
+unique constraint, the admin lists and the shared types, in exchange for a
+state the product has no channel for anyway. "No channel" therefore means
+**"phone not verified yet"**, which is a state the user can fix in a minute,
+rather than "this account can never receive a message".
+
+**Why India-only normalisation:** the signup form has always demanded a
+10-digit Indian mobile, the price is in paise, and a number we cannot validate
+is a number we cannot be confident WhatsApp will reach. A valid E.164 number
+with the wrong country code is rejected rather than stored and discovered at
+the first unlock.
+
+**No grandfathering.** Every existing account starts unverified and must
+verify before it can unlock. Nothing is deployed and there are no live users,
+so the migration cost is zero and the alternative — a flag exempting "old"
+accounts — is a permanent hole nobody would ever close.
+
+**Consequence:** `maskPhone` is the only phone representation allowed into a
+log line or an audit row, and it is allowlisted in both the logger's redaction
+regex and the audit service's metadata scrubber. Full numbers are redacted
+everywhere else, including `to`, `recipient`, `msisdn` and `templateParams`.
+
+---
+
+## 2026-10-16 — A WhatsApp failure must not stop a safe from opening
+
+**Decision:** The in-app notification stays **atomic with and blocking on** the
+unlock transaction, exactly as step 2 decided. The WhatsApp message does not:
+`WhatsAppNotifier` writes an `OutboundMessage` row through the same transaction
+client, and a poll worker sends it after the commit. This reverses step 2's
+trade-off **for the external channel only**.
+
+**Why the reversal is right here and wrong there:** step 2's rule — a notifier
+that cannot record rolls the unlock back — rests on the in-app notifier being a
+single insert on the same connection, which effectively cannot fail on its own.
+"The safe opened and we never recorded it" is then genuinely the worse failure.
+A third-party HTTP API is not like that. Applying the same rule to WhatsApp
+would mean **a safe that refuses to open because a notification channel is
+down**, which is far worse than a late message: the owner is standing in front
+of their safe, and the authoritative record (the in-app notification and
+`/history`) is written either way.
+
+**Sending from inside the transaction is wrong in both directions.** A message
+already delivered cannot be unsent by a rollback, so someone could be told
+their safe opened when it did not; and a send that blocks the transaction makes
+the outage fatal. Writing a row is a local insert, so it keeps the atomicity
+and moves the only fallible part outside.
+
+**The outbox is deliberately minimal, and does not need a queue.** One table,
+one `setInterval`, `FOR UPDATE SKIP LOCKED` to claim (the same pattern as the
+device allocation pick), capped attempts with exponential backoff (30s, 2m, 8m,
+32m, capped at an hour). The property that matters — a rollback cannot unsend a
+message — comes from writing the row inside the transaction, not from the
+transport. A broker would add concurrency and scheduling this workload has no
+use for, plus a service to run and a second failure domain. The upgrade seam is
+`lib/outbox/outbox.service.ts`; revisit when there is a second API instance,
+which is the same trigger as the `TODO(scale)` on rate limiting.
+
+**The worker starts from `server.ts` only, never `createApp()`.** A worker that
+started with the app would tick during the test suite, racing every assertion
+about outbox state. Tests call `processPending()` directly.
+
+**`SKIPPED` is a distinct terminal status, not a kind of `FAILED`.** It means we
+chose not to send — no verified number, no consent, cap spent — so nothing was
+attempted and nothing should be retried. Collapsing the two would bury a real
+provider outage inside a pile of "this user has no phone yet".
+
+---
+
+## 2026-10-16 — The outbox stores no template parameters, and what that forces
+
+**Decision:** `OutboundMessage` has no column for message text or template
+parameters. Parameters are rebuilt from live data at send time
+(`lib/outbox/params.ts`).
+
+**Why:** parameters can contain a one-time code, and writing a code to a table
+is the one thing the OTP design exists to prevent — only an HMAC of a code is
+ever stored. A queued payload column would quietly undo that.
+
+**What it forces, and why that is also correct:** the two OTP kinds
+(`UNLOCK_OTP`, `PHONE_OTP`) **cannot be queued at all** — `buildParams` throws
+for them. So they are sent **inline**, which is independently right: the user is
+waiting for the code, and one that arrives after a retry backoff has already
+expired. The outbox therefore carries exactly the messages that are *about
+something already recorded* — alerts and the reset notice — whose parameters
+can be read back whenever the send happens.
+
+**Consequence:** a dump of `OutboundMessage` says who was messaged about what,
+and contains no codes. A test asserts the table's exact column list, so adding
+a `params` column later has to be a deliberate decision rather than a quiet
+one.
+
+---
+
+## 2026-10-16 — The reset message carries no token
+
+**Decision:** The password-reset WhatsApp template tells the user a reset was
+requested and carries **no token and no link**. The token reaches them only
+through the flow they started.
+
+**Why:** a WhatsApp message is persistent, forwardable and backed up to
+whatever cloud the account is mirrored to. A reset token is an account takeover
+in one string, valid for 30 minutes. Putting one in a chat thread means it
+outlives its window in someone's message history and on every device that
+account is signed in to. The message that *is* worth sending is the alert
+half — "a reset was requested; if it wasn't you, your password still works" —
+which is the half that matters for a physical-security product.
+
+**This is a narrowing of what was asked for**, recorded here rather than done
+silently. It is also why `OutboundMessageKind.PASSWORD_RESET` takes no
+parameters.
+
+**The cap applies here, unlike to an unlock code.** An unlock code is an owner
+reaching their own safe and must never be cap-blocked — that would be the cap
+doing more harm than the abuse it prevents. A reset alert is triggered by an
+*unauthenticated* request against a known address, which is exactly the
+endpoint someone would use to bombard a stranger's phone.
+
+**And the cap must not become an oracle.** `/auth/password/forgot` answers
+byte-identically for a registered address, an unregistered one, a user with no
+verified phone, and a user whose cap is spent. Any observable difference would
+hand back the disclosure the identical response was built to deny — "this
+address has an account that has been messaged a lot today" is still an answer.
+Four tests pin this.
+
+---
+
+## 2026-10-16 — Phone uniqueness fails closed, and the masked number rescues the typo
+
+**Decision:** Requesting verification for a number that belongs to **another**
+account answers exactly like a success — same status, same body shape — and
+**sends nothing**. The collision is recorded only in the audit log.
+
+**Why:** `User.phone` is unique, so the number cannot be taken either way. The
+question is what the caller learns. "That number is already registered" lets
+anyone test whether a given mobile has a Safe Lock account, and therefore
+probably a safe in their house. For a physical-security product that is a worse
+disclosure than it first appears, and the endpoint is authenticated only in the
+sense that *some* account is signed in — not that it has any claim to the
+number being tested.
+
+**The cost, and how it is paid:** a user who mistypes a digit into a stranger's
+number would otherwise see "code sent" and wait forever. So the response
+carries the **masked** number (`+91 98****10`) and the UI shows it prominently.
+They supplied the number, so it reveals nothing, and it is enough to recognise
+that the number is not theirs.
+
+**Also decided:** no code is ever sent to a number the caller has not proved a
+claim to. That is the other half of failing closed — answering identically
+while still messaging the stranger would be worse than the oracle.
+
+---
+
+## 2026-10-16 — `PHONE_NOT_VERIFIED` gates unlock, not lock
+
+**Decision:** `assertCanOperate` refuses an **unlock** without
+`phoneVerifiedAt`, with a 403 and its own error code. **Locking is not
+gated.** The check sits after paid/refunded and before the device lookup.
+
+**Why lock stays open:** locking needs no one-time code, it is the safe
+direction, and blocking it would leave an unverified user unable to secure
+their own safe. A gate that prevents someone protecting their valuables is a
+gate doing harm.
+
+**Why that order:** paid and refunded come first because they are facts about
+the account the user may be unable to change right now. An unverified number is
+fixable in a minute, so saying so is more useful than `NO_DEVICE` — which the
+user can do nothing about — and checking it before the device lookup means
+someone still waiting on allocation learns to verify in the meantime.
+
+**Consequence:** `requestUnlock` *and* `confirmUnlock` both check it. The second
+call is the one that moves the bolt, and a number could have been unverified
+between the two.
+
+---
+
+## 2026-10-16 — Webhook authentication is the HMAC, and CSRF does not apply
+
+**Decision:** `POST /api/v1/webhooks/whatsapp` verifies `X-Hub-Signature-256` —
+HMAC-SHA256 over the **raw body bytes** with the app secret, constant-time
+compared — and is exempt from the Origin check and carries no cookies. `GET`
+answers Meta's verify-token handshake. Both are rate limited per IP.
+
+**Why CSRF does not apply:** CSRF is the abuse of a browser's *ambient
+credentials*. This endpoint has none to abuse — no cookie, no session, no
+`Authorization` — so there is nothing for a cross-site request to borrow. And a
+forged request cannot produce a valid signature without the shared secret,
+which is a stronger claim than an `Origin` header: a header is supplied by the
+caller, a signature cannot be. The Razorpay webhook has relied on exactly this
+since step 2; `app.ts` now keeps both paths in one `RAW_BODY_PATHS` list used by
+the parser bypass and the originCheck exemption.
+
+**The signature is checked in middleware, before the handler.** An
+unauthenticated caller never reaches `JSON.parse`, let alone the database, so
+the attack surface of a public endpoint is one HMAC comparison. A test posts
+non-JSON with a bad signature and asserts **401 rather than 400** — a 400 would
+prove the body had been parsed first.
+
+**Idempotency is by rank, not by a ledger.** Statuses apply only when they move
+the record forward (sent → delivered → read), so Meta's retries and
+out-of-order deliveries cannot walk it backwards, and a repeat does not even
+move the timestamp. `failed` applies from any state, because it is news rather
+than progress. Unlike the Razorpay webhook there is no `WebhookEvent` ledger:
+the update is already idempotent by construction, and a ledger would be a
+second thing to keep correct.
+
+**An unknown message id is a 200, not a 404.** A retry cannot fix "we never
+issued that id" — it is a message from another environment, or a pruned row —
+and Meta retries anything that is not a 2xx, forever.
+
+---
+
+## 2026-10-16 — The OTP delivery-failure window, stated rather than hidden
+
+**Decision:** When a code cannot be delivered, `requestUnlock` **consumes the
+challenge it just created** and answers 502 `OTP_DELIVERY_FAILED`. The
+unlock-request rate limiters refund a 5xx, so an outage does not also burn the
+user's three-codes-per-ten-minutes.
+
+**Why consume it:** leaving the challenge open would mean a live code for five
+minutes that the owner never received — a code usable only by someone who
+intercepted it. The user gets a clear error and can simply ask again.
+
+**The window, plainly:** the commit and the send are two steps and **nothing can
+make them atomic** — a send cannot join a database transaction, and a
+transaction cannot un-send. If the process dies between the commit and the
+compensating consume, an undelivered challenge stays open until it expires on
+its own five minutes later. Three things bound it: that is the same five-minute
+exposure an ordinary unread code already has; it requires a crash inside a
+window of roughly a hundred milliseconds; and the code only ever existed in the
+memory of the process that died. Closing it properly would need a two-phase
+protocol with the provider, which Meta does not offer.
+
+**Why the refund is scoped to 5xx:** every 4xx still counts, so a caller
+cycling request/confirm with wrong codes is bounded exactly as before. There
+are tests for both halves.
+
+---
+
+## 2026-10-16 — A per-user daily cap on WhatsApp sends
+
+**Decision:** `WHATSAPP_DAILY_SEND_CAP` (default **10**) messages per user per
+**rolling** 24 hours, across every kind. Counted from `OutboundMessage` rows
+that were actually attempted (`PENDING`, `SENT`, `FAILED`); `SKIPPED` rows cost
+nothing and do not consume the allowance.
+
+**Why:** every message costs money and lands on a real person's phone. An
+uncapped send endpoint is both a billing risk and a way to use this product to
+harass someone.
+
+**Why rolling rather than calendar-day:** a calendar cap resets at midnight in
+a timezone we did not choose, which hands an abuser a predictable refill and a
+legitimate user an arbitrary cliff.
+
+**Where it does and does not apply:**
+- **Unlock codes ignore it.** An owner reaching their own safe must not be
+  locked out by a messaging quota; the unlock rate limiter (3 per 10 minutes)
+  and the paid-plus-verified-plus-allocated gate already bound that path.
+- **Verification and reset respect it**, and answer differently on purpose:
+  verification is authenticated, so it returns 429 `WHATSAPP_SEND_CAP_REACHED`
+  with the time the window reopens; `/forgot-password` is unauthenticated, so it
+  stays byte-identical and silently skips the send.
+
+---
+
+## 2026-10-16 — Templates, and why the names come from the environment
+
+**Decision:** Five approved templates, one per `OutboundMessageKind`, with
+their **names read from `WHATSAPP_TEMPLATE_*` environment variables** rather
+than hardcoded.
+
+**Why from the environment:** template names are created and approved per
+WhatsApp Business account in Meta's console. Hardcoding a name would assume an
+approval this codebase cannot verify, and a rejected or renamed template would
+need a code change and a deploy rather than a config change.
+
+**Categories matter and are not interchangeable.** The three code-carrying
+templates are **authentication** category: Meta allows them to be delivered
+outside the 24-hour customer-service window, which is exactly what an unlock
+code needs, and requires a copy-code button with no custom URLs. The two alerts
+are **utility** category — they are about a transaction the user performed.
+Marketing category is never used and must not be: it is rate-limited by Meta
+per user and can be switched off by the recipient, neither of which is
+acceptable for a security alert.
+
+**Consequence:** the exact template definitions to submit to Meta are in
+`README.md`, alongside the production environment variables they map to. Until
+they are approved, `WHATSAPP_PROVIDER=fake` is the only working configuration —
+which the env schema enforces by refusing `fake` in production, so a
+half-configured deployment fails at boot rather than silently sending nothing.

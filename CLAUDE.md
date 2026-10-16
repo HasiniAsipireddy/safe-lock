@@ -50,7 +50,11 @@ middleware/    # auth, rateLimit, validate, errorHandler
 ```
 
 ## Data Model (Prisma — starting point)
-- **User**: id, name, email, phone, passwordHash, role (`USER` | `ADMIN`), createdAt
+- **User**: id, name, email, phone, passwordHash, role (`USER` | `ADMIN`), createdAt, **phoneVerifiedAt**, **whatsappConsentAt**, **whatsappConsentVersion**
+  — `phone` stays **required and unique** in its 10-digit national form; E.164
+  is derived at the delivery boundary. Nullable phone / email-only signup is a
+  deliberate non-goal (`docs/decisions.md`). `phoneVerifiedAt` null means **no
+  unlock and no WhatsApp message of any kind**; locking is still allowed.
 - **Payment**: id, userId, razorpayOrderId (unique), razorpayPaymentId (nullable, unique), amount (paise, Int), currency, status (`CREATED` | `PAID` | `FAILED` | `REFUNDED`), paidAt, createdAt
   — **the signature is verified and discarded, never stored**: keeping it buys nothing and
   widens what a database leak exposes.
@@ -83,6 +87,20 @@ middleware/    # auth, rateLimit, validate, errorHandler
   `Notifier` seam, so neither can exist without the other. Its own enum, not
   `DeviceEventType`: most device events notify nobody. Holds **no message text** —
   copy comes from `NOTIFICATION_COPY` in `@safelock/shared` at render time.
+- **PhoneVerification**: id, userId, phoneE164, otpHash, expiresAt, attempts, consumedAt, requestedIp, userAgent, createdAt
+  — the **candidate** number lives here and only reaches `User.phone` on
+  confirmation, so changing a verified number leaves the old one live and
+  receiving codes until the new one is proved. Same HMAC, TTL and attempt
+  limit as `UnlockChallenge`; a new request supersedes the old one.
+- **OutboundMessage**: id, userId, kind, status (`PENDING` | `SENT` | `FAILED` |
+  `SKIPPED`), attempts, failureCategory, nextAttemptAt, providerMessageId
+  (unique), deliveryStatus, deliveryUpdatedAt, deviceEventId, timestamps
+  — the WhatsApp outbox. Written **inside** the unlock transaction by
+  `WhatsAppNotifier` (a local insert, so still atomic) and sent by a poll
+  worker **after** the commit, so a WhatsApp outage cannot stop a safe from
+  opening. **Holds no message text and no template parameters** — they are
+  rebuilt at send time, which is why a one-time code can never be queued.
+  `SKIPPED` is terminal and distinct from `FAILED`: nothing was attempted.
 - ~~**Command**~~ — **deferred to the MQTT gateway.** The mock acks synchronously, so
   there is nothing in flight to track and nothing to time out. Command ids/nonces and the
   15s timeout land with it. See `docs/decisions.md`.
@@ -117,8 +135,11 @@ middleware/    # auth, rateLimit, validate, errorHandler
   Reclaiming is a deliberate admin action.
 - **Locking** requires an authenticated session + ownership check — and, per the refund
   state above, must **also** require a paid user. Neither condition implies the other.
-- **Unlocking** ALWAYS requires a valid OTP, on top of paid + ownership. No exceptions,
-  no bypass flags in production.
+- **Unlocking** ALWAYS requires a valid OTP, on top of paid + ownership + a
+  **verified phone** (`PHONE_NOT_VERIFIED`, 403). No exceptions, no bypass
+  flags in production. **Locking is deliberately not phone-gated**: it needs no
+  code, it is the safe direction, and blocking it would leave an unverified
+  user unable to secure their own safe.
 - Every lock/unlock attempt (success or fail) is written to `AuditLog`.
 - Admin responses are an **explicit allow-list** via Prisma `select` — never whole rows.
   No password hashes, token hashes or `credentialHash`, ever.
@@ -169,10 +190,12 @@ middleware/    # auth, rateLimit, validate, errorHandler
   30 minutes, is single-use, and unknown / expired / already-used all answer
   the same `RESET_TOKEN_INVALID`. **Reset does not log the user in** — no user,
   no cookies; they sign in with the new password.
-  **It does not work in production yet**: like the unlock OTP, delivery is
-  unbuilt, so `deliverPasswordReset` prints to the dev console behind
-  `mayPrintResetToken(NODE_ENV)` and logs a warning in production. Same open
-  question, same one function body to change.
+  Delivery goes through the `ResetSender` seam to **WhatsApp, to a verified
+  number only**. The message deliberately carries **no token** — a chat
+  message is persistent and forwardable, and a reset token is an account
+  takeover in one string (see `docs/decisions.md`). A user with no verified
+  phone has **no channel**, and `/forgot-password` says so generically without
+  revealing which case it hit.
 - **`POST /auth/password/change`** (authenticated) verifies the current
   password, then revokes **every** refresh token and reissues a fresh family to
   the caller in one transaction: still signed in here, signed out everywhere
@@ -212,6 +235,15 @@ middleware/    # auth, rateLimit, validate, errorHandler
 - Never log OTPs or return them in API responses. The dev console print is guarded by
   `mayPrintOtp(NODE_ENV)` in `otp.service.ts` — true only for `development`/`test`, so an
   unset or misspelled `NODE_ENV` falls through to silence, not to printing a code.
+- **Delivery is WhatsApp, sent inline and never queued.** `deliverOtp` returns
+  its outcome; on failure `requestUnlock` **consumes the challenge it just
+  created** and answers 502 `OTP_DELIVERY_FAILED`, so no undelivered code is
+  left live. The two unlock-request limiters refund a 5xx (an outage must not
+  burn the user's allowance); every 4xx still counts. The ~100ms window between
+  commit and compensation is documented in `docs/decisions.md`.
+- A code can never be queued: `OutboundMessage` stores no template parameters,
+  so `buildParams` **throws** for the OTP kinds. A code that arrived after a
+  retry backoff would have expired anyway.
 - A new request **invalidates the previous challenge**, so exactly one code is ever live.
   Without that, "5 attempts per challenge" silently becomes "5 attempts per request".
 - Endpoints (no device id in the path — the device is resolved from the session, so
@@ -271,6 +303,33 @@ interface DeviceGateway {
 - Event retention is **undecided and nothing deletes events** — see the open
   questions.
 
+## WhatsApp, Verification & Outbox
+- One seam, `WhatsAppClient` (`apps/api/src/lib/whatsapp/`), two
+  implementations chosen by `WHATSAPP_PROVIDER`. **Templates only, never free
+  text** — Meta requires a pre-approved template, so there is no method that
+  sends an arbitrary string and no user input can become message content.
+- `FakeWhatsAppClient` records sends in memory and can be told to fail
+  deterministically (delivery failure is a real path with required behaviour).
+  `mayUseFakeWhatsApp(NODE_ENV)` guards it exactly like `mayPrintOtp`.
+- `CloudApiWhatsAppClient` has a timeout and **never retries**: a send is not
+  idempotent, so a blind retry risks a second code on someone's phone.
+  Retrying is the outbox's decision, from a typed error category.
+- **Nothing is sent from inside a transaction.** `WhatsAppNotifier` writes an
+  outbox row through the transaction client; the worker sends after the commit.
+  The in-app notification keeps step 2's atomic-and-blocking contract.
+- Phone numbers are normalised to **E.164** by `toE164` in
+  `@safelock/shared`; `maskPhone` (`+91 98****10`) is the **only** phone
+  representation allowed in a log line or audit row, and is allowlisted in
+  both the logger regex and the audit scrubber.
+- `POST /api/v1/webhooks/whatsapp` verifies `X-Hub-Signature-256` over the
+  **raw body** with the app secret, constant-time, **before parsing** — 401
+  otherwise. Exempt from `originCheck` like the Razorpay webhook: there are no
+  ambient credentials to abuse and an HMAC is a stronger claim than an Origin
+  header. Idempotent by status rank, so retries cannot walk a record backwards.
+- **No test can reach the network**: `test/setup.ts` replaces `fetch` with a
+  throwing stub for the whole suite, and the Cloud client is unit-tested
+  against a stub.
+
 ## API Conventions
 - Base path `/api/v1`, JSON only, consistent error shape: `{ "error": { "code": "...", "message": "..." } }`.
 - Validate every request body/query with **zod**.
@@ -296,9 +355,16 @@ interface DeviceGateway {
   `peekMockUnlockCode`.
 - `/reset-password?token=…` — new password + confirm. Distinct states for a
   missing token, a dead link and success. **Ends at "sign in", not signed in.**
-- `/account` — name (editable), email and phone (read-only, with the reason),
-  and change-password. Two independent forms: a password change ends every
-  other session and a name change does not, so they do not share a button.
+- `/account` — phone verification (`#phone`), name (editable), email
+  (read-only, with the reason), and change-password. Independent forms: a
+  password change ends every other session and a name change does not, so they
+  do not share a button. The verification step shows the **masked** number the
+  code went to, which is the only way a user who mistyped can notice — the API
+  answers identically for a number owned by someone else.
+- A **"verify your phone" prompt** appears on `/dashboard` and `/account` for
+  any unverified user, not only when an unlock is refused: discovering the
+  requirement when you need to open your safe is discovering it too late. The
+  Unlock button is disabled with the reason shown; Lock stays enabled.
 - `/pay` — plan/price + Razorpay Checkout
 - `/dashboard` — safe status card, Lock / Unlock buttons, last activity
 - `/dashboard/unlock` — OTP entry (6 input boxes, resend timer 30s)
@@ -341,8 +407,16 @@ OTP_HMAC_SECRET=change_me     # REQUIRED, 32+ chars; keys the unlock-code HMAC.
                               # Password reset needs NO secret of its own — its
                               # tokens are 32 random bytes under a plain sha256.
 DEVICE_GATEWAY=mock           # mock (only value today; mqtt arrives with hardware)
-# Not yet used — added with WhatsApp delivery and the MQTT gateway:
-# SMS_PROVIDER_API_KEY=xxxxx
+WHATSAPP_PROVIDER=fake        # fake | cloud. `fake` is REFUSED in production.
+# Required when WHATSAPP_PROVIDER=cloud, in every environment:
+# WHATSAPP_ACCESS_TOKEN=      # System User token for production
+# WHATSAPP_PHONE_NUMBER_ID=   # not the phone number itself
+# WHATSAPP_APP_SECRET=        # keys the webhook HMAC
+# WHATSAPP_WEBHOOK_VERIFY_TOKEN=   # a random string you choose
+# WHATSAPP_TEMPLATE_* (five names), WHATSAPP_LANGUAGE, WHATSAPP_API_VERSION,
+# WHATSAPP_TIMEOUT_MS, WHATSAPP_DAILY_SEND_CAP (default 10, rolling 24h),
+# OUTBOX_POLL_INTERVAL_MS, OUTBOX_MAX_ATTEMPTS — see apps/api/.env.example
+# Not yet used — added with the MQTT gateway:
 # MQTT_URL=mqtts://broker.example.com
 # MQTT_USERNAME=
 # MQTT_PASSWORD=
@@ -389,17 +463,21 @@ portable to PowerShell, so use two terminals.
 ## Open Questions (to decide)
 - ~~Price and plan structure~~ → **provisionally** one-time ₹999 (`SAFE_PRICE_PAISE=99900`),
   changeable via env. Confirm the real figure and whether GST is included.
-- **OTP channel — still open and now user-facing.** Codes are currently printed to the
-  API console only, so unlock works in development and **not in production**:
-  `deliverOtp` logs a warning and sends nothing there. WhatsApp vs SMS vs email needs
-  deciding before launch. One function body to change.
-  — **Password reset has the same gap, and is blocked on the same decision.**
-  `deliverPasswordReset` prints to the dev console behind
-  `mayPrintResetToken(NODE_ENV)` and sends nothing in production, so
-  `/forgot-password` works in development and **cannot work in production until
-  a channel exists**. Reset is email-shaped and the OTP is phone-shaped, so this
-  may well be two providers rather than one — but neither is built, and shipping
-  the account pages without saying so would be worse than the gap.
+- ~~OTP channel~~ → **decided: WhatsApp (Meta Cloud API).** Unlock codes,
+  verification codes and alerts are delivered through the `WhatsAppClient` seam.
+  Working in production **once five templates are approved by Meta and the four
+  `WHATSAPP_*` credentials are set** — see README. Until then
+  `WHATSAPP_PROVIDER=fake` is the only legal value, and the env schema refuses
+  `fake` in production so a half-configured deploy fails at boot rather than
+  silently sending nothing.
+- **Email provider for password reset — open, and the one real gap left.**
+  Reset is delivered to a **verified phone**, so a user who never verified and
+  then forgets their password has no self-service path. `/forgot-password`
+  still answers byte-identically and says reset goes to a verified number;
+  the dashboard and `/account` nag unverified users precisely to shrink this
+  window. The long-term fix is an email sender (the seam is
+  `lib/resetSender/`, which an email implementation joins as a composite, not
+  a replacement).
 - ~~Auto-allocation vs manual admin allocation~~ → **manual by ADMIN now**, with
   `allocateDevice()` ready for the webhook to call. Decide when to switch it on.
 - **Serial number format is provisional** (`^SAFE-[0-9A-Z]{4,12}$`). Confirm what the
@@ -452,12 +530,22 @@ portable to PowerShell, so use two terminals.
    `/account` pages, plus a polish pass (mock badge unstuck from the sticky
    history headings, `prefers-reduced-motion` honoured). **Reset delivery is
    not built**, so it works in development only.
-7. Real hardware via MQTT — also brings the `Command` table, command nonces and the
+7. ✅ WhatsApp delivery + phone verification — `WhatsAppClient` seam (fake +
+   Cloud API), `OutboundMessage` outbox with a poll worker, `CompositeNotifier`
+   (in-app stays atomic, WhatsApp cannot block an unlock), `ResetSender`,
+   `POST /account/phone/request-verification|confirm`, `PHONE_NOT_VERIFIED`
+   gating unlock only, a rolling daily send cap, and the signed delivery
+   webhook. **Needs five Meta-approved templates before it works in
+   production.** Email-only reset is still open.
+8. Real hardware via MQTT — also brings the `Command` table, command nonces and the
    15s ack timeout, all deliberately deferred until there is a transport that can
    lose a message
-8. Convert to mobile app (reuse `/api/v1`)
+9. Convert to mobile app (reuse `/api/v1`)
 
-**Postponed (deliberately not built):** WhatsApp/SMS phone verification. There
-is no `phoneVerifiedAt` column and no `requireVerifiedPhone` middleware. The
-places it will hook in are marked `TODO(phone-verification)` in
-`apps/api/src/modules/payments/payments.routes.ts` and the Prisma schema.
+**Built in step 7:** WhatsApp phone verification. `phoneVerifiedAt` exists and
+`assertCanOperate` enforces it for unlock. There is still **no
+`requireVerifiedPhone` middleware on the payment routes** — the
+`TODO(phone-verification)` markers in
+`apps/api/src/modules/payments/payments.routes.ts` remain, deliberately:
+gating payment on verification is a product decision, not a security one, and
+nobody has made it.

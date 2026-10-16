@@ -437,6 +437,171 @@ filterable by action name (try `device.`). Both successes and failures are
 recorded; failures carry the error code, and every row carries the
 `requestId` that ties it to the server log lines.
 
+## WhatsApp delivery and phone verification
+
+Unlock codes, verification codes, unlock alerts and password-reset notices are
+delivered over the **Meta WhatsApp Cloud API**.
+
+### Local development: nothing to configure
+
+`WHATSAPP_PROVIDER=fake` (the default) records messages in memory and sends
+nothing. Codes are printed to the API console, exactly as before:
+
+```
+  [dev] Unlock code for SAFE-0001: 418203  (expires 2026-10-16T12:05:00.000Z)
+  [dev] Phone verification code for +91 98****10: 905114  (expires ...)
+```
+
+The fake client **cannot be used in production** — the env schema refuses to
+boot, and `mayUseFakeWhatsApp` refuses to construct it. No test in the repo can
+reach the network either: `test/setup.ts` replaces `fetch` with a throwing stub
+for the whole suite.
+
+### What you need from Meta for production
+
+Four credentials, from <https://developers.facebook.com> → your app:
+
+| Variable | Where it comes from |
+| --- | --- |
+| `WHATSAPP_ACCESS_TOKEN` | WhatsApp → API Setup. The temporary token expires in 24h — create a **System User** token for production. |
+| `WHATSAPP_PHONE_NUMBER_ID` | WhatsApp → API Setup → "Phone number ID". Not the phone number itself. |
+| `WHATSAPP_APP_SECRET` | App Settings → Basic → App Secret. Keys the webhook HMAC. |
+| `WHATSAPP_WEBHOOK_VERIFY_TOKEN` | A random string **you** choose. Paste the same value into WhatsApp → Configuration → Webhook. |
+
+Plus: a verified WhatsApp Business phone number, a completed business
+verification, and the five approved templates below.
+
+Set `WHATSAPP_PROVIDER=cloud`. The API refuses to start if any of the four is
+missing or still a placeholder.
+
+### Webhook
+
+Point Meta at `https://<your-api-host>/api/v1/webhooks/whatsapp` and subscribe
+to the **messages** field. Meta will GET it once with your verify token; the
+API echoes the challenge back. Delivery statuses then arrive by POST and update
+`OutboundMessage.deliveryStatus`.
+
+Locally, use ngrok exactly as for the Razorpay webhook:
+
+```bash
+ngrok http 4000
+# then use https://<id>.ngrok-free.app/api/v1/webhooks/whatsapp
+```
+
+The signature is verified over the raw body with the app secret before the body
+is parsed, so a request without a valid `X-Hub-Signature-256` is a 401 and
+never reaches the database.
+
+### The five templates to submit to Meta
+
+Create these under WhatsApp → Manage templates. **Category matters**: the three
+code-carrying templates must be `AUTHENTICATION`, which is what allows delivery
+outside the 24-hour customer-service window — an unlock code is useless if it
+can only be sent to someone who messaged you first. The two alerts are
+`UTILITY`. Never use `MARKETING` for any of these: Meta rate-limits it per
+recipient and lets users switch it off, neither of which is acceptable for a
+security alert.
+
+Authentication templates are built from Meta's fixed authentication layout:
+the body is boilerplate you select rather than free text, you add a **copy-code
+button**, and custom URLs are not allowed. The wording below is what that
+layout produces; match it rather than pasting it verbatim if the console
+differs.
+
+---
+
+**1. `safelock_unlock_code`** — category **AUTHENTICATION**, language `en`
+
+- Body: `{{1}} is your verification code. For your security, do not share this code.`
+- Button: **Copy code** (zero-tap off, code expiry 5 minutes)
+- Parameters: `{{1}}` = the 6-digit code
+- Sample: `418203`
+
+> Note: Meta's authentication layout permits only the code parameter, so the
+> safe's serial is **not** in this message. The API passes
+> `[code, serialNumber]`; if your approved template accepts only one
+> parameter, drop the second from `deliverOtp` in
+> `apps/api/src/modules/devices/otp.service.ts` — it is the one line that
+> decides this.
+
+**2. `safelock_phone_verification`** — category **AUTHENTICATION**, language `en`
+
+- Body: `{{1}} is your verification code. For your security, do not share this code.`
+- Button: **Copy code** (code expiry 5 minutes)
+- Parameters: `{{1}}` = the 6-digit code
+- Sample: `905114`
+
+**3. `safelock_password_reset`** — category **AUTHENTICATION**, language `en`
+
+- Body: `{{1}} is your verification code. For your security, do not share this code.`
+- Parameters: **none** — the API sends an empty parameter list
+- Sample: n/a
+
+> This template deliberately carries **no token and no link** (see
+> docs/decisions.md). A chat message is persistent, forwardable and
+> cloud-backed-up; a reset token is an account takeover in one string. If the
+> authentication layout forces a code parameter, submit this one as
+> `UTILITY` instead with the body:
+> `A password reset was requested for your Safe Lock account. If this wasn't you, your password still works and no action is needed.`
+
+**4. `safelock_unlock_alert`** — category **UTILITY**, language `en`
+
+- Body: `Your Safe Lock safe {{1}} was just unlocked. If this wasn't you, lock it from the app and contact support.`
+- Parameters: `{{1}}` = the safe's serial number
+- Sample: `SAFE-0001`
+
+**5. `safelock_failed_attempts`** — category **UTILITY**, language `en`
+
+- Body: `Five incorrect unlock codes were entered for your Safe Lock safe {{1}}. The code has been cancelled. If this wasn't you, contact support.`
+- Parameters: `{{1}}` = the safe's serial number
+- Sample: `SAFE-0001`
+
+---
+
+If Meta approves a template under a different name, set the matching
+`WHATSAPP_TEMPLATE_*` variable — nothing in the code assumes a name.
+
+### Phone verification
+
+Every account starts **unverified** and must verify before it can unlock; there
+is no grandfathering. Locking is never gated — it needs no code, and an
+unverified user must still be able to secure their safe.
+
+```
+POST /api/v1/account/phone/request-verification  { phone, consent, currentPassword? }
+POST /api/v1/account/phone/confirm               { otp }
+```
+
+`currentPassword` is required only when the account already has a verified
+number: moving the number that receives unlock codes is a credential change.
+The old number keeps working until the new one is confirmed.
+
+A request for a number that belongs to another account answers **identically**
+to a success and sends nothing — saying "that number is taken" would let anyone
+test whether a given mobile has an account, and therefore probably a safe. The
+response carries the masked number (`+91 98****10`) so an honest typo is still
+visible.
+
+### Send caps
+
+`WHATSAPP_DAILY_SEND_CAP` (default 10) messages per user per rolling 24 hours.
+Unlock codes are exempt: a messaging quota must never lock an owner out of
+their own safe. Verification answers `429 WHATSAPP_SEND_CAP_REACHED` with a
+retry time; `/auth/password/forgot` stays byte-identical and silently skips the
+send, because any observable difference there would be an account-enumeration
+oracle.
+
+### Inspecting the outbox
+
+```bash
+docker compose exec -T postgres psql -U safelock -d safelock -c \
+  'SELECT kind, status, attempts, "failureCategory", "deliveryStatus" FROM "OutboundMessage" ORDER BY "createdAt" DESC LIMIT 20;'
+```
+
+`SKIPPED` means we chose not to send (no verified number, no consent, cap
+spent) — not a failure, and never retried. The table holds no message text and
+no template parameters, so no one-time code can reach it.
+
 ## Tests
 
 The API suite runs against the real `safelock_test` database (truncated between
