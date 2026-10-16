@@ -15,13 +15,13 @@ import { env } from '../../config/env';
  * all three as parameters would be harder to audit than two short files.
  */
 
-/** The signature Meta should have sent for this body. */
-export function expectedSignature(rawBody: Buffer | string): string {
-  if (!env.WHATSAPP_APP_SECRET) {
-    // Unreachable in cloud mode: the env schema requires it. Thrown rather
-    // than returning a value that could accidentally compare equal.
-    throw new Error('WHATSAPP_APP_SECRET is not configured');
-  }
+/** The signature Meta should have sent for this body, or null if we cannot tell. */
+export function expectedSignature(rawBody: Buffer | string): string | null {
+  // Required in cloud mode by the env schema, and optional in fake mode —
+  // where this endpoint has no legitimate caller anyway. Returning null rather
+  // than throwing keeps "cannot verify" on the reject path: a misconfiguration
+  // must fail closed, not 500, and certainly not accept.
+  if (!env.WHATSAPP_APP_SECRET) return null;
 
   return crypto
     .createHmac('sha256', env.WHATSAPP_APP_SECRET)
@@ -50,6 +50,8 @@ export function verifySignature(
   if (!/^[a-f0-9]{64}$/i.test(provided)) return false;
 
   const expected = expectedSignature(rawBody);
+  // No secret configured: we cannot verify, so we reject. Never accept.
+  if (!expected) return false;
 
   // Both are now known to be 64 hex chars, so timingSafeEqual cannot throw on
   // a length mismatch — and comparing in constant time is what stops an

@@ -320,6 +320,30 @@ describe('POST /webhooks/whatsapp — idempotency', () => {
   });
 });
 
+describe('an unconfigured app secret', () => {
+  /**
+   * `WHATSAPP_APP_SECRET` is required in cloud mode but optional in fake mode,
+   * where this endpoint has no legitimate caller. "Cannot verify" must land on
+   * the **reject** path — not a 500, and certainly not an accept.
+   */
+  it('rejects rather than throwing when there is no secret to verify with', async () => {
+    const original = env.WHATSAPP_APP_SECRET;
+    // @ts-expect-error — deliberately unsetting a validated value for this test.
+    env.WHATSAPP_APP_SECRET = undefined;
+
+    try {
+      const body = statusBody('wamid.NOSECRET', 'delivered');
+      const response = await postRaw(body, `sha256=${'a'.repeat(64)}`);
+
+      expect(response.status).toBe(401);
+      expect(response.body.error.code).toBe('INVALID_SIGNATURE');
+    } finally {
+      // @ts-expect-error — restoring it.
+      env.WHATSAPP_APP_SECRET = original;
+    }
+  });
+});
+
 describe('GET /webhooks/whatsapp — the handshake', () => {
   it('echoes the challenge when the verify token matches', async () => {
     const response = await request(app())
