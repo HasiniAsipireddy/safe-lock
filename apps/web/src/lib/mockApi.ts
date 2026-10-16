@@ -21,11 +21,17 @@ import {
   OTP_MAX_ATTEMPTS,
   OTP_RESEND_COOLDOWN_SECONDS,
   OTP_TTL_MS,
+  PASSWORD_RESET_TTL_MS,
+  RESET_TOKEN_BYTES,
   UNLOCK_FAILURE_LABELS,
+  changePasswordBodySchema,
   classifyIdentifier,
+  forgotPasswordSchema,
   normaliseSerial,
   otpSchema,
+  resetPasswordBodySchema,
   serialNumberSchema,
+  updateProfileSchema,
   type AdminAuditRow,
   type AdminDeviceRow,
   type AdminPaymentRow,
@@ -38,6 +44,7 @@ import {
   type DeviceEventType,
   type DeviceStatus,
   type DeviceSummary,
+  type ForgotPasswordResponse,
   type HistoryEvent,
   type HistoryResponse,
   type LockResponse,
@@ -48,6 +55,7 @@ import {
   type NotificationType,
   type NotificationsResponse,
   type Paginated,
+  type PasswordResetResponse,
   type PaymentMeResponse,
   type PaymentSummary,
   type PublicUser,
@@ -332,6 +340,14 @@ export async function mockRequest<T>(
       return handleMe() as T;
     case 'POST /auth/refresh':
       return handleRefresh() as T;
+    case 'POST /auth/password/forgot':
+      return handleMockForgotPassword(body) as T;
+    case 'POST /auth/password/reset':
+      return handleMockResetPassword(body) as T;
+    case 'POST /auth/password/change':
+      return handleMockChangePassword(body) as T;
+    case 'PATCH /auth/profile':
+      return handleMockUpdateProfile(body) as T;
     case 'GET /payments/me':
       return handlePaymentMe() as T;
     case 'POST /payments/order':
@@ -490,6 +506,175 @@ function requireAccount(): MockAccount {
   }
 
   return account;
+}
+
+// --- Password reset / account (mock) ----------------------------------------
+
+/**
+ * The mock's in-memory reset token.
+ *
+ * Unlike the API this keeps the token in plaintext — it has to, because there
+ * is nowhere to deliver it and the dev-only panel on `/forgot-password`
+ * displays it. That is exactly why mock mode is refused in production builds
+ * (`lib/env.ts`): this object would be a working account-takeover credential
+ * sitting in browser memory.
+ */
+interface MockResetToken {
+  email: string;
+  token: string;
+  expiresAt: number;
+  consumed: boolean;
+}
+
+let mockResetToken: MockResetToken | null = null;
+
+/**
+ * The reset token the mock just issued, for the dev-only hint on
+ * `/forgot-password`. There is no equivalent in the real flow — the API never
+ * returns a token, only a neutral `{ status: 'ok' }`.
+ *
+ * Guarded exactly like {@link peekMockUnlockCode}: callers gate on
+ * `USE_MOCK_API`, which cannot be true in a production build.
+ */
+export function peekMockResetToken(): string | null {
+  if (!mockResetToken || mockResetToken.consumed) return null;
+  if (mockResetToken.expiresAt <= Date.now()) return null;
+  return mockResetToken.token;
+}
+
+/**
+ * Mirrors the API: the response is the same for a registered and an
+ * unregistered address, and a new request supersedes any older live token.
+ */
+function handleMockForgotPassword(body: unknown): ForgotPasswordResponse {
+  const parsed = forgotPasswordSchema.safeParse(body ?? {});
+
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Enter a valid email address',
+    );
+  }
+
+  const account = accounts.find((candidate) => candidate.user.email === parsed.data.email);
+
+  // A token is only minted for a real account — but the answer below does not
+  // depend on that, which is the whole point of the endpoint.
+  if (account) {
+    mockResetToken = {
+      email: account.user.email,
+      token: mockRandomToken(),
+      expiresAt: Date.now() + PASSWORD_RESET_TTL_MS,
+      consumed: false,
+    };
+    recordAudit('auth.password.reset_requested', { userId: account.user.id });
+  } else {
+    recordAudit('auth.password.reset_requested_unknown');
+  }
+
+  return { status: 'ok' };
+}
+
+/** 32 bytes of base64url, the same shape the API issues. */
+function mockRandomToken(): string {
+  const bytes = new Uint8Array(RESET_TOKEN_BYTES);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+/** Mirrors the API, including that a successful reset does **not** sign in. */
+function handleMockResetPassword(body: unknown): PasswordResetResponse {
+  const parsed = resetPasswordBodySchema.safeParse(body ?? {});
+
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Please check the highlighted fields.',
+    );
+  }
+
+  const live = mockResetToken;
+  const usable =
+    live !== null &&
+    !live.consumed &&
+    live.expiresAt > Date.now() &&
+    live.token === parsed.data.token;
+
+  // Unknown, expired and already-used all answer identically.
+  if (!live || !usable) {
+    return fail(
+      400,
+      ERROR_CODES.RESET_TOKEN_INVALID,
+      'That reset link is invalid or has expired. Please request a new one.',
+    );
+  }
+
+  const account = accounts.find((candidate) => candidate.user.email === live.email);
+  if (!account) {
+    return fail(
+      400,
+      ERROR_CODES.RESET_TOKEN_INVALID,
+      'That reset link is invalid or has expired. Please request a new one.',
+    );
+  }
+
+  live.consumed = true;
+  account.password = parsed.data.password;
+  // Every session ends, like the API revoking all refresh tokens — and the
+  // caller is *not* signed in by this.
+  setSessionUserId(null);
+  recordAudit('auth.password.reset_completed', { userId: account.user.id });
+
+  return { status: 'ok' };
+}
+
+function handleMockChangePassword(body: unknown): AuthResponse {
+  const account = requireAccount();
+  const parsed = changePasswordBodySchema.safeParse(body ?? {});
+
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Please check the highlighted fields.',
+    );
+  }
+
+  // A 400, not a 401 — matching the API, so the client's refresh-and-retry
+  // path is never triggered by a mistyped password.
+  if (account.password !== parsed.data.currentPassword) {
+    return fail(400, ERROR_CODES.PASSWORD_INCORRECT, 'That is not your current password.');
+  }
+
+  account.password = parsed.data.password;
+  // The caller stays signed in; the mock has no other sessions to revoke.
+  recordAudit('auth.password.changed', { userId: account.user.id });
+
+  return { user: account.user };
+}
+
+function handleMockUpdateProfile(body: unknown): AuthResponse {
+  const account = requireAccount();
+  // `.strict()`, so a body also carrying an email or phone is a 400 here too.
+  const parsed = updateProfileSchema.safeParse(body ?? {});
+
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Please check the highlighted fields.',
+    );
+  }
+
+  account.user = { ...account.user, name: parsed.data.name };
+  recordAudit('auth.profile.updated', { userId: account.user.id });
+
+  return { user: account.user };
 }
 
 // --- Payments ----------------------------------------------------------------

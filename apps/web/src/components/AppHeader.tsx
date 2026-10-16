@@ -26,6 +26,7 @@ export function AppHeader() {
   const links = [
     { href: '/dashboard', label: 'Dashboard' },
     { href: '/history', label: 'Activity' },
+    { href: '/account', label: 'Account' },
     ...(user.role === 'ADMIN' ? [{ href: '/admin', label: 'Admin' }] : []),
   ];
 

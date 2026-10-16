@@ -9,7 +9,13 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import type { AuthResponse, LoginInput, PublicUser, SignupInput } from '@safelock/shared';
+import type {
+  AuthResponse,
+  ChangePasswordBody,
+  LoginInput,
+  PublicUser,
+  SignupInput,
+} from '@safelock/shared';
 import { api, registerUnauthorizedHandler } from '@/lib/api';
 import { ApiError } from '@/lib/apiError';
 
@@ -21,6 +27,13 @@ export interface AuthContextValue {
   login: (input: LoginInput) => Promise<PublicUser>;
   signup: (input: SignupInput) => Promise<PublicUser>;
   logout: () => Promise<void>;
+  /** Updates the profile. Name only — the API rejects anything else. */
+  updateProfile: (name: string) => Promise<PublicUser>;
+  /**
+   * Changes the password. The caller stays signed in on new cookies; every
+   * other session is revoked server-side.
+   */
+  changePassword: (input: ChangePasswordBody) => Promise<PublicUser>;
   /**
    * Re-reads `GET /auth/me`. Needed after anything that changes server-side
    * state the UI branches on — notably `hasPaid` once a payment is verified.
@@ -113,6 +126,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const updateProfile = useCallback(async (name: string) => {
+    const { user: me } = await api.patch<AuthResponse>('/auth/profile', { name });
+    setUser(me);
+    return me;
+  }, []);
+
+  /**
+   * The API revokes every refresh token and immediately issues the caller a
+   * new family in the same response, so there is nothing to do here but take
+   * the updated user — the new cookies arrive with it. The password itself is
+   * never kept beyond this call.
+   */
+  const changePassword = useCallback(async (input: ChangePasswordBody) => {
+    const { user: me } = await api.post<AuthResponse>('/auth/password/change', {
+      currentPassword: input.currentPassword,
+      password: input.password,
+    });
+    setUser(me);
+    return me;
+  }, []);
+
   const refreshUser = useCallback(async () => {
     try {
       const { user: me } = await api.get<AuthResponse>('/auth/me');
@@ -131,8 +165,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo<AuthContextValue>(
-    () => ({ user, status, login, signup, logout, refreshUser }),
-    [user, status, login, signup, logout, refreshUser],
+    () => ({
+      user,
+      status,
+      login,
+      signup,
+      logout,
+      updateProfile,
+      changePassword,
+      refreshUser,
+    }),
+    [user, status, login, signup, logout, updateProfile, changePassword, refreshUser],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
