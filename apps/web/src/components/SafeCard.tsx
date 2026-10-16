@@ -6,6 +6,7 @@ import { LockStateBadge, OnlineBadge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { UnlockDialog } from '@/components/UnlockDialog';
+import { useAuth } from '@/context/AuthContext';
 import { api } from '@/lib/api';
 import { toUserMessage } from '@/lib/apiError';
 
@@ -23,6 +24,8 @@ import { toUserMessage } from '@/lib/apiError';
  *   pair of buttons whose effect nobody can predict.
  */
 export function SafeCard({ device: initial }: { device: DeviceSummary }) {
+  const { user } = useAuth();
+  const phoneVerified = user?.phoneVerified ?? false;
   const [device, setDevice] = useState(initial);
   const [locking, setLocking] = useState(false);
   const [confirmLock, setConfirmLock] = useState(false);
@@ -114,14 +117,29 @@ export function SafeCard({ device: initial }: { device: DeviceSummary }) {
         >
           {device.lockState === 'LOCKED' ? 'Locked' : 'Lock'}
         </Button>
+        {/*
+          Unlock is disabled for an unverified number, because the API refuses
+          it (403 PHONE_NOT_VERIFIED) — the one-time code has nowhere to go.
+          Offering a button that cannot work and explaining afterwards is worse
+          than saying so now; the dashboard also shows a prompt with the fix.
+
+          Lock stays enabled: it needs no code, and an unverified user must
+          still be able to secure their own safe.
+        */}
         <Button
           variant="secondary"
           onClick={() => setUnlocking(true)}
-          disabled={stateUnavailable || locking}
+          disabled={stateUnavailable || locking || !phoneVerified}
         >
           Unlock
         </Button>
       </div>
+
+      {!phoneVerified ? (
+        <p className="mt-2 text-sm text-amber-800 dark:text-amber-200">
+          Verify your phone number to unlock. Locking still works.
+        </p>
+      ) : null}
 
       <p
         role="status"

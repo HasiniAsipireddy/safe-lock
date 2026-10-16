@@ -22,15 +22,22 @@ import {
   OTP_RESEND_COOLDOWN_SECONDS,
   OTP_TTL_MS,
   PASSWORD_RESET_TTL_MS,
+  PHONE_OTP_MAX_ATTEMPTS,
+  PHONE_OTP_RESEND_COOLDOWN_SECONDS,
+  PHONE_OTP_TTL_MS,
   RESET_TOKEN_BYTES,
   UNLOCK_FAILURE_LABELS,
   changePasswordBodySchema,
   classifyIdentifier,
+  confirmPhoneVerificationSchema,
   forgotPasswordSchema,
+  maskPhone,
   normaliseSerial,
   otpSchema,
+  requestPhoneVerificationSchema,
   resetPasswordBodySchema,
   serialNumberSchema,
+  toNationalPhone,
   updateProfileSchema,
   type AdminAuditRow,
   type AdminDeviceRow,
@@ -57,6 +64,7 @@ import {
   type Paginated,
   type PasswordResetResponse,
   type PaymentMeResponse,
+  type PhoneVerificationRequestResponse,
   type PaymentSummary,
   type PublicUser,
   type UnlockConfirmResponse,
@@ -350,6 +358,10 @@ export async function mockRequest<T>(
       return handleMockChangePassword(body) as T;
     case 'PATCH /auth/profile':
       return handleMockUpdateProfile(body) as T;
+    case 'POST /account/phone/request-verification':
+      return handleMockRequestPhoneVerification(body) as T;
+    case 'POST /account/phone/confirm':
+      return handleMockConfirmPhoneVerification(body) as T;
     case 'GET /payments/me':
       return handlePaymentMe() as T;
     case 'POST /payments/order':
@@ -676,6 +688,182 @@ function handleMockUpdateProfile(body: unknown): AuthResponse {
 
   account.user = { ...account.user, name: parsed.data.name };
   recordAudit('auth.profile.updated', { userId: account.user.id });
+
+  return { user: account.user };
+}
+
+// --- Phone verification (mock) ----------------------------------------------
+
+/**
+ * The mock's in-memory verification challenge.
+ *
+ * Holds the code in plaintext, as the unlock challenge does and for the same
+ * reason: there is nowhere to deliver it and the dev-only panel displays it.
+ * Which is exactly why mock mode is refused in production builds.
+ */
+interface MockPhoneChallenge {
+  userId: string;
+  phoneE164: string;
+  code: string;
+  expiresAt: number;
+  attempts: number;
+  consumed: boolean;
+}
+
+let mockPhoneChallenge: MockPhoneChallenge | null = null;
+
+/**
+ * The verification code the mock just issued, for the dev-only hint.
+ *
+ * Guarded exactly like {@link peekMockUnlockCode}: callers gate on
+ * `USE_MOCK_API`, which cannot be true in a production build.
+ */
+export function peekMockPhoneCode(): string | null {
+  if (!mockPhoneChallenge || mockPhoneChallenge.consumed) return null;
+  if (mockPhoneChallenge.expiresAt <= Date.now()) return null;
+  return mockPhoneChallenge.code;
+}
+
+function handleMockRequestPhoneVerification(
+  body: unknown,
+): PhoneVerificationRequestResponse {
+  const account = requireAccount();
+  const parsed = requestPhoneVerificationSchema.safeParse(body ?? {});
+
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Enter a valid mobile number',
+    );
+  }
+
+  // Consent first and unconditionally, matching the API.
+  if (!parsed.data.consent) {
+    return fail(
+      400,
+      ERROR_CODES.CONSENT_REQUIRED,
+      'Please agree to receive WhatsApp messages so we can send your code.',
+    );
+  }
+
+  const national = toNationalPhone(parsed.data.phone)!;
+
+  if (account.user.phoneVerified && account.user.phone === national) {
+    return fail(
+      409,
+      ERROR_CODES.PHONE_ALREADY_VERIFIED,
+      'That number is already verified on your account.',
+    );
+  }
+
+  // Changing an already-verified number needs the password, as on the server.
+  if (account.user.phoneVerified) {
+    if (parsed.data.currentPassword !== account.password) {
+      return fail(
+        400,
+        ERROR_CODES.PASSWORD_INCORRECT,
+        'Enter your current password to change your verified number.',
+      );
+    }
+  }
+
+  /**
+   * Uniqueness fails closed, exactly as the API does: a number owned by
+   * another account answers identically and sends nothing. The masked number
+   * below is what lets a user spot their own typo.
+   */
+  const takenByAnother = accounts.some(
+    (candidate) => candidate.user.id !== account.user.id && candidate.user.phone === national,
+  );
+
+  if (!takenByAnother) {
+    mockPhoneChallenge = {
+      userId: account.user.id,
+      phoneE164: parsed.data.phone,
+      code: String(Math.floor(Math.random() * 1_000_000)).padStart(6, '0'),
+      expiresAt: Date.now() + PHONE_OTP_TTL_MS,
+      attempts: 0,
+      consumed: false,
+    };
+    recordAudit('account.phone.verification_requested', { userId: account.user.id });
+  } else {
+    recordAudit('account.phone.verification_requested', {
+      userId: account.user.id,
+      metadata: { collision: true, sent: false },
+    });
+  }
+
+  return {
+    maskedPhone: maskPhone(parsed.data.phone),
+    expiresAt: new Date(Date.now() + PHONE_OTP_TTL_MS).toISOString(),
+    expiresInSeconds: Math.round(PHONE_OTP_TTL_MS / 1000),
+    attemptsAllowed: PHONE_OTP_MAX_ATTEMPTS,
+    resendAfterSeconds: PHONE_OTP_RESEND_COOLDOWN_SECONDS,
+  };
+}
+
+function handleMockConfirmPhoneVerification(body: unknown): AuthResponse {
+  const account = requireAccount();
+  const parsed = confirmPhoneVerificationSchema.safeParse(body ?? {});
+
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Enter the 6-digit code',
+    );
+  }
+
+  const challenge = mockPhoneChallenge;
+  const live =
+    challenge !== null && !challenge.consumed && challenge.userId === account.user.id;
+
+  if (!challenge || !live) {
+    return fail(
+      400,
+      ERROR_CODES.PHONE_VERIFICATION_NOT_FOUND,
+      'That code is no longer valid. Request a new one.',
+    );
+  }
+
+  if (challenge.expiresAt <= Date.now()) {
+    challenge.consumed = true;
+    return fail(
+      400,
+      ERROR_CODES.PHONE_VERIFICATION_EXPIRED,
+      'That code has expired. Request a new one.',
+    );
+  }
+
+  if (parsed.data.otp !== challenge.code) {
+    challenge.attempts += 1;
+
+    if (challenge.attempts >= PHONE_OTP_MAX_ATTEMPTS) {
+      challenge.consumed = true;
+      return fail(
+        400,
+        ERROR_CODES.PHONE_VERIFICATION_TOO_MANY_ATTEMPTS,
+        'Too many incorrect codes. Request a new one.',
+      );
+    }
+
+    const left = PHONE_OTP_MAX_ATTEMPTS - challenge.attempts;
+    return fail(
+      400,
+      ERROR_CODES.PHONE_VERIFICATION_INVALID,
+      `That code is not correct. ${left} attempt${left === 1 ? '' : 's'} left.`,
+    );
+  }
+
+  challenge.consumed = true;
+  // Only now does the number become the account's, as on the server.
+  account.user = {
+    ...account.user,
+    phone: toNationalPhone(challenge.phoneE164)!,
+    phoneVerified: true,
+  };
+  recordAudit('account.phone.verified', { userId: account.user.id });
 
   return { user: account.user };
 }

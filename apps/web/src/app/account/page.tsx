@@ -18,6 +18,10 @@ import { FormError } from '@/components/ui/FormError';
 import { Input } from '@/components/ui/Input';
 import { PasswordInput } from '@/components/ui/PasswordInput';
 import { PasswordStrengthMeter } from '@/components/PasswordStrengthMeter';
+import {
+  PhoneVerificationCard,
+  VerifyPhonePrompt,
+} from '@/components/PhoneVerificationCard';
 import { Protected } from '@/components/RouteGuard';
 
 /**
@@ -40,6 +44,15 @@ export default function AccountPage() {
             Your details and password.
           </p>
         </header>
+
+        {/* The nudge first, for an unverified user: it is the one thing on
+            this page that blocks the product's main action. */}
+        <VerifyPhonePrompt />
+
+        {/* `id` is the anchor the prompt and the dashboard banner link to. */}
+        <div id="phone">
+          <PhoneVerificationCard />
+        </div>
 
         <ProfileCard />
         <PasswordCard />

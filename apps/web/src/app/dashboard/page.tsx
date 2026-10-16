@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/Button';
 import { PaymentRequiredBanner } from '@/components/PaymentRequiredBanner';
 import { AllocationTimeline } from '@/components/AllocationTimeline';
 import { SafeCard } from '@/components/SafeCard';
+import { VerifyPhonePrompt } from '@/components/PhoneVerificationCard';
 import { api } from '@/lib/api';
 import { toUserMessage } from '@/lib/apiError';
 
@@ -52,6 +53,18 @@ function DashboardContent() {
         </h1>
         <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">{user?.email}</p>
       </header>
+
+      {/*
+        Shown to every unverified user, not only when an unlock is refused.
+        Discovering the requirement at the moment you need to open your safe is
+        discovering it too late — and the same gap makes password reset
+        unreachable, since reset is delivered to a verified number.
+
+        Placed after the refunded check below in importance but before the
+        safe card: a refunded user has nothing to unlock, so the prompt is
+        suppressed for them by returning early from that branch.
+      */}
+      {!refundedWithDevice && user?.hasPaid ? <VerifyPhonePrompt /> : null}
 
       {refundedWithDevice ? (
         <RefundedNotice />
