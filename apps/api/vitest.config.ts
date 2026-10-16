@@ -35,6 +35,23 @@ export default defineConfig({
       // real browser. originCheck matches it by exact string equality.
       WEB_ORIGIN: 'http://localhost:3000,http://localhost:3001',
       LOG_LEVEL: 'error',
+
+      /**
+       * WhatsApp: the suite runs on the **fake** client, which has no network
+       * at all. `test/setup.ts` additionally blocks `fetch` for the whole
+       * suite, so a client written without a fake fails loudly rather than
+       * messaging a real phone number.
+       *
+       * The cloud credentials below exist only so the Cloud API client can be
+       * *constructed* in its unit test, which drives it against a stubbed
+       * fetch. They are throwaway strings and reach nothing.
+       */
+      WHATSAPP_PROVIDER: 'fake',
+      WHATSAPP_ACCESS_TOKEN: 'vitest_whatsapp_access_token_do_not_use',
+      WHATSAPP_PHONE_NUMBER_ID: '100000000000000',
+      // Fixed so a webhook signature is reproducible inside a test.
+      WHATSAPP_APP_SECRET: 'vitest_whatsapp_app_secret_do_not_use',
+      WHATSAPP_WEBHOOK_VERIFY_TOKEN: 'vitest_whatsapp_verify_token',
     },
   },
 });
