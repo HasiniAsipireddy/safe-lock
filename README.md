@@ -15,10 +15,14 @@ Razorpay payment flow, the legal pages, device inventory + manual allocation
 with an admin panel, and **remote lock / unlock with a one-time code** against
 a mock device.
 
-**Not built yet:** real hardware (the gateway is a mock that always acks), the
-`/history` page, phone verification, and **OTP delivery** — codes are printed
-to the API console in development and are *not* sent anywhere in production.
-Pick a channel before launch; see `docs/decisions.md`.
+Also built: the **`/history` activity feed** and **in-app unlock
+notifications** (a header bell with an unread count).
+
+**Not built yet:** real hardware (the gateway is a mock that always acks),
+phone verification, and **OTP delivery** — codes are printed to the API
+console in development and are *not* sent anywhere in production. Pick a
+channel before launch; see `docs/decisions.md`. Notifications are in-app only;
+WhatsApp plugs into the existing `Notifier` seam.
 
 ---
 
@@ -281,6 +285,12 @@ verification, signature failure and webhook.
 | `POST` | `/api/v1/auth/logout` | optional | Revoke the refresh token, clear cookies |
 | `GET` | `/api/v1/auth/me` | access cookie | Current user, incl. `hasPaid` and `deviceAllocated` |
 | `GET` | `/api/v1/devices/mine` | cookie + paid | The caller's device, or `null` while awaiting allocation |
+| `POST` | `/api/v1/devices/lock` | cookie | Lock the safe. Idempotent — an already-locked safe is a 200. |
+| `POST` | `/api/v1/devices/unlock/request` | cookie | Send a one-time code. Returns no code. |
+| `POST` | `/api/v1/devices/unlock/confirm` | cookie | `{ otp }`; only this opens the safe. |
+| `GET` | `/api/v1/devices/history` | cookie | The caller's activity, newest first. `?cursor=&limit=` (max 50). |
+| `GET` | `/api/v1/notifications` | cookie | Unread first, plus the total unread count. `?limit=` |
+| `POST` | `/api/v1/notifications/read` | cookie | `{ ids? }` — mark read. Idempotent; omit `ids` for all. |
 | `GET` | `/api/v1/admin/devices` | ADMIN | Inventory, with `status`, `q`, `page` |
 | `POST` | `/api/v1/admin/devices` · `/devices/bulk` | ADMIN | Add one, or up to 500 with per-row results |
 | `POST` | `/api/v1/admin/devices/:id/allocate` · `/allocate-next` | ADMIN | Allocate a specific or the next device |
@@ -294,6 +304,12 @@ verification, signature failure and webhook.
 `requirePaid` (`apps/api/src/middleware/requirePaid.ts`) returns `402` for a
 user without a verified payment; `requireAdmin` returns `403` for non-admins
 and is applied to the whole `/admin` router.
+
+`/devices/history` and the notification routes carry **`requireAuth` only** —
+no payment or allocation gate. They serve the caller's own record, so a user
+awaiting allocation and a refunded user both get an empty list rather than an
+error. The lock/unlock routes are the opposite: they go through
+`assertCanOperate`, which requires a settled payment *and* an assigned device.
 
 ---
 
@@ -379,9 +395,28 @@ Both routes refuse anyone who is not entitled, with a code the UI can act on:
 | `OTP_INVALID` / `OTP_EXPIRED` / `OTP_TOO_MANY_ATTEMPTS` / `OTP_NOT_FOUND` | 400 | Code problems. |
 
 Every state change writes a `DeviceEvent` (the owner's activity feed, which
-`/history` will read) **and** an `AuditLog` row. Failed code attempts are
-written to both as well — a run of them against one account is worth seeing.
-Neither ever contains the code.
+`/history` reads) **and** an `AuditLog` row. Failed code attempts are written
+to both as well — a run of them against one account is worth seeing, and the
+event carries a `failureReason` from a fixed enum. Neither ever contains the
+code.
+
+### Activity and notifications
+
+**`/history`** shows every lock and unlock on the caller's safe, grouped by
+local day, newest first, with a **Load more** button (cursor-paginated — see
+`docs/decisions.md` for why not an offset). Reachable from the nav and the
+dashboard, and readable by any signed-in user including one with no safe yet.
+
+An **unlock writes a `Notification` in the same transaction as the event**, so
+there is no unlock the owner was not told about and no notification about an
+unlock that rolled back. The header **bell** shows the unread count and polls
+every 60 seconds while the tab is visible (pausing when hidden, refetching
+immediately on return). Opening it marks the loaded notifications read.
+
+Only two things notify: a **confirmed unlock**, and an unlock attempt that
+**burns all 5 code attempts** — a possible tampering signal. A single mistyped
+digit does not, and neither does locking. Adding WhatsApp (step 4) means a new
+implementation of `Notifier` and no change to the unlock service.
 
 The device layer behind all of this is one interface, `DeviceGateway`, with a
 mock implementation that always acks after a short delay. Swapping in the real

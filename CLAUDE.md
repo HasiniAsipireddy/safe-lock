@@ -67,9 +67,22 @@ middleware/    # auth, rateLimit, validate, errorHandler
   slow hash buys nothing; the key living outside the database is what protects it.
   A new request **consumes any older open challenge**, so one code is live at a time.
 - **DeviceEvent**: id, deviceId, userId, type (`LOCK` | `UNLOCK_REQUESTED` |
-  `UNLOCK_CONFIRMED` | `UNLOCK_FAILED`), source (`WEB`), requestId, createdAt
-  — the **user-visible** activity feed `/history` will read, indexed on
-  `[userId, createdAt]`. Distinct from `AuditLog`, which is the internal security trail.
+  `UNLOCK_CONFIRMED` | `UNLOCK_FAILED`), source (`WEB`), failureReason
+  (`WRONG_CODE` | `EXPIRED` | `TOO_MANY_ATTEMPTS` | `NO_CHALLENGE`, nullable),
+  requestId, createdAt
+  — the **user-visible** activity feed `/history` reads, indexed on
+  `[userId, createdAt, id]`. Distinct from `AuditLog`, the internal security trail.
+  — `requestId` is **internal**: it is in no `select` the history endpoint uses.
+  `failureReason` is null on rows written before the column existed; those render
+  as a generic "Unlock failed" and are **not** backfilled.
+  — The index carries `id` because `/history` is keyset-paginated on
+  `(createdAt DESC, id DESC)`; `createdAt` alone is not unique.
+- **Notification**: id, userId, type (`UNLOCK_CONFIRMED` |
+  `UNLOCK_FAILED_MAX_ATTEMPTS`), deviceEventId (nullable), createdAt, readAt
+  — written **in the same transaction** as the event it describes, through the
+  `Notifier` seam, so neither can exist without the other. Its own enum, not
+  `DeviceEventType`: most device events notify nobody. Holds **no message text** —
+  copy comes from `NOTIFICATION_COPY` in `@safelock/shared` at render time.
 - ~~**Command**~~ — **deferred to the MQTT gateway.** The mock acks synchronously, so
   there is nothing in flight to track and nothing to time out. Command ids/nonces and the
   15s timeout land with it. See `docs/decisions.md`.
@@ -192,6 +205,31 @@ interface DeviceGateway {
   only moves when a command is **acked**, and the dashboard renders what the
   server returned rather than an optimistic guess.
 
+## Activity History & Notifications
+- `GET /api/v1/devices/history?cursor=&limit=` — the caller's own events, newest
+  first. **Cursor-based, not offset-based** (default 20, max 50): the feed is
+  append-only, and an offset duplicates rows across pages as new events land.
+  The cursor is an opaque `base64url("<iso>|<id>")`; a malformed, tampered or
+  oversized one is a **400 `INVALID_CURSOR`**, never a silent full scan.
+- **No eligibility gate on history or notifications** — `requireAuth` only. A
+  user awaiting allocation and a refunded user both read their own record and
+  get an **empty list, not an error**. Do not add `requirePaid` here.
+- `GET /api/v1/notifications` (unread first, with the **total** unread count,
+  not the page's) and `POST /api/v1/notifications/read` `{ ids? }` — idempotent;
+  ids that are not the caller's are ignored, never 403'd.
+- **What notifies:** `UNLOCK_CONFIRMED`, and `UNLOCK_FAILED` only once the
+  attempt limit is burned. **Not** a single wrong code, not `UNLOCK_REQUESTED`,
+  not `LOCK`. Rationale in `docs/decisions.md` — a notification per typo trains
+  people to ignore the bell.
+- Notifications go through `Notifier` (`apps/api/src/lib/notifier/`), whose
+  `notifyUnlock(client, event)` **takes the transaction client**. WhatsApp
+  (step 4) must write an outbox row through it rather than sending inline — a
+  rollback cannot unsend a message.
+- The web client **polls** `/notifications` every 60s while the tab is visible,
+  pauses when hidden, and fetches immediately on becoming visible. No websockets.
+- Event retention is **undecided and nothing deletes events** — see the open
+  questions.
+
 ## API Conventions
 - Base path `/api/v1`, JSON only, consistent error shape: `{ "error": { "code": "...", "message": "..." } }`.
 - Validate every request body/query with **zod**.
@@ -214,7 +252,10 @@ interface DeviceGateway {
 - `/pay` — plan/price + Razorpay Checkout
 - `/dashboard` — safe status card, Lock / Unlock buttons, last activity
 - `/dashboard/unlock` — OTP entry (6 input boxes, resend timer 30s)
-- `/history` — audit/activity log
+- `/history` — activity log, grouped by local day, "Load more" (not infinite
+  scroll — an endless list has no end for a keyboard or screen reader user).
+  Rows are icon **plus** text, never colour alone. The unread bell lives in
+  `AppHeader`.
 - `/admin` (role ADMIN) — payments list, device inventory, allocate device
 - UX: big touch-friendly buttons, clear status colors, loading/disabled states while a command is pending, confirm dialog on Lock.
 
@@ -313,6 +354,14 @@ portable to PowerShell, so use two terminals.
 - **Refund / device return policy — still open, and now blocking.** `/refund-policy`
   is a published placeholder; the 11 decisions needed are listed on that page and in
   `apps/web/src/app/refund-policy/page.tsx`.
+- **How long should `DeviceEvent` rows be retained? — open, nothing deletes them.**
+  The activity feed is the user-visible security record of a physical safe, so
+  "keep forever" and "prune after N months" are both defensible and the choice is
+  a policy one. Needs deciding: a retention period (if any), whether a user may
+  delete their own history (probably not — it is a security log), and what
+  happens to `Notification` rows pointing at a pruned event (`deviceEventId` is
+  already `onDelete: SetNull`). Related: `AuditLog` has no retention policy
+  either, and refresh tokens are pruned at 30 days by `db:cleanup-tokens`.
 - Number of safes per user? (The API currently refuses a second order once a user has
   one `PAID` payment, which implies **one**.)
 - Business details for the legal pages: `[BUSINESS NAME]`, `[ADDRESS]`, `[EMAIL]`,
@@ -332,8 +381,11 @@ portable to PowerShell, so use two terminals.
    `NOT_PAID`), `POST /devices/lock|unlock/request|unlock/confirm`, HMAC'd
    single-use codes, `DeviceEvent` + `AuditLog` on every state change,
    row-locked transactions, dashboard controls and OTP dialog
-5. Audit log + history page (`AuditLog` and `DeviceEvent` writes exist; the `/history`
-   page does not — it reads `DeviceEvent`, not `AuditLog`)
+5. ✅ Activity history + unlock notifications — `GET /devices/history` with
+   cursor pagination and strict cursor validation, `DeviceEvent.failureReason`,
+   a `Notification` table written through the `Notifier` seam inside the
+   unlock transaction, `/notifications` list + idempotent mark-read, the
+   `/history` page and a polling header bell. Retention is still open.
 6. Real hardware via MQTT — also brings the `Command` table, command nonces and the
    15s ack timeout, all deliberately deferred until there is a transport that can
    lose a message

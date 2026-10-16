@@ -939,3 +939,179 @@ exists so that if it ever happens, the product says so rather than guessing.
 have found their new controls dead. `lockStateUpdatedAt` is deliberately left
 null by allocation and unassign: it means "last state the hardware confirmed",
 and neither of those is an ack.
+
+---
+
+## 2026-10-16 — The activity feed is cursor-paginated, not offset-paginated
+
+**Decision:** `GET /devices/history` takes `?cursor=&limit=` and returns
+`{ items, nextCursor }`. `nextCursor: null` means end of list. The cursor is
+`base64url("<iso timestamp>|<event id>")`, ordering is
+`(createdAt DESC, id DESC)`, and a `@@index([userId, createdAt, id])` covers
+the scan. Default limit 20, maximum 50. The admin lists keep their existing
+page/pageSize offset pagination.
+
+**Why not offset, given the admin lists use it:** `DeviceEvent` is
+append-only and the user is looking at the newest end of it. With
+`skip`/`take`, an event arriving between two page requests shifts every older
+row down one, so page 2 begins with a row page 1 already showed — a duplicate
+in a security log, which is exactly where a reader must be able to trust what
+they are counting. A keyset asks "what comes strictly after this position",
+which is unaffected by inserts. The admin lists are filtered, roughly static
+views where a page number is genuinely what an operator wants.
+
+**Why `id` is in the sort key and in the cursor:** `createdAt` is not unique.
+Two events can land in the same millisecond — a lock and its event, or several
+`UNLOCK_FAILED`s from a script. Ordering by timestamp alone leaves their
+relative order undefined, so a page boundary falling between them skips a row
+or serves it twice. `(createdAt, id)` is a total order. Two tests pin this:
+six events sharing one millisecond paged three at a time, and a tie split by a
+boundary with distinct rows either side.
+
+**The cursor is opaque, not a capability, and deliberately not signed.** Every
+query is filtered by the session's `userId`, so the worst a hand-forged cursor
+can do is move the window within the caller's own events — there is a test
+that builds a cursor from another user's event and asserts nothing of theirs
+comes back. Signing would protect nothing that is not already protected. It
+must be signed the moment a cursor carries something the caller could not
+derive.
+
+**Validation is in two stages, because base64url decoding is lenient:**
+`cursorSchema` checks length (200 max) and alphabet before anything is
+decoded, so an oversized value is refused without allocating for it; the
+service then validates the payload and answers 400 `INVALID_CURSOR`. The
+timestamp is round-tripped through `toISOString()` and compared, which is what
+rejects a value `Date` parses loosely — `new Date('2026-10-16')` succeeds, and
+a bare "did it parse" check would accept it.
+
+**Also decided: no eligibility gate on the feed.** `requireAuth` and nothing
+more — no `requirePaid`, no ownership check. This is the user's own record: a
+user awaiting allocation has no events and gets an empty list, and a refunded
+user can still read what happened to the safe they are holding. Withholding it
+would be withholding their own data, and an empty list is the honest answer
+where an error would not be.
+
+---
+
+## 2026-10-16 — Notifications: an in-app table, and what is worth interrupting someone for
+
+**Decision:** A `Notification` table (`id`, `userId`, `type`, `deviceEventId`,
+`createdAt`, `readAt`) with its own `NotificationType` enum, written through a
+`Notifier` interface. `GET /notifications` returns unread first then newest
+first, plus the **total** unread count; `POST /notifications/read` marks rows
+read and is idempotent.
+
+**What triggers a notification — and what does not:**
+
+| Event | Notifies | Why |
+| --- | --- | --- |
+| `UNLOCK_CONFIRMED` | **yes** | The safe opened. If it was not the owner, this is the one message that matters. |
+| `UNLOCK_FAILED` with the attempt limit burned | **yes** | Five wrong codes against one challenge is either someone who no longer has the code, or someone guessing at a physical safe. |
+| `UNLOCK_FAILED`, a single wrong or expired code | no | A mistyped digit is the most ordinary thing a legitimate owner does. |
+| `UNLOCK_REQUESTED` | no | A code being sent is not the safe opening, and the user triggered it themselves. |
+| `LOCK` | no | Locking is the safe state. |
+
+The omissions are the decision. A notification per typo would train people to
+ignore the bell, and the bell's only job is to still mean something on the day
+it matters. Everything above is in `/history` regardless — the feed is the
+complete record, notifications are the interruptions.
+
+**Why a separate enum from `DeviceEventType`:** most device events notify
+nobody, so a shared enum would carry values that are never legal here. A later
+notification that is not about a device event (an allocation, say) would also
+have to pose as one. `deviceEventId` is nullable for the same reason.
+
+**Why the `Notifier` interface takes the transaction client:** the in-app
+notification is written **inside** the transaction that records the
+`UNLOCK_CONFIRMED` event, so neither can exist without the other. Three tests
+pin it: a notifier that writes and then throws leaves no orphan row; a
+notifier that cannot record at all rolls the unlock back entirely (the safe
+stays locked and the code is not burned, so a retry works); and a failed
+device command writes neither.
+
+**That is a deliberate trade:** a notifier outage refuses to open the safe
+rather than opening it silently. For a product that physically opens a safe,
+"it opened and we never told you" is the worse of the two failures. The in-app
+notifier is a single insert on the same connection, so the window for this is
+very small.
+
+**What this means for WhatsApp (step 4), without changing the unlock
+service:** sending a message is not transactional and must not happen from
+inside `notifyUnlock` — a rollback cannot unsend it, which would mean telling
+someone their safe opened when it did not. Step 4's implementation writes an
+**outbox row** through the same client and a worker sends it after the commit.
+The interface already supports that; it is why the method takes a client
+rather than just ids.
+
+**No `NOTIFIER` env variable yet,** unlike `DEVICE_GATEWAY`. With one
+implementation it would have exactly one legal value — configuration that
+cannot be configured. It arrives in step 4 with the second implementation, and
+probably as a composite (in-app *and* WhatsApp) rather than a choice between
+them, which is a different shape from the gateway's enum and not worth
+guessing at now.
+
+**Mark-read ignores ids that are not the caller's** rather than answering 403
+or 404. Either would confirm whether an id exists, which is an existence
+oracle on another account's rows, and a legitimate client only ever sends back
+ids it was given. Only `readAt: null` rows are touched, so a repeat call
+reports `markedRead: 0` and does not move a timestamp that already records
+when the user first saw it.
+
+**Retention is an open question, and nothing deletes events today.** See
+CLAUDE.md's open questions. `DeviceEvent` is the user-visible security record
+of a physical safe, so a retention period is a policy decision rather than a
+default to pick quietly.
+
+---
+
+## 2026-10-16 — `UNLOCK_FAILED` reasons are a column, not reconstructed from the audit log
+
+**Decision:** `DeviceEvent.failureReason` is a nullable `UnlockFailureReason`
+enum (`WRONG_CODE`, `EXPIRED`, `TOO_MANY_ATTEMPTS`, `NO_CHALLENGE`). Existing
+`UNLOCK_FAILED` rows stay `null` and render as a generic "Unlock failed".
+**There is no backfill.**
+
+**Why not read it from `AuditLog`:** the reason was already being recorded
+there, but `AuditLog` is the internal security trail — it holds IPs, user
+agents and admin actions, and it is explicitly not what users see. Joining a
+user-facing page onto it would put a table with that content one careless
+`select` away from a response body. Two tables with two audiences is the
+existing design; this follows it.
+
+**Why no backfill:** the mapping would be a guess. An audit row and an event
+row are correlated by `userId`, `deviceId` and a timestamp, not by a foreign
+key, so matching them up would be heuristic — and a *wrong* reason on a
+security event is worse than an absent one. "Unlock failed" with no detail is
+honest about what is actually known.
+
+**Consequence:** the enum values differ in spelling from the audit metadata
+`reason` strings (`wrong_code`, …), which are already written and asserted by
+tests. `STORED_REASON` in `deviceControl.service.ts` is the single place the
+two are tied together, so a fifth reason cannot be added to one without the
+compiler demanding the other.
+
+---
+
+## 2026-10-16 — Notification polling, not websockets, and it stops when nobody is looking
+
+**Decision:** The web client polls `GET /notifications` every **60 seconds
+while the tab is visible**. It stops on `visibilitychange` to hidden, and on
+becoming visible again it fetches **immediately** rather than waiting out the
+rest of an interval. No websockets, no server-sent events.
+
+**Why:** a socket per signed-in tab is a connection to authenticate, keep
+alive, reconnect and scale, for a payload that changes a few times a day. The
+poll degrades to "the badge is up to a minute stale", which is an acceptable
+property for a notification about something that already happened — the
+authoritative record is `/history`, one click away.
+
+**Why it must pause:** a background tab left open overnight would otherwise
+make ~480 requests whose answer nobody can see. The immediate fetch on return
+is the other half of the same point: the first thing a returning user sees
+must be current, not up to a minute stale.
+
+**Consequence:** a new `notifications` limiter (120 per 5 minutes per user),
+sized to clear several visible tabs plus a fetch on every visibility change
+and bell open. A failed poll keeps the last good data rather than blanking the
+bell. If the staleness ever becomes a real complaint, the answer is a shorter
+interval or a push channel for unlocks specifically — not a socket for a badge.
