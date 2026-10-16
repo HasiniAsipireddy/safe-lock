@@ -134,6 +134,12 @@ export async function allocateDevice(
           status: 'ASSIGNED',
           ownerId: userId,
           allocatedAt: new Date(),
+          // A safe is handed over locked, and an owned device must never be
+          // UNKNOWN — the dashboard has no controls to offer in that state.
+          // `lockStateUpdatedAt` stays null: this is an assertion about a unit
+          // being shipped, not a state the hardware has confirmed.
+          lockState: 'LOCKED',
+          lockStateUpdatedAt: null,
         },
       });
 
@@ -213,8 +219,10 @@ export async function unassignDevice(deviceId: string): Promise<DeviceMutationRe
         status: 'UNASSIGNED',
         ownerId: null,
         allocatedAt: null,
-        // The lock state of a safe nobody owns is not something we know.
+        // The lock state of a safe nobody owns is not something we know — it
+        // is in transit, in a cupboard, or in someone's hands.
         lockState: 'UNKNOWN',
+        lockStateUpdatedAt: null,
       },
       select: ADMIN_DEVICE_SELECT,
     });

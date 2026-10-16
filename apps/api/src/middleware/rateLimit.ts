@@ -35,6 +35,17 @@ export interface RateLimitConfig {
    * compromised admin session, not to pace normal work.
    */
   adminWrite: LimitSpec;
+  /** Per-user limiter on `POST /devices/lock`. */
+  deviceLock: LimitSpec;
+  /** Per-user limiter on `POST /devices/unlock/request`. */
+  unlockRequest: LimitSpec;
+  /**
+   * Per-IP limb on the same route. The per-user limb cannot see one host
+   * walking through many compromised accounts; this one can.
+   */
+  unlockRequestIp: LimitSpec;
+  /** Per-user limiter on `POST /devices/unlock/confirm`. */
+  unlockConfirm: LimitSpec;
 }
 
 export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
@@ -45,6 +56,19 @@ export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
   createOrder: { windowMs: 10 * 60 * 1000, limit: 5 },
   verifyPayment: { windowMs: 10 * 60 * 1000, limit: 20 },
   adminWrite: { windowMs: 5 * 60 * 1000, limit: 60 },
+
+  // Locking is harmless and idempotent — the limit only bounds a runaway
+  // client, so it is generous.
+  deviceLock: { windowMs: 5 * 60 * 1000, limit: 30 },
+  // Per CLAUDE.md's OTP rules: 3 codes per 10 minutes per user. Each request
+  // invalidates the previous code, so a loose limit here would hand an
+  // attacker a fresh set of 5 guesses on demand.
+  unlockRequest: { windowMs: 10 * 60 * 1000, limit: 3 },
+  unlockRequestIp: { windowMs: 10 * 60 * 1000, limit: 10 },
+  // Above the 5 attempts a single challenge allows, so the per-challenge
+  // counter is what normally stops a guesser and this is the backstop against
+  // request/confirm cycling.
+  unlockConfirm: { windowMs: 10 * 60 * 1000, limit: 15 },
 };
 
 const TOO_MANY_ATTEMPTS = 'Too many attempts. Please wait a few minutes and try again.';
@@ -125,6 +149,10 @@ export interface Limiters {
   createOrder: ReturnType<typeof rateLimit>;
   verifyPayment: ReturnType<typeof rateLimit>;
   adminWrite: ReturnType<typeof rateLimit>;
+  deviceLock: ReturnType<typeof rateLimit>;
+  unlockRequest: ReturnType<typeof rateLimit>;
+  unlockRequestIp: ReturnType<typeof rateLimit>;
+  unlockConfirm: ReturnType<typeof rateLimit>;
 }
 
 export function createLimiters(
@@ -197,6 +225,49 @@ export function createLimiters(
         },
       },
       stores.adminWrite,
+    ),
+
+    deviceLock: build(
+      config.deviceLock,
+      'Too many lock requests. Please wait a moment and try again.',
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.deviceLock,
+    ),
+
+    unlockRequest: build(
+      config.unlockRequest,
+      'Too many unlock codes requested. Please wait a few minutes and try again.',
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.unlockRequest,
+    ),
+
+    unlockRequestIp: build(
+      config.unlockRequestIp,
+      'Too many unlock codes requested. Please wait a few minutes and try again.',
+      { keyGenerator: (req) => (req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown') },
+      stores.unlockRequestIp,
+    ),
+
+    unlockConfirm: build(
+      config.unlockConfirm,
+      'Too many code attempts. Please wait a few minutes and try again.',
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.unlockConfirm,
     ),
   };
 }

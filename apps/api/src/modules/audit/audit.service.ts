@@ -59,6 +59,29 @@ export const AUDIT_ACTIONS = {
   DEVICE_RETIRE_FAILED: 'device.retire.failed',
   /** A non-admin tried to reach an admin route. */
   ADMIN_ACCESS_DENIED: 'admin.access.denied',
+
+  // --- Lock / unlock --------------------------------------------------------
+  /** A lock command was acked by the device. */
+  DEVICE_LOCKED: 'device.lock.success',
+  /** A lock attempt that never reached the device. Metadata has the code. */
+  DEVICE_LOCK_FAILED: 'device.lock.failed',
+  /** An unlock code was generated and handed to the notifier. */
+  UNLOCK_OTP_REQUESTED: 'device.unlock.otp_requested',
+  /** An unlock code could not be issued (not eligible, rate limited, …). */
+  UNLOCK_OTP_REFUSED: 'device.unlock.otp_refused',
+  /** A correct code was presented and the safe opened. */
+  DEVICE_UNLOCKED: 'device.unlock.success',
+  /**
+   * A wrong, expired, exhausted or already-used code. The single most
+   * security-relevant line in this table: a run of these against one account
+   * is someone guessing at a physical safe.
+   */
+  UNLOCK_OTP_FAILED: 'device.unlock.otp_failed',
+  /**
+   * A lock/unlock request from someone not entitled to operate the device —
+   * unpaid, refunded, or holding no device.
+   */
+  DEVICE_OPERATION_DENIED: 'device.operation.denied',
 } as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[keyof typeof AUDIT_ACTIONS];

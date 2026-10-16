@@ -1,10 +1,12 @@
 import crypto from 'node:crypto';
+import { vi } from 'vitest';
 import type { Express } from 'express';
 import { createApp, type CreateAppOptions } from '../app';
 import { env } from '../config/env';
 import { prisma } from '../lib/prisma';
 import { ACCESS_COOKIE, REFRESH_COOKIE, signAccessToken } from '../modules/auth/tokens';
 import { hashRefreshToken } from '../modules/auth/refreshToken.service';
+import { allocateDevice } from '../modules/devices/device.service';
 
 /**
  * Shared test helpers.
@@ -33,6 +35,10 @@ export function app(options: CreateAppOptions = {}): Express {
       createOrder: { windowMs: 60_000, limit: 1000 },
       verifyPayment: { windowMs: 60_000, limit: 1000 },
       adminWrite: { windowMs: 60_000, limit: 1000 },
+      deviceLock: { windowMs: 60_000, limit: 1000 },
+      unlockRequest: { windowMs: 60_000, limit: 1000 },
+      unlockRequestIp: { windowMs: 60_000, limit: 1000 },
+      unlockConfirm: { windowMs: 60_000, limit: 1000 },
       ...options.rateLimits,
     },
   });
@@ -183,6 +189,24 @@ export async function seedDevices(count: number): Promise<Array<{ id: string; se
   return devices;
 }
 
+/**
+ * A paid user holding an allocated, locked safe — the state every lock/unlock
+ * test starts from. Goes through the real `allocateDevice`, so the lock-state
+ * transition it performs is exercised rather than bypassed.
+ */
+export async function createUserWithDevice(): Promise<{
+  user: TestUser;
+  deviceId: string;
+  serialNumber: string;
+}> {
+  const user = await createTestUser();
+  await givePaidPayment(user.id);
+  const device = await seedDevice();
+  await allocateDevice(user.id, device.id);
+
+  return { user, deviceId: device.id, serialNumber: device.serialNumber };
+}
+
 /** Marks a user's payment PAID the way a settled payment would look. */
 export async function givePaidPayment(userId: string): Promise<{ id: string; orderId: string }> {
   const orderId = `order_PAID${crypto.randomBytes(6).toString('hex')}`;
@@ -199,6 +223,41 @@ export async function givePaidPayment(userId: string): Promise<{ id: string; ord
     select: { id: true },
   });
   return { id: payment.id, orderId };
+}
+
+// --- OTP capture -------------------------------------------------------------
+
+/**
+ * Runs something that sends an unlock code and returns the code.
+ *
+ * The code is read back off the dev console line, which means these tests
+ * exercise the **real** delivery path rather than reaching into the service.
+ * Nothing else can recover it: only the HMAC is stored.
+ *
+ * It also means a test fails loudly if the console print is ever removed or
+ * accidentally gated off in the test environment.
+ */
+export async function withCapturedOtp<T>(
+  run: () => Promise<T>,
+): Promise<{ result: T; code: string; lines: string[] }> {
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+    lines.push(args.map(String).join(' '));
+  });
+
+  let result: T;
+  try {
+    result = await run();
+  } finally {
+    spy.mockRestore();
+  }
+
+  const match = lines.join('\n').match(/Unlock code for \S+: (\d{6})/);
+  if (!match?.[1]) {
+    throw new Error(`No unlock code was printed. Console output:\n${lines.join('\n')}`);
+  }
+
+  return { result, code: match[1], lines };
 }
 
 // --- Signatures (computed for real, with the test secrets) -------------------

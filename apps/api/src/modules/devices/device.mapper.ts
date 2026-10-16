@@ -13,6 +13,7 @@ export const DEVICE_SUMMARY_SELECT = {
   id: true,
   serialNumber: true,
   lockState: true,
+  lockStateUpdatedAt: true,
   online: true,
   lastSeenAt: true,
   allocatedAt: true,
@@ -24,6 +25,7 @@ export const ADMIN_DEVICE_SELECT = {
   serialNumber: true,
   status: true,
   lockState: true,
+  lockStateUpdatedAt: true,
   online: true,
   lastSeenAt: true,
   allocatedAt: true,
@@ -37,6 +39,7 @@ interface DeviceSummaryRow {
   id: string;
   serialNumber: string;
   lockState: 'LOCKED' | 'UNLOCKED' | 'UNKNOWN';
+  lockStateUpdatedAt: Date | null;
   online: boolean;
   lastSeenAt: Date | null;
   allocatedAt: Date | null;
@@ -47,6 +50,9 @@ export function toDeviceSummary(device: DeviceSummaryRow): DeviceSummary {
     id: device.id,
     serialNumber: device.serialNumber,
     lockState: device.lockState,
+    lockStateUpdatedAt: device.lockStateUpdatedAt
+      ? device.lockStateUpdatedAt.toISOString()
+      : null,
     online: device.online,
     lastSeenAt: device.lastSeenAt ? device.lastSeenAt.toISOString() : null,
     allocatedAt: device.allocatedAt ? device.allocatedAt.toISOString() : null,

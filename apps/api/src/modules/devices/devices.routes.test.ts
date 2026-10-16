@@ -45,7 +45,7 @@ describe('GET /api/v1/devices/mine', () => {
     expect(response.body.device).toMatchObject({
       id: device.id,
       serialNumber: device.serialNumber,
-      lockState: 'UNKNOWN',
+      lockState: 'LOCKED',
       online: false,
     });
     expect(response.body.device.allocatedAt).not.toBeNull();

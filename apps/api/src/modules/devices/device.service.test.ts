@@ -192,6 +192,38 @@ describe('allocateDevice — next available', () => {
   });
 });
 
+describe('lock state across allocation', () => {
+  it('is LOCKED once allocated and UNKNOWN again once unassigned', async () => {
+    // An *owned* device must never be UNKNOWN: the dashboard has no controls
+    // to offer in that state, and assertCanOperate refuses it outright. An
+    // unowned one must never claim to be locked, because nobody is watching
+    // it. Both halves are pinned here.
+    const user = await createTestUser();
+    await givePaidPayment(user.id);
+    const device = await seedDevice();
+
+    await prisma.device.update({
+      where: { id: device.id },
+      // Force the state the old default would have left behind, so this test
+      // proves allocation *sets* LOCKED rather than inheriting it.
+      data: { lockState: 'UNKNOWN', lockStateUpdatedAt: new Date() },
+    });
+
+    await allocateDevice(user.id, device.id);
+
+    const allocated = await prisma.device.findUnique({ where: { id: device.id } });
+    expect(allocated?.lockState).toBe('LOCKED');
+    // Not a hardware-confirmed state — nothing has acked anything yet.
+    expect(allocated?.lockStateUpdatedAt).toBeNull();
+
+    await unassignDevice(device.id);
+
+    const returned = await prisma.device.findUnique({ where: { id: device.id } });
+    expect(returned?.lockState).toBe('UNKNOWN');
+    expect(returned?.lockStateUpdatedAt).toBeNull();
+  });
+});
+
 describe('unassignDevice', () => {
   it('returns the device to stock and clears the owner', async () => {
     const user = await createTestUser();
@@ -288,7 +320,8 @@ describe('createDevice', () => {
 
     expect(device.serialNumber).toBe('SAFE-ABCD');
     expect(device.status).toBe('UNASSIGNED');
-    expect(device.lockState).toBe('UNKNOWN');
+    // A safe ships locked, so stock starts LOCKED rather than UNKNOWN.
+    expect(device.lockState).toBe('LOCKED');
     expect(device.online).toBe(false);
   });
 
@@ -400,6 +433,7 @@ describe('getDeviceForUser', () => {
       'id',
       'lastSeenAt',
       'lockState',
+      'lockStateUpdatedAt',
       'online',
       'serialNumber',
     ]);

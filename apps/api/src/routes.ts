@@ -29,7 +29,7 @@ export function createApiRouter(limiters: Limiters): Router {
 
   router.use('/auth', createAuthRouter(limiters));
   router.use('/payments', createPaymentsRouter(limiters));
-  router.use('/devices', createDevicesRouter());
+  router.use('/devices', createDevicesRouter(limiters));
   router.use('/admin', createAdminRouter(limiters));
 
   return router;

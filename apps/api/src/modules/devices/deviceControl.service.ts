@@ -1,0 +1,525 @@
+import {
+  ERROR_CODES,
+  OTP_MAX_ATTEMPTS,
+  OTP_RESEND_COOLDOWN_SECONDS,
+  OTP_TTL_MS,
+  type DeviceSummary,
+  type LockResponse,
+  type UnlockConfirmResponse,
+  type UnlockRequestResponse,
+} from '@safelock/shared';
+import { prisma, type PrismaTransaction } from '../../lib/prisma';
+import { HttpError, conflict } from '../../lib/httpError';
+import { deviceGateway } from '../../lib/deviceGateway';
+import { logger } from '../../lib/logger';
+import { userHasPaid } from '../users/user.mapper';
+import { DEVICE_SUMMARY_SELECT, toDeviceSummary } from './device.mapper';
+import { deliverOtp, generateOtp, hashOtp, verifyOtp } from './otp.service';
+
+/**
+ * Lock and unlock.
+ *
+ * Three invariants hold throughout this module:
+ *
+ * 1. **Eligibility is re-derived on every call** by {@link assertCanOperate},
+ *    never trusted from the client and never cached. Paid and allocated are
+ *    independent facts and both are required — a refunded user can still be
+ *    holding hardware, and a paid user may be waiting for one.
+ * 2. **Unlocking always costs a valid OTP.** There is no flag, no environment
+ *    variable and no admin override in this file that skips it.
+ * 3. **The stored lock state only moves on an ack.** A sent command that is
+ *    not acknowledged leaves the state alone, so the dashboard never tells
+ *    someone their safe is locked when the bolt did not move.
+ */
+
+// --- Errors ------------------------------------------------------------------
+
+const notPaid = () =>
+  new HttpError({
+    status: 402,
+    code: ERROR_CODES.NOT_PAID,
+    message: 'Complete your payment to activate your safe.',
+  });
+
+const refunded = () =>
+  new HttpError({
+    status: 403,
+    code: ERROR_CODES.REFUNDED_CONTACT_SUPPORT,
+    message:
+      'Your payment was refunded, so remote access is disabled. Please contact support about returning your safe.',
+  });
+
+const noDevice = () =>
+  conflict(
+    ERROR_CODES.NO_DEVICE,
+    'No safe is allocated to your account yet. You will be notified once one is assigned.',
+  );
+
+const stateUnknown = () =>
+  conflict(
+    ERROR_CODES.DEVICE_STATE_UNKNOWN,
+    'Your safe is not reporting its state. Please contact support.',
+  );
+
+/**
+ * Every OTP failure is a 400 carrying a distinct code.
+ *
+ * Not 429 for the attempt limit, even though it is a lockout: the client
+ * already treats 429 as "the rate limiter, back off and retry later", and a
+ * burned challenge is not retryable — it needs a new code. The `code` is what
+ * the UI switches on.
+ */
+const otpFailure = (code: string, message: string) =>
+  new HttpError({ status: 400, code, message });
+
+const commandFailed = () =>
+  new HttpError({
+    status: 502,
+    code: ERROR_CODES.DEVICE_COMMAND_FAILED,
+    message: 'Your safe did not respond. Please try again in a moment.',
+  });
+
+// --- Eligibility -------------------------------------------------------------
+
+/** What a caller is allowed to do, and the device it concerns. */
+export interface OperableDevice {
+  deviceId: string;
+  serialNumber: string;
+  lockState: 'LOCKED' | 'UNLOCKED' | 'UNKNOWN';
+}
+
+/**
+ * Resolves the device this user may operate, or throws.
+ *
+ * Checked in this order, which matters:
+ * - **refunded while holding hardware** first, so that state gets its own
+ *   message instead of being flattened into "you have not paid". It is a real
+ *   state (see docs/decisions.md) and paying again is not the remedy.
+ * - then unpaid,
+ * - then no device allocated.
+ *
+ * This is why the lock/unlock routes do **not** mount `requirePaid`: that
+ * middleware answers 402 PAYMENT_REQUIRED for both the never-paid and the
+ * refunded user, and the two need different answers here.
+ */
+export async function assertCanOperate(
+  userId: string,
+  client: PrismaTransaction | typeof prisma = prisma,
+): Promise<OperableDevice> {
+  const [paid, device] = await Promise.all([
+    userHasPaid(userId, client),
+    client.device.findUnique({
+      where: { ownerId: userId },
+      select: { id: true, serialNumber: true, lockState: true, status: true },
+    }),
+  ]);
+
+  if (!paid) throw device ? refunded() : notPaid();
+  if (!device || device.status !== 'ASSIGNED') throw noDevice();
+
+  // Should be unreachable: allocation sets LOCKED and only unassign sets
+  // UNKNOWN, which also clears ownerId. Refusing rather than guessing — the
+  // alternative is sending a bolt command on a state we cannot reason about.
+  if (device.lockState === 'UNKNOWN') throw stateUnknown();
+
+  return {
+    deviceId: device.id,
+    serialNumber: device.serialNumber,
+    lockState: device.lockState,
+  };
+}
+
+// --- Shared helpers ----------------------------------------------------------
+
+/**
+ * Takes an exclusive row lock on a device for the rest of the transaction.
+ *
+ * This is what stops two tabs racing: a second request for the same device
+ * blocks here until the first has committed, then reads the state the first
+ * one left. Without it both could read "LOCKED", both send a command, and
+ * both write a DeviceEvent for one physical movement.
+ *
+ * Raw SQL because Prisma has no row-locking API. The only interpolated value
+ * is a device id we just read from our own database, and it is a bound
+ * parameter, not string concatenation.
+ */
+async function lockDeviceRow(tx: PrismaTransaction, deviceId: string): Promise<void> {
+  await tx.$queryRaw`SELECT "id" FROM "Device" WHERE "id" = ${deviceId} FOR UPDATE`;
+}
+
+/** Records a user-visible device event. Never carries a code or a hash. */
+async function recordEvent(
+  tx: PrismaTransaction | typeof prisma,
+  input: {
+    deviceId: string;
+    userId: string;
+    type: 'LOCK' | 'UNLOCK_REQUESTED' | 'UNLOCK_CONFIRMED' | 'UNLOCK_FAILED';
+    requestId: string | null;
+  },
+): Promise<void> {
+  await tx.deviceEvent.create({
+    data: {
+      deviceId: input.deviceId,
+      userId: input.userId,
+      type: input.type,
+      source: 'WEB',
+      requestId: input.requestId,
+    },
+  });
+}
+
+/** Reads the owner-facing view of a device. */
+async function readSummary(
+  client: PrismaTransaction | typeof prisma,
+  deviceId: string,
+): Promise<DeviceSummary> {
+  const device = await client.device.findUniqueOrThrow({
+    where: { id: deviceId },
+    select: DEVICE_SUMMARY_SELECT,
+  });
+  return toDeviceSummary(device);
+}
+
+// --- Lock --------------------------------------------------------------------
+
+export interface LockInput {
+  userId: string;
+  requestId: string | null;
+}
+
+/**
+ * Locks the safe. Idempotent: an already-locked safe is a success, no command
+ * is sent and no event is written — there was no state change to record.
+ *
+ * The gateway call happens **inside** the transaction, while the device row is
+ * locked. That holds a row lock across the gateway round trip, which is
+ * acceptable while the gateway is an in-process mock and is the simplest thing
+ * that makes two concurrent taps correct. The real MQTT gateway must not do
+ * this: it needs a claim-then-ack model with a `Command` row and a timeout,
+ * which is exactly what that deferred table is for (see docs/decisions.md).
+ */
+export async function lockDevice(input: LockInput): Promise<LockResponse> {
+  const target = await assertCanOperate(input.userId);
+
+  return prisma.$transaction(async (tx) => {
+    await lockDeviceRow(tx, target.deviceId);
+
+    // Re-read under the lock: another tab may have moved it since
+    // assertCanOperate ran.
+    const current = await tx.device.findUniqueOrThrow({
+      where: { id: target.deviceId },
+      select: { lockState: true, serialNumber: true },
+    });
+
+    if (current.lockState === 'LOCKED') {
+      return { device: await readSummary(tx, target.deviceId), alreadyLocked: true };
+    }
+
+    const result = await sendCommand(() => deviceGateway.sendLock(current.serialNumber));
+
+    await tx.device.update({
+      where: { id: target.deviceId },
+      data: {
+        lockState: 'LOCKED',
+        lockStateUpdatedAt: result.ackedAt,
+        online: true,
+        lastSeenAt: result.ackedAt,
+      },
+    });
+
+    await recordEvent(tx, {
+      deviceId: target.deviceId,
+      userId: input.userId,
+      type: 'LOCK',
+      requestId: input.requestId,
+    });
+
+    return { device: await readSummary(tx, target.deviceId), alreadyLocked: false };
+  });
+}
+
+/** Runs a gateway call and turns any transport failure into a clean 502. */
+async function sendCommand(
+  call: () => Promise<{ acked: boolean; ackedAt: Date }>,
+): Promise<{ acked: boolean; ackedAt: Date }> {
+  let result: { acked: boolean; ackedAt: Date };
+
+  try {
+    result = await call();
+  } catch (cause) {
+    logger.error(
+      { reason: cause instanceof Error ? cause.message : 'unknown' },
+      'Device gateway threw while sending a command',
+    );
+    throw commandFailed();
+  }
+
+  // An unacked command is a command that did not happen. Fail rather than
+  // record a state the hardware never confirmed.
+  if (!result.acked) throw commandFailed();
+
+  return result;
+}
+
+// --- Unlock: request ---------------------------------------------------------
+
+export interface UnlockRequestInput {
+  userId: string;
+  requestId: string | null;
+}
+
+/**
+ * Issues a fresh unlock code.
+ *
+ * Any older open challenge for this user and device is consumed first, so
+ * there is **at most one live code at a time**. Leaving the old one valid
+ * would quietly multiply the attacker's guesses: five tries per challenge
+ * becomes five tries per *request*, and the request endpoint is the one a
+ * user can trigger repeatedly.
+ */
+export async function requestUnlock(
+  input: UnlockRequestInput,
+): Promise<UnlockRequestResponse> {
+  const target = await assertCanOperate(input.userId);
+
+  const code = generateOtp();
+  const expiresAt = new Date(Date.now() + OTP_TTL_MS);
+
+  await prisma.$transaction(async (tx) => {
+    await tx.unlockChallenge.updateMany({
+      where: { userId: input.userId, deviceId: target.deviceId, consumedAt: null },
+      data: { consumedAt: new Date() },
+    });
+
+    await tx.unlockChallenge.create({
+      data: {
+        userId: input.userId,
+        deviceId: target.deviceId,
+        otpHash: hashOtp(code),
+        expiresAt,
+      },
+    });
+
+    await recordEvent(tx, {
+      deviceId: target.deviceId,
+      userId: input.userId,
+      type: 'UNLOCK_REQUESTED',
+      requestId: input.requestId,
+    });
+  });
+
+  // After the commit: a code the user has been told about must correspond to
+  // a challenge that actually exists.
+  deliverOtp({ code, serialNumber: target.serialNumber, expiresAt });
+
+  return {
+    expiresAt: expiresAt.toISOString(),
+    expiresInSeconds: Math.round(OTP_TTL_MS / 1000),
+    attemptsAllowed: OTP_MAX_ATTEMPTS,
+    resendAfterSeconds: OTP_RESEND_COOLDOWN_SECONDS,
+  };
+}
+
+// --- Unlock: confirm ---------------------------------------------------------
+
+export interface UnlockConfirmInput {
+  userId: string;
+  otp: string;
+  requestId: string | null;
+}
+
+/** Why a confirm failed, for the audit row. Never includes the code itself. */
+export type UnlockFailureReason =
+  | 'no_challenge'
+  | 'expired'
+  | 'attempts_exhausted'
+  | 'wrong_code';
+
+export class UnlockFailed extends Error {
+  constructor(
+    readonly httpError: HttpError,
+    readonly reason: UnlockFailureReason,
+    readonly deviceId: string,
+  ) {
+    super(httpError.message);
+    this.name = 'UnlockFailed';
+  }
+}
+
+/**
+ * Verifies a code and, only then, opens the safe.
+ *
+ * Concurrency: the winning path claims the challenge with a conditional
+ * `updateMany` on `consumedAt: null`. Two confirms submitting the same correct
+ * code therefore produce exactly one claim — the loser sees `OTP_NOT_FOUND`
+ * ("already used") rather than both of them unlocking and writing two events.
+ *
+ * A wrong code increments `attempts` with an atomic `increment`, so N
+ * simultaneous wrong guesses cost N attempts, not one.
+ */
+export async function confirmUnlock(
+  input: UnlockConfirmInput,
+): Promise<UnlockConfirmResponse> {
+  const target = await assertCanOperate(input.userId);
+
+  const challenge = await prisma.unlockChallenge.findFirst({
+    where: { userId: input.userId, deviceId: target.deviceId, consumedAt: null },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true, otpHash: true, expiresAt: true, attempts: true },
+  });
+
+  if (!challenge) {
+    throw new UnlockFailed(
+      otpFailure(
+        ERROR_CODES.OTP_NOT_FOUND,
+        'That code is no longer valid. Request a new one.',
+      ),
+      'no_challenge',
+      target.deviceId,
+    );
+  }
+
+  if (challenge.expiresAt.getTime() <= Date.now()) {
+    await consume(challenge.id);
+    throw new UnlockFailed(
+      otpFailure(ERROR_CODES.OTP_EXPIRED, 'That code has expired. Request a new one.'),
+      'expired',
+      target.deviceId,
+    );
+  }
+
+  // Defensive: the increment below also consumes on the last attempt, so a
+  // live challenge should never be sitting at the cap. Checked anyway, since
+  // the alternative is unbounded guessing if that ever stops being true.
+  if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
+    await consume(challenge.id);
+    throw new UnlockFailed(
+      otpFailure(
+        ERROR_CODES.OTP_TOO_MANY_ATTEMPTS,
+        'Too many incorrect codes. Request a new one.',
+      ),
+      'attempts_exhausted',
+      target.deviceId,
+    );
+  }
+
+  if (!verifyOtp(input.otp, challenge.otpHash)) {
+    const { attempts } = await prisma.unlockChallenge.update({
+      where: { id: challenge.id },
+      data: { attempts: { increment: 1 } },
+      select: { attempts: true },
+    });
+
+    if (attempts >= OTP_MAX_ATTEMPTS) {
+      await consume(challenge.id);
+      throw new UnlockFailed(
+        otpFailure(
+          ERROR_CODES.OTP_TOO_MANY_ATTEMPTS,
+          'Too many incorrect codes. Request a new one.',
+        ),
+        'attempts_exhausted',
+        target.deviceId,
+      );
+    }
+
+    throw new UnlockFailed(
+      otpFailure(
+        ERROR_CODES.OTP_INVALID,
+        `That code is not correct. ${OTP_MAX_ATTEMPTS - attempts} attempt${
+          OTP_MAX_ATTEMPTS - attempts === 1 ? '' : 's'
+        } left.`,
+      ),
+      'wrong_code',
+      target.deviceId,
+    );
+  }
+
+  const device = await prisma.$transaction(async (tx) => {
+    // The serialisation point. Exactly one concurrent confirm claims it.
+    const claimed = await tx.unlockChallenge.updateMany({
+      where: { id: challenge.id, consumedAt: null },
+      data: { consumedAt: new Date() },
+    });
+
+    if (claimed.count !== 1) {
+      throw new UnlockFailed(
+        otpFailure(
+          ERROR_CODES.OTP_NOT_FOUND,
+          'That code has already been used. Request a new one.',
+        ),
+        'no_challenge',
+        target.deviceId,
+      );
+    }
+
+    await lockDeviceRow(tx, target.deviceId);
+
+    const current = await tx.device.findUniqueOrThrow({
+      where: { id: target.deviceId },
+      select: { serialNumber: true },
+    });
+
+    // If this throws, the whole transaction rolls back — including the claim,
+    // so the user's code still works and they can simply try again. Burning a
+    // valid code because the radio hiccuped would be a poor trade.
+    const result = await sendCommand(() => deviceGateway.sendUnlock(current.serialNumber));
+
+    await tx.device.update({
+      where: { id: target.deviceId },
+      data: {
+        lockState: 'UNLOCKED',
+        lockStateUpdatedAt: result.ackedAt,
+        online: true,
+        lastSeenAt: result.ackedAt,
+      },
+    });
+
+    await recordEvent(tx, {
+      deviceId: target.deviceId,
+      userId: input.userId,
+      type: 'UNLOCK_CONFIRMED',
+      requestId: input.requestId,
+    });
+
+    return readSummary(tx, target.deviceId);
+  });
+
+  return { device };
+}
+
+/** Marks a challenge dead. Idempotent — only an open challenge is touched. */
+async function consume(challengeId: string): Promise<void> {
+  await prisma.unlockChallenge.updateMany({
+    where: { id: challengeId, consumedAt: null },
+    data: { consumedAt: new Date() },
+  });
+}
+
+/**
+ * Records a failed unlock attempt as a user-visible event.
+ *
+ * Separate from the happy path because it must survive the failure: the
+ * controller calls this after catching {@link UnlockFailed}, so a wrong code
+ * still shows up in the owner's history. The reason is a fixed enum string —
+ * nothing derived from what was typed.
+ */
+export async function recordUnlockFailure(input: {
+  deviceId: string;
+  userId: string;
+  requestId: string | null;
+}): Promise<void> {
+  try {
+    await recordEvent(prisma, {
+      deviceId: input.deviceId,
+      userId: input.userId,
+      type: 'UNLOCK_FAILED',
+      requestId: input.requestId,
+    });
+  } catch (cause) {
+    // Same rule as the audit log: recording must never turn a 400 into a 500.
+    logger.error(
+      { reason: cause instanceof Error ? cause.message : 'unknown' },
+      'Failed to record an UNLOCK_FAILED device event',
+    );
+  }
+}
