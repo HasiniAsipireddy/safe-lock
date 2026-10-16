@@ -108,12 +108,19 @@ middleware/    # auth, rateLimit, validate, errorHandler
   — `revokedReason` exists for exactly one decision: whether a replay is
   **theft**. `PASSWORD_CHANGE` / `PASSWORD_RESET` replays are not. Null on rows
   revoked before the column existed, and null means "treat as theft".
-- **PasswordResetToken**: id, userId, tokenHash (unique), expiresAt, consumedAt, requestedIp, userAgent, createdAt
-  — 32 random bytes, stored as **plain `sha256`, not an HMAC**, and there is no
-  `RESET_TOKEN_HMAC_SECRET`. A 2^256 space has nothing to brute-force; the OTP
-  is keyed because 10^6 does. See `docs/decisions.md`.
-  — Requesting a reset **consumes any older open token**, so one link is live
-  at a time. Redeeming one revokes every refresh token for the user.
+- **PasswordResetCode**: id, userId, codeHash, expiresAt, attempts, consumedAt, requestedIp, userAgent, createdAt
+  — an **8-digit** one-time code, stored as
+  `HMAC-SHA256("pwreset:v1:" + code, OTP_HMAC_SECRET)`. **Keyed**, unlike the
+  32-byte token it replaces, and for the same reason that one was not: 10^8 is
+  enumerable, 2^256 is not. The `pwreset:v1:` prefix is domain separation, so a
+  reset digest can never equal an unlock digest for the same digits.
+  **No new env var.** See `docs/decisions.md`.
+  — `attempts` is **load-bearing**: 8 digits is only safe because five guesses
+  is five guesses. Incremented by a conditional update whose `where` carries
+  the limit, so the check and the increment are one statement and the correct
+  code also fails once they are gone.
+  — Requesting a reset **consumes any older open code**, so one is live at a
+  time. Redeeming one revokes every refresh token for the user.
 - **AuditLog**: id, userId, deviceId, action, ip, userAgent, metadata (json), createdAt
 
 ## Business Rules
@@ -184,18 +191,30 @@ middleware/    # auth, rateLimit, validate, errorHandler
 - **Logout** revokes the presented refresh token server-side, then clears cookies.
   Cookies must be cleared with the same `Path` they were set with.
 - **Password reset** is two endpoints, neither authenticated:
-  `POST /auth/password/forgot` (email only; the response is **byte-identical**
-  whether or not the address has an account — the difference is two distinct
-  audit actions, nothing more) and `POST /auth/password/reset`. A token lasts
-  30 minutes, is single-use, and unknown / expired / already-used all answer
-  the same `RESET_TOKEN_INVALID`. **Reset does not log the user in** — no user,
-  no cookies; they sign in with the new password.
-  Delivery goes through the `ResetSender` seam to **WhatsApp, to a verified
-  number only**. The message deliberately carries **no token** — a chat
-  message is persistent and forwardable, and a reset token is an account
-  takeover in one string (see `docs/decisions.md`). A user with no verified
-  phone has **no channel**, and `/forgot-password` says so generically without
-  revealing which case it hit.
+  `POST /auth/password/forgot` `{ identifier }` (email **or** phone) and
+  `POST /auth/password/reset` `{ identifier, code, password }`. An **8-digit
+  code**, 15 minutes, 5 attempts, single use; a new request supersedes the old
+  one. **Reset does not log the user in** — no user, no cookies; they sign in
+  with the new password. It revokes every refresh token with
+  `revokedReason: PASSWORD_RESET`.
+- **`/forgot` answers byte-identically for every input** — registered email,
+  unknown email, registered phone, unknown phone, a user with no verified
+  number, and a user whose daily WhatsApp cap is spent. Six cases, one answer,
+  one test asserting the set has exactly one member. The difference is recorded
+  only as two distinct audit actions.
+- **Every reset failure answers identically too**: unknown identifier, no
+  outstanding code, wrong code, expired, used, attempts exhausted — all 400
+  `RESET_CODE_INVALID` with one message. Exhaustion is distinguished only in
+  the audit log.
+- The **minimum interval between codes** is enforced server-side as a limiter
+  limb keyed on the hashed identifier, evaluated **before any lookup**, so its
+  429 is identical for a real and a fake account. The UI countdown reads the
+  same shared constant.
+- Delivery goes through the `ResetSender` seam to **WhatsApp, to a verified
+  number only** — the message now carries the code (8 digits, 15 minutes,
+  5 attempts, single-use is a credential a forwardable message can carry; a
+  32-byte token was not). A user with no verified phone has **no channel**, and
+  `/forgot-password` says so generically without revealing which case it hit.
 - **`POST /auth/password/change`** (authenticated) verifies the current
   password, then revokes **every** refresh token and reissues a fresh family to
   the caller in one transaction: still signed in here, signed out everywhere
@@ -353,8 +372,9 @@ interface DeviceGateway {
   for a registered and an unregistered address alike, since the API answers
   identically. In mock mode it shows the token and a link, guarded like
   `peekMockUnlockCode`.
-- `/reset-password?token=…` — new password + confirm. Distinct states for a
-  missing token, a dead link and success. **Ends at "sign in", not signed in.**
+- `/reset-password` — identifier (prefilled from `/forgot-password`) + the
+  8-digit code + new password. One error message for every failure, because the
+  API has only one. **Ends at "sign in", not signed in.**
 - `/account` — phone verification (`#phone`), name (editable), email
   (read-only, with the reason), and change-password. Independent forms: a
   password change ends every other session and a name change does not, so they
@@ -471,13 +491,13 @@ portable to PowerShell, so use two terminals.
   `fake` in production so a half-configured deploy fails at boot rather than
   silently sending nothing.
 - **Email provider for password reset — open, and the one real gap left.**
-  Reset is delivered to a **verified phone**, so a user who never verified and
-  then forgets their password has no self-service path. `/forgot-password`
-  still answers byte-identically and says reset goes to a verified number;
-  the dashboard and `/account` nag unverified users precisely to shrink this
-  window. The long-term fix is an email sender (the seam is
-  `lib/resetSender/`, which an email implementation joins as a composite, not
-  a replacement).
+  Reset now works over WhatsApp (an 8-digit code), but only to a **verified
+  phone**, so a user who never verified and then forgets their password still
+  has no self-service path. `/forgot-password` answers byte-identically and
+  says reset goes to a verified number; the dashboard and `/account` nag
+  unverified users precisely to shrink this window. The long-term fix is an
+  email sender (the seam is `lib/resetSender/`, which an email implementation
+  joins as a composite, not a replacement).
 - ~~Auto-allocation vs manual admin allocation~~ → **manual by ADMIN now**, with
   `allocateDevice()` ready for the webhook to call. Decide when to switch it on.
 - **Serial number format is provisional** (`^SAFE-[0-9A-Z]{4,12}$`). Confirm what the
@@ -536,7 +556,9 @@ portable to PowerShell, so use two terminals.
    `POST /account/phone/request-verification|confirm`, `PHONE_NOT_VERIFIED`
    gating unlock only, a rolling daily send cap, and the signed delivery
    webhook. **Needs five Meta-approved templates before it works in
-   production.** Email-only reset is still open.
+   production.** Password reset was then switched from an undeliverable
+   32-byte token link to an 8-digit code (2026-10-17), which is what makes it
+   actually work. Email-only reset is still open.
 8. Real hardware via MQTT — also brings the `Command` table, command nonces and the
    15s ack timeout, all deliberately deferred until there is a transport that can
    lose a message

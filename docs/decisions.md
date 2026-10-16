@@ -1148,6 +1148,13 @@ keeps the visual affordance for people who can see it.
 
 ## 2026-10-16 — Reset tokens are a plain SHA-256, and the OTP is not
 
+> **SUPERSEDED (2026-10-17)** by "Password reset is a one-time code, not a
+> link" at the end of this file. The token this entry describes no longer
+> exists: nothing could deliver it, so reset was replaced by an 8-digit code
+> whose digest **is** keyed — for precisely the reason given below, since
+> 10^8 is enumerable and 2^256 is not. Kept because the reasoning is still
+> the right way to decide the question; only the premise changed.
+
 **Decision:** `PasswordResetToken.tokenHash` is `sha256(token)` — the same
 construction as `RefreshToken`, with **no keyed HMAC and no new environment
 variable**. `RESET_TOKEN_HMAC_SECRET` was considered and deliberately not
@@ -1581,3 +1588,101 @@ acceptable for a security alert.
 they are approved, `WHATSAPP_PROVIDER=fake` is the only working configuration —
 which the env schema enforces by refusing `fake` in production, so a
 half-configured deployment fails at boot rather than silently sending nothing.
+
+---
+
+## 2026-10-17 — Password reset is a one-time code, not a link
+
+**Supersedes** "2026-10-16 — Reset tokens are a plain SHA-256, and the OTP is
+not", which remains above as the record of why the token was shaped that way.
+Its reasoning was not wrong; its premise changed.
+
+**The problem.** Step 4 decided the reset WhatsApp message would carry **no
+token** — a chat message is persistent, forwardable and backed up to whatever
+cloud the account is mirrored to, and a 32-byte reset token is an account
+takeover in one string that outlives its expiry in someone's history. That was
+right. The consequence was that nothing could deliver the credential: there is
+no email sender, so the message contained nothing the user could act on and
+**password reset did not work in production at all**. A safe credential nobody
+can use is not a feature.
+
+**Decision.** Reset is now an **8-digit one-time code**, delivered over the
+channel that exists, with the identifier submitted alongside it:
+
+- `POST /auth/password/forgot` `{ identifier }` — email **or** phone
+- `POST /auth/password/reset` `{ identifier, code, password }`
+
+15-minute expiry, 5 attempts, single use, a new request supersedes the old
+code, and a server-enforced minimum interval between requests.
+
+**Why 8 digits, and the tradeoff.** 10^8 against five attempts is a
+1-in-20-million shot per code. Base32 would give 10^12, which the attempt cap
+makes unreachable either way — the extra entropy buys nothing, while digits buy
+a numeric keypad on mobile, no case handling, no "is that O or 0" on a code
+read off a message, and a working `autocomplete="one-time-code"`. **The
+tradeoff this accepts is real:** 8 digits is safe *because* the attempt counter
+works. Base32 would survive a broken attempt limit; this will not. The counter
+is therefore load-bearing, and is where the test weight went.
+
+**Why the digest is keyed now, having argued against keying it before.** The
+step 3 entry's claim was that an unkeyed hash is reversible exactly when the
+input space is enumerable, and that 2^256 is not. Both halves still hold —
+**10^8 is**, so the code is stored as `HMAC-SHA256("pwreset:v1:" + code,
+OTP_HMAC_SECRET)`. The secret is the existing one rather than a new variable:
+these are the same kind of thing (short-lived one-time codes), and rotating the
+key invalidates at most 15 minutes of outstanding codes either way. The
+`pwreset:v1:` prefix is domain separation, so a reset digest can never equal an
+unlock digest for the same digits even under one key — there is a test.
+**Nothing new is required in `.env`.**
+
+**The attempt counter is atomic by construction.** The increment is a
+conditional update whose `where` carries `attempts < RESET_CODE_MAX_ATTEMPTS`,
+`consumedAt: null` and an unexpired `expiresAt`. The check and the increment
+are therefore one statement: twenty parallel guesses cost at most five
+attempts, none of them gets a free evaluation, and the cap cannot be overshot.
+Crucially there is **no branch that compares the digest before spending an
+attempt**, so the *correct* code also fails once the attempts are gone. Three
+tests pin this, including twenty parallel wrong guesses and ten guesses from
+distinct apparent clients with fresh limiter buckets.
+
+**The per-account limit is the point, and its cost is accepted.** The counter
+lives on the challenge row, so it is IP-independent: many addresses hammering
+one account share one counter. The cost is that someone who knows your email
+can burn your code's five attempts and force you to request another. That is a
+nuisance confined to the reset flow — login is untouched — and a fresh code is
+always obtainable, subject only to the minimum interval and the daily cap.
+There is a test for that too. The alternative, per-IP only, is exactly the
+brute-force surface a short code must not have.
+
+**One answer for every failure.** Unknown identifier, no outstanding code,
+wrong code, expired, already used, attempts exhausted — all return 400
+`RESET_CODE_INVALID` with one message. This endpoint is unauthenticated, so any
+difference would say whether an account exists and therefore whether somebody
+owns a safe. Exhaustion is distinguished **only** in the audit log
+(`auth.password.reset_code_exhausted`), because five wrong codes against one
+reset is a signal worth being able to see.
+
+**The minimum interval is server-side, and not an oracle.** It is a rate-limit
+limb keyed on `sha256(identifier)` with a window of
+`RESET_CODE_RESEND_COOLDOWN_SECONDS`, evaluated **before any database lookup**,
+so its 429 is identical for a real and a fake account (verified over HTTP as
+well as in tests). The UI countdown reads the same constant, so the two cannot
+drift. It is separate from the 3-per-hour limb because "not two in a second"
+and "not too many in a day" are different questions that one bucket cannot
+express.
+
+**The long-token path is removed, not deprecated.** `PasswordResetToken`,
+`hashResetToken`, `RESET_TOKEN_BYTES`, `RESET_TOKEN_INVALID`, `resetTokenSchema`
+and the `?token=` handling are all gone, with a destructive migration (no
+deployment, no live users — consistent with the no-grandfathering decision). An
+undeliverable credential is unreachable auth surface, which is where bugs live.
+If an email sender lands later, a link is re-addable and will then have a
+channel that can carry it.
+
+**Unchanged from step 3:** reset still issues no session and clears cookies,
+and still revokes every refresh token with `revokedReason: PASSWORD_RESET` so a
+stale tab gets a plain 401 rather than a false theft cascade.
+
+**Still open:** a user with no verified phone has no channel, so reset remains
+unreachable for them. That is the email-provider question in CLAUDE.md, and the
+reason the dashboard nags unverified users.

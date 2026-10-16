@@ -534,15 +534,18 @@ differs.
 **3. `safelock_password_reset`** — category **AUTHENTICATION**, language `en`
 
 - Body: `{{1}} is your verification code. For your security, do not share this code.`
-- Parameters: **none** — the API sends an empty parameter list
-- Sample: n/a
+- Button: **Copy code** (code expiry **15 minutes**)
+- Parameters: `{{1}}` = the **8-digit** reset code
+- Sample: `40318725`
 
-> This template deliberately carries **no token and no link** (see
-> docs/decisions.md). A chat message is persistent, forwardable and
-> cloud-backed-up; a reset token is an account takeover in one string. If the
-> authentication layout forces a code parameter, submit this one as
-> `UTILITY` instead with the body:
-> `A password reset was requested for your Safe Lock account. If this wasn't you, your password still works and no action is needed.`
+> **If you already submitted the earlier parameterless version of this
+> template, withdraw or resubmit it.** It was deliberately empty of any
+> credential, which made it safe and useless — there was nothing in the
+> message the user could act on, so reset did not work in production. It now
+> carries an 8-digit code: dead in 15 minutes, single-use, worthless without
+> the account identifier, and bounded by five attempts. That is a credential a
+> forwardable message can carry; a 32-byte token was not. See
+> docs/decisions.md.
 
 **4. `safelock_unlock_alert`** — category **UTILITY**, language `en`
 
@@ -571,6 +574,35 @@ unverified user must still be able to secure their safe.
 POST /api/v1/account/phone/request-verification  { phone, consent, currentPassword? }
 POST /api/v1/account/phone/confirm               { otp }
 ```
+
+### Password reset
+
+```
+POST /api/v1/auth/password/forgot   { identifier }                     -> { status: 'ok' }
+POST /api/v1/auth/password/reset    { identifier, code, password }     -> { status: 'ok' }
+```
+
+`identifier` is an email **or** a 10-digit mobile. An **8-digit code** is sent
+on WhatsApp to the account's verified number: 15 minutes, 5 attempts, single
+use, and a new request replaces it. Codes are printed to the API console in
+development:
+
+```
+  [dev] Password reset code: 40318725  (expires 2026-10-17T12:15:00.000Z)
+```
+
+Two properties to be careful about if you change this flow:
+
+- **`/forgot` must answer byte-identically for every input** — registered
+  email, unknown email, registered phone, unknown phone, a user with no
+  verified number, a user whose daily cap is spent. Anything else is an
+  account-enumeration oracle on an unauthenticated endpoint. The minimum
+  interval between codes is a limiter limb evaluated *before* any lookup for
+  the same reason.
+- **The attempt counter is load-bearing.** An 8-digit code is only safe because
+  five guesses is five guesses, so the increment and the limit check are one
+  conditional update, and nothing compares the code before spending an attempt
+  (the correct code also fails once they are gone).
 
 `currentPassword` is required only when the account already has a verified
 number: moving the number that receives unlock codes is a credential change.
