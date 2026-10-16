@@ -1,21 +1,62 @@
 'use client';
 
-import type { DeviceSummary } from '@safelock/shared';
+import { useRef, useState } from 'react';
+import type { DeviceSummary, LockResponse } from '@safelock/shared';
 import { LockStateBadge, OnlineBadge } from '@/components/ui/Badge';
+import { Button } from '@/components/ui/Button';
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
+import { UnlockDialog } from '@/components/UnlockDialog';
+import { api } from '@/lib/api';
+import { toUserMessage } from '@/lib/apiError';
 
 /**
- * The owner's safe.
+ * The owner's safe, with working controls.
  *
- * Lock and Unlock are rendered **disabled** and labelled "Coming soon". They
- * are deliberately inert: the command layer, the OTP flow and the hardware
- * driver do not exist yet, and a button that looks live but silently does
- * nothing is worse than one that says so — this product's buttons will move a
- * physical bolt.
- *
- * When they are implemented they must require a paid user **and** an assigned
- * device, and unlocking must additionally require a valid OTP.
+ * The rules this component follows, all of which the API enforces anyway:
+ * - **State is never optimistic.** Every control waits for the server's
+ *   response and then renders the device the server returned. A safe that
+ *   failed to move must not look as though it moved.
+ * - **Unlock always goes through a code.** The button opens
+ *   {@link UnlockDialog}; there is no path from here to an unlock request.
+ * - **UNKNOWN disables everything.** It should not happen for an allocated
+ *   safe, but if it ever does the honest answer is "state unavailable", not a
+ *   pair of buttons whose effect nobody can predict.
  */
-export function SafeCard({ device }: { device: DeviceSummary }) {
+export function SafeCard({ device: initial }: { device: DeviceSummary }) {
+  const [device, setDevice] = useState(initial);
+  const [locking, setLocking] = useState(false);
+  const [confirmLock, setConfirmLock] = useState(false);
+  const [unlocking, setUnlocking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
+
+  /** Synchronous double-click guard — see the note in UnlockDialog. */
+  const inFlight = useRef(false);
+
+  const stateUnavailable = device.lockState === 'UNKNOWN';
+
+  async function handleLock() {
+    if (inFlight.current) return;
+    inFlight.current = true;
+
+    setConfirmLock(false);
+    setLocking(true);
+    setError(null);
+    setStatus('Locking your safe…');
+
+    try {
+      const result = await api.post<LockResponse>('/devices/lock');
+      setDevice(result.device);
+      setStatus(result.alreadyLocked ? 'Your safe was already locked.' : 'Your safe is locked.');
+    } catch (cause) {
+      setStatus(null);
+      setError(toUserMessage(cause));
+    } finally {
+      setLocking(false);
+      inFlight.current = false;
+    }
+  }
+
   return (
     <section className="rounded-2xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -30,6 +71,22 @@ export function SafeCard({ device }: { device: DeviceSummary }) {
         <div className="flex flex-wrap gap-2">
           <LockStateBadge state={device.lockState} />
           <OnlineBadge online={device.online} />
+        </div>
+      </div>
+
+      {/* Icon + words. The badge above carries colour; this carries meaning
+          for anyone who cannot use colour to tell the two apart. */}
+      <div className="mt-4 flex items-center gap-3 rounded-xl bg-slate-50 p-3 dark:bg-slate-800/50">
+        <LockGlyph state={device.lockState} />
+        <div>
+          <p className="text-base font-bold text-slate-900 dark:text-white">
+            {STATE_HEADING[device.lockState]}
+          </p>
+          <p className="text-sm text-slate-600 dark:text-slate-400">
+            {device.lockState === 'UNKNOWN'
+              ? 'Your safe has not reported its state. Please contact support.'
+              : `Last confirmed ${formatTimestamp(device.lockStateUpdatedAt)}`}
+          </p>
         </div>
       </div>
 
@@ -49,35 +106,103 @@ export function SafeCard({ device }: { device: DeviceSummary }) {
       </dl>
 
       <div className="mt-5 flex flex-col gap-2 sm:flex-row">
-        <ComingSoonButton label="Lock" />
-        <ComingSoonButton label="Unlock" />
+        <Button
+          onClick={() => setConfirmLock(true)}
+          loading={locking}
+          loadingText="Locking…"
+          disabled={stateUnavailable || device.lockState === 'LOCKED'}
+        >
+          {device.lockState === 'LOCKED' ? 'Locked' : 'Lock'}
+        </Button>
+        <Button
+          variant="secondary"
+          onClick={() => setUnlocking(true)}
+          disabled={stateUnavailable || locking}
+        >
+          Unlock
+        </Button>
       </div>
-      <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-        Remote locking is not enabled yet. Unlocking will ask for a one-time code.
+
+      <p
+        role="status"
+        aria-live="polite"
+        className="mt-2 min-h-5 text-sm text-slate-600 dark:text-slate-400"
+      >
+        {status}
       </p>
+      <p
+        role="alert"
+        aria-live="assertive"
+        className="min-h-5 text-sm font-medium text-red-700 dark:text-red-300"
+      >
+        {error}
+      </p>
+
+      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+        Unlocking always asks for a one-time code. Every lock and unlock is recorded.
+      </p>
+
+      {/* Lock is one tap plus a confirmation — it is not destructive, but
+          locking a safe you are standing in front of is a real inconvenience. */}
+      <ConfirmDialog
+        open={confirmLock}
+        title="Lock your safe?"
+        description="The bolt will close immediately. You will need a one-time code to open it again."
+        confirmLabel="Lock it"
+        pending={locking}
+        onConfirm={() => void handleLock()}
+        onCancel={() => setConfirmLock(false)}
+      />
+
+      <UnlockDialog
+        open={unlocking}
+        onClose={() => setUnlocking(false)}
+        onUnlocked={(updated) => {
+          setDevice(updated);
+          setStatus('Your safe is unlocked.');
+          setError(null);
+        }}
+      />
     </section>
   );
 }
 
-/**
- * A control that is visibly present but not yet functional.
- *
- * `disabled` plus explicit text, rather than a handler that shows "not
- * implemented" — the state is legible before the tap, not after.
- */
-function ComingSoonButton({ label }: { label: string }) {
+const STATE_HEADING: Record<DeviceSummary['lockState'], string> = {
+  LOCKED: 'Locked',
+  UNLOCKED: 'Unlocked',
+  UNKNOWN: 'State unavailable',
+};
+
+/** A padlock whose shackle is open, closed, or replaced by a question mark. */
+function LockGlyph({ state }: { state: DeviceSummary['lockState'] }) {
+  const tone =
+    state === 'LOCKED'
+      ? 'text-emerald-600 dark:text-emerald-400'
+      : state === 'UNLOCKED'
+        ? 'text-amber-600 dark:text-amber-400'
+        : 'text-slate-500 dark:text-slate-400';
+
   return (
-    <button
-      type="button"
-      disabled
-      aria-disabled="true"
-      className="inline-flex min-h-12 w-full cursor-not-allowed items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-5 text-base font-semibold text-slate-400 select-none dark:border-slate-800 dark:bg-slate-800/50 dark:text-slate-500"
+    <svg
+      viewBox="0 0 24 24"
+      className={`size-8 shrink-0 ${tone}`}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      // Decorative: the heading next to it already says the state in words.
+      aria-hidden="true"
+      focusable="false"
     >
-      {label}
-      <span className="rounded-full bg-slate-200 px-2 py-0.5 text-xs font-semibold text-slate-600 dark:bg-slate-700 dark:text-slate-300">
-        Coming soon
-      </span>
-    </button>
+      <rect x="4" y="10" width="16" height="10" rx="2" />
+      {state === 'UNKNOWN' ? (
+        <path d="M10 7a2 2 0 1 1 4 0c0 1.5-2 1.5-2 3" />
+      ) : state === 'LOCKED' ? (
+        <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+      ) : (
+        <path d="M8 10V7a4 4 0 0 1 7.5-2" />
+      )}
+    </svg>
   );
 }
 

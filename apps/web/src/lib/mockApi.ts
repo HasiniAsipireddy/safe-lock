@@ -14,8 +14,12 @@
 import {
   ERROR_CODES,
   GENERIC_LOGIN_ERROR,
+  OTP_MAX_ATTEMPTS,
+  OTP_RESEND_COOLDOWN_SECONDS,
+  OTP_TTL_MS,
   classifyIdentifier,
   normaliseSerial,
+  otpSchema,
   serialNumberSchema,
   type AdminAuditRow,
   type AdminDeviceRow,
@@ -27,11 +31,16 @@ import {
   type BulkCreateRowResult,
   type CreateOrderResponse,
   type DeviceStatus,
+  type DeviceSummary,
+  type LockResponse,
+  type LockState,
   type MyDeviceResponse,
   type Paginated,
   type PaymentMeResponse,
   type PaymentSummary,
   type PublicUser,
+  type UnlockConfirmResponse,
+  type UnlockRequestResponse,
   type VerifyPaymentResponse,
 } from '@safelock/shared';
 import { apiErrorFromBody } from './apiError';
@@ -90,7 +99,8 @@ interface MockDevice {
   id: string;
   serialNumber: string;
   status: DeviceStatus;
-  lockState: 'LOCKED' | 'UNLOCKED' | 'UNKNOWN';
+  lockState: LockState;
+  lockStateUpdatedAt: string | null;
   online: boolean;
   lastSeenAt: string | null;
   ownerId: string | null;
@@ -113,7 +123,9 @@ function makeMockDevice(serialNumber: string, ageIndex: number): MockDevice {
     id: `dev_mock_${serialNumber.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
     serialNumber,
     status: 'UNASSIGNED',
-    lockState: 'UNKNOWN',
+    // Mirrors the API: a safe in stock is locked, not of unknown state.
+    lockState: 'LOCKED',
+    lockStateUpdatedAt: null,
     online: false,
     lastSeenAt: null,
     ownerId: null,
@@ -205,6 +217,12 @@ export async function mockRequest<T>(
       return handleVerifyPayment(body) as T;
     case 'GET /devices/mine':
       return handleMyDevice() as T;
+    case 'POST /devices/lock':
+      return handleMockLock() as T;
+    case 'POST /devices/unlock/request':
+      return handleMockUnlockRequest() as T;
+    case 'POST /devices/unlock/confirm':
+      return handleMockUnlockConfirm(body) as T;
     case 'GET /admin/devices':
       return handleAdminDevices(query) as T;
     case 'POST /admin/devices':
@@ -458,6 +476,7 @@ function toAdminDevice(device: MockDevice): AdminDeviceRow {
     serialNumber: device.serialNumber,
     status: device.status,
     lockState: device.lockState,
+    lockStateUpdatedAt: device.lockStateUpdatedAt,
     online: device.online,
     lastSeenAt: device.lastSeenAt,
     allocatedAt: device.allocatedAt,
@@ -500,16 +519,196 @@ function handleMyDevice(): MyDeviceResponse {
   const device = devices.find((candidate) => candidate.ownerId === account.user.id);
   if (!device) return { device: null };
 
+  return { device: toDeviceSummary(device) };
+}
+
+function toDeviceSummary(device: MockDevice): DeviceSummary {
   return {
-    device: {
-      id: device.id,
-      serialNumber: device.serialNumber,
-      lockState: device.lockState,
-      online: device.online,
-      lastSeenAt: device.lastSeenAt,
-      allocatedAt: device.allocatedAt,
-    },
+    id: device.id,
+    serialNumber: device.serialNumber,
+    lockState: device.lockState,
+    lockStateUpdatedAt: device.lockStateUpdatedAt,
+    online: device.online,
+    lastSeenAt: device.lastSeenAt,
+    allocatedAt: device.allocatedAt,
   };
+}
+
+// --- Lock / unlock (mock) ----------------------------------------------------
+
+/**
+ * The mock's in-memory unlock challenge.
+ *
+ * Unlike the API this keeps the code in plaintext — it has to, because there
+ * is nowhere to send it and the dev-mode panel displays it. That is exactly
+ * why mock mode is refused in production builds (`lib/env.ts`): this object
+ * would be a working unlock code sitting in browser memory.
+ */
+interface MockChallenge {
+  userId: string;
+  deviceId: string;
+  code: string;
+  expiresAt: number;
+  attempts: number;
+  consumed: boolean;
+}
+
+let mockChallenge: MockChallenge | null = null;
+
+/**
+ * The code the mock just issued, for the dev-only hint on the unlock dialog.
+ * There is no equivalent in the real flow — the API never returns a code.
+ */
+export function peekMockUnlockCode(): string | null {
+  if (!mockChallenge || mockChallenge.consumed) return null;
+  if (mockChallenge.expiresAt <= Date.now()) return null;
+  return mockChallenge.code;
+}
+
+/** Mirrors assertCanOperate, including the order the states are checked in. */
+function requireOperableDevice(): { account: MockAccount; device: MockDevice } {
+  const account = requireAccount();
+  const device = devices.find((candidate) => candidate.ownerId === account.user.id);
+
+  if (!account.user.hasPaid) {
+    if (device) {
+      return fail(
+        403,
+        ERROR_CODES.REFUNDED_CONTACT_SUPPORT,
+        'Your payment was refunded, so remote access is disabled. Please contact support about returning your safe.',
+      );
+    }
+    return fail(402, ERROR_CODES.NOT_PAID, 'Complete your payment to activate your safe.');
+  }
+
+  if (!device || device.status !== 'ASSIGNED') {
+    return fail(
+      409,
+      ERROR_CODES.NO_DEVICE,
+      'No safe is allocated to your account yet. You will be notified once one is assigned.',
+    );
+  }
+
+  if (device.lockState === 'UNKNOWN') {
+    return fail(
+      409,
+      ERROR_CODES.DEVICE_STATE_UNKNOWN,
+      'Your safe is not reporting its state. Please contact support.',
+    );
+  }
+
+  return { account, device };
+}
+
+function handleMockLock(): LockResponse {
+  const { account, device } = requireOperableDevice();
+
+  if (device.lockState === 'LOCKED') {
+    return { device: toDeviceSummary(device), alreadyLocked: true };
+  }
+
+  const now = new Date().toISOString();
+  device.lockState = 'LOCKED';
+  device.lockStateUpdatedAt = now;
+  device.online = true;
+  device.lastSeenAt = now;
+  recordAudit('device.lock.success', { userId: account.user.id, deviceId: device.id });
+
+  return { device: toDeviceSummary(device), alreadyLocked: false };
+}
+
+function handleMockUnlockRequest(): UnlockRequestResponse {
+  const { account, device } = requireOperableDevice();
+  const expiresAt = Date.now() + OTP_TTL_MS;
+
+  // A new request replaces any live code, exactly as the API does.
+  mockChallenge = {
+    userId: account.user.id,
+    deviceId: device.id,
+    code: String(Math.floor(Math.random() * 1_000_000)).padStart(6, '0'),
+    expiresAt,
+    attempts: 0,
+    consumed: false,
+  };
+  recordAudit('device.unlock.otp_requested', {
+    userId: account.user.id,
+    deviceId: device.id,
+  });
+
+  return {
+    expiresAt: new Date(expiresAt).toISOString(),
+    expiresInSeconds: Math.round(OTP_TTL_MS / 1000),
+    attemptsAllowed: OTP_MAX_ATTEMPTS,
+    resendAfterSeconds: OTP_RESEND_COOLDOWN_SECONDS,
+  };
+}
+
+function handleMockUnlockConfirm(body: unknown): UnlockConfirmResponse {
+  const { account, device } = requireOperableDevice();
+  const parsed = otpSchema.safeParse((body as { otp?: unknown })?.otp ?? '');
+
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Enter the 6-digit code',
+    );
+  }
+
+  const challenge = mockChallenge;
+  const live =
+    challenge !== null &&
+    !challenge.consumed &&
+    challenge.userId === account.user.id &&
+    challenge.deviceId === device.id;
+
+  if (!challenge || !live) {
+    return fail(
+      400,
+      ERROR_CODES.OTP_NOT_FOUND,
+      'That code is no longer valid. Request a new one.',
+    );
+  }
+
+  if (challenge.expiresAt <= Date.now()) {
+    challenge.consumed = true;
+    return fail(400, ERROR_CODES.OTP_EXPIRED, 'That code has expired. Request a new one.');
+  }
+
+  if (parsed.data !== challenge.code) {
+    challenge.attempts += 1;
+    recordAudit('device.unlock.otp_failed', {
+      userId: account.user.id,
+      deviceId: device.id,
+      metadata: { reason: 'wrong_code' },
+    });
+
+    if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
+      challenge.consumed = true;
+      return fail(
+        400,
+        ERROR_CODES.OTP_TOO_MANY_ATTEMPTS,
+        'Too many incorrect codes. Request a new one.',
+      );
+    }
+
+    const left = OTP_MAX_ATTEMPTS - challenge.attempts;
+    return fail(
+      400,
+      ERROR_CODES.OTP_INVALID,
+      `That code is not correct. ${left} attempt${left === 1 ? '' : 's'} left.`,
+    );
+  }
+
+  challenge.consumed = true;
+  const now = new Date().toISOString();
+  device.lockState = 'UNLOCKED';
+  device.lockStateUpdatedAt = now;
+  device.online = true;
+  device.lastSeenAt = now;
+  recordAudit('device.unlock.success', { userId: account.user.id, deviceId: device.id });
+
+  return { device: toDeviceSummary(device) };
 }
 
 // --- Admin -------------------------------------------------------------------
