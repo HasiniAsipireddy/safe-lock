@@ -7,6 +7,7 @@ import { createAuthRouter } from './modules/auth/auth.routes';
 import { createDevicesRouter } from './modules/devices/devices.routes';
 import { createNotificationsRouter } from './modules/notifications/notifications.routes';
 import { createPaymentsRouter } from './modules/payments/payments.routes';
+import { createWebhooksRouter } from './modules/webhooks/webhooks.routes';
 
 /** Everything under `/api/v1`. */
 export function createApiRouter(limiters: Limiters): Router {
@@ -35,6 +36,9 @@ export function createApiRouter(limiters: Limiters): Router {
   router.use('/account', createAccountRouter(limiters));
   router.use('/notifications', createNotificationsRouter(limiters));
   router.use('/admin', createAdminRouter(limiters));
+  // Server-to-server, authenticated by an HMAC over the raw body. Mounted
+  // last so nothing above can shadow it.
+  router.use('/webhooks', createWebhooksRouter(limiters));
 
   return router;
 }

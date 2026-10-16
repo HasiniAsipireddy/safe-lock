@@ -16,11 +16,18 @@ import {
 export const API_PREFIX = '/api/v1';
 
 /**
- * Razorpay's webhook. Exempt from two things:
- * - the JSON body parser (its signature covers the raw bytes), and
+ * Webhook paths, exempt from two things each:
+ * - the JSON body parser (their signatures cover the raw bytes), and
  * - the Origin check (server-to-server, no cookies, own HMAC).
+ *
+ * Both verify an HMAC over the raw body instead, which is a stronger claim
+ * than an Origin header: a forged cross-site request cannot produce a valid
+ * signature without the shared secret. See docs/decisions.md.
  */
-const WEBHOOK_PATH = `${API_PREFIX}/payments/webhook`;
+const RAZORPAY_WEBHOOK_PATH = `${API_PREFIX}/payments/webhook`;
+const WHATSAPP_WEBHOOK_PATH = `${API_PREFIX}/webhooks/whatsapp`;
+
+const RAW_BODY_PATHS = [RAZORPAY_WEBHOOK_PATH, WHATSAPP_WEBHOOK_PATH];
 
 export interface CreateAppOptions {
   /**
@@ -71,16 +78,20 @@ export function createApp(options: CreateAppOptions = {}): Express {
   );
 
   /**
-   * JSON everywhere except the Razorpay webhook.
+   * JSON everywhere except the webhooks.
    *
-   * The webhook signature covers the raw request bytes, so that route parses
-   * its own body with `express.raw()` (see payments.routes.ts). If
-   * `express.json()` ran first it would consume the stream and the HMAC could
-   * never be reproduced.
+   * A webhook signature covers the raw request bytes, so those routes parse
+   * their own bodies with `express.raw()` (see payments.routes.ts and
+   * webhooks.routes.ts). If `express.json()` ran first it would consume the
+   * stream and the HMAC could never be reproduced.
+   *
+   * Only these exact paths are skipped, so every other route — including any
+   * future one — keeps ordinary JSON parsing. There is a test asserting a
+   * normal endpoint still parses its body with the WhatsApp webhook mounted.
    */
   const jsonParser = express.json({ limit: '100kb' });
   app.use((req, res, next) => {
-    if (req.path === WEBHOOK_PATH) {
+    if (RAW_BODY_PATHS.includes(req.path)) {
       next();
       return;
     }
@@ -89,7 +100,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   app.use(cookieParser());
 
-  app.use(createOriginCheck({ exemptPaths: [WEBHOOK_PATH] }));
+  app.use(createOriginCheck({ exemptPaths: RAW_BODY_PATHS }));
 
   app.use(API_PREFIX, createApiRouter(limiters));
 

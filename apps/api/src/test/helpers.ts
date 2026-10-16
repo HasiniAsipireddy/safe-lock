@@ -51,6 +51,7 @@ export function app(options: CreateAppOptions = {}): Express {
       unlockConfirm: { windowMs: 60_000, limit: 1000 },
       deviceHistory: { windowMs: 60_000, limit: 1000 },
       notifications: { windowMs: 60_000, limit: 1000 },
+      whatsAppWebhook: { windowMs: 60_000, limit: 1000 },
       ...options.rateLimits,
     },
   });

@@ -80,6 +80,14 @@ export interface RateLimitConfig {
    * that and still bound a client stuck in a loop.
    */
   notifications: LimitSpec;
+  /**
+   * Per-IP limiter on the WhatsApp webhook, GET and POST.
+   *
+   * Public and unauthenticated until the HMAC is checked, so this bounds
+   * someone hammering it with forged signatures. Generous, because Meta's own
+   * retries and status bursts are legitimate traffic and must not be dropped.
+   */
+  whatsAppWebhook: LimitSpec;
 }
 
 export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
@@ -134,6 +142,10 @@ export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
   // 5 minutes of 60s polling is 5 requests per tab, plus a fetch on every
   // visibility change and bell open. 120 clears a handful of tabs comfortably.
   notifications: { windowMs: 5 * 60 * 1000, limit: 120 },
+
+  // Meta can burst several statuses per message (sent, delivered, read) and
+  // retries failures, so this is sized to never drop legitimate callbacks.
+  whatsAppWebhook: { windowMs: 60 * 1000, limit: 300 },
 };
 
 const TOO_MANY_ATTEMPTS = 'Too many attempts. Please wait a few minutes and try again.';
@@ -228,6 +240,7 @@ export interface Limiters {
   unlockConfirm: ReturnType<typeof rateLimit>;
   deviceHistory: ReturnType<typeof rateLimit>;
   notifications: ReturnType<typeof rateLimit>;
+  whatsAppWebhook: ReturnType<typeof rateLimit>;
 }
 
 export function createLimiters(
@@ -483,6 +496,13 @@ export function createLimiters(
         },
       },
       stores.notifications,
+    ),
+
+    whatsAppWebhook: build(
+      config.whatsAppWebhook,
+      'Too many requests.',
+      { keyGenerator: (req) => (req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown') },
+      stores.whatsAppWebhook,
     ),
   };
 }
