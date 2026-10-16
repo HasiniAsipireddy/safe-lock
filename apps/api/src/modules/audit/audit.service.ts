@@ -34,6 +34,27 @@ export const AUDIT_ACTIONS = {
   /** A refresh attempt with an unknown, expired or malformed token. */
   REFRESH_REJECTED: 'auth.refresh.rejected',
 
+  // --- Account / password ---------------------------------------------------
+  /** A reset link was requested for an address that has an account. */
+  PASSWORD_RESET_REQUESTED: 'auth.password.reset_requested',
+  /**
+   * A reset link was requested for an address that has no account. Nothing was
+   * sent, and the HTTP response was identical to the case above — the two are
+   * distinguishable **here and nowhere else**. A run of these from one IP is
+   * someone probing for registered users.
+   */
+  PASSWORD_RESET_REQUESTED_UNKNOWN: 'auth.password.reset_requested_unknown',
+  /** A reset token was redeemed: the password changed and all sessions ended. */
+  PASSWORD_RESET_COMPLETED: 'auth.password.reset_completed',
+  /** A reset token that was unknown, expired or already used. */
+  PASSWORD_RESET_REJECTED: 'auth.password.reset_rejected',
+  /** A signed-in user changed their own password. */
+  PASSWORD_CHANGED: 'auth.password.changed',
+  /** A change-password attempt that failed — usually a wrong current password. */
+  PASSWORD_CHANGE_FAILED: 'auth.password.change_failed',
+  /** A profile field (today: the name) was updated. */
+  PROFILE_UPDATED: 'auth.profile.updated',
+
   /** A state-changing request was blocked by the Origin allowlist. */
   ORIGIN_REJECTED: 'security.origin.rejected',
 

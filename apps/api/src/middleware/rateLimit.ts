@@ -25,6 +25,23 @@ export interface RateLimitConfig {
   auth: LimitSpec;
   /** Per-identifier (hashed email/phone) limiter on the same two routes. */
   authIdentifier: LimitSpec;
+  /** Per-IP limb on `POST /auth/password/forgot`. */
+  passwordForgot: LimitSpec;
+  /**
+   * Per-address limb on the same route, keyed on `sha256(email)`.
+   *
+   * Deliberately its **own** bucket rather than sharing `authIdentifier` with
+   * login: sharing would let reset requests exhaust a user's login quota, so
+   * anyone could lock a known account out of signing in by asking for reset
+   * links. It also bounds mailbox spam at a few messages an hour.
+   */
+  passwordForgotIdentifier: LimitSpec;
+  /** Per-IP limiter on `POST /auth/password/reset`. */
+  passwordReset: LimitSpec;
+  /** Per-user limiter on `POST /auth/password/change`. */
+  passwordChange: LimitSpec;
+  /** Per-user limiter on `PATCH /auth/profile`. */
+  profileUpdate: LimitSpec;
   /** Per-user limiter on /payments/order. */
   createOrder: LimitSpec;
   /** Per-user limiter on /payments/verify. */
@@ -61,6 +78,20 @@ export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
   // Tighter than the per-IP limb: a single account being hammered from many
   // addresses is the attack the per-IP limiter cannot see.
   authIdentifier: { windowMs: 15 * 60 * 1000, limit: 5 },
+
+  // Reset requests cost the recipient a message they did not ask for, so the
+  // per-address limb is the tight one: 3 an hour is plenty for someone who
+  // genuinely cannot find the first mail.
+  passwordForgot: { windowMs: 15 * 60 * 1000, limit: 5 },
+  passwordForgotIdentifier: { windowMs: 60 * 60 * 1000, limit: 3 },
+  // Guessing a 32-byte token is not a threat a rate limit defeats or needs to;
+  // this bounds a broken client retrying a dead link.
+  passwordReset: { windowMs: 15 * 60 * 1000, limit: 10 },
+  // Each attempt costs an argon2 verify, and a wrong current password is a
+  // 400 the limiter should not let anyone grind through.
+  passwordChange: { windowMs: 15 * 60 * 1000, limit: 10 },
+  profileUpdate: { windowMs: 15 * 60 * 1000, limit: 20 },
+
   createOrder: { windowMs: 10 * 60 * 1000, limit: 5 },
   verifyPayment: { windowMs: 10 * 60 * 1000, limit: 20 },
   adminWrite: { windowMs: 5 * 60 * 1000, limit: 60 },
@@ -162,6 +193,11 @@ export function hashIdentifier(identifier: string): string {
 export interface Limiters {
   auth: ReturnType<typeof rateLimit>;
   authIdentifier: ReturnType<typeof rateLimit>;
+  passwordForgot: ReturnType<typeof rateLimit>;
+  passwordForgotIdentifier: ReturnType<typeof rateLimit>;
+  passwordReset: ReturnType<typeof rateLimit>;
+  passwordChange: ReturnType<typeof rateLimit>;
+  profileUpdate: ReturnType<typeof rateLimit>;
   createOrder: ReturnType<typeof rateLimit>;
   verifyPayment: ReturnType<typeof rateLimit>;
   adminWrite: ReturnType<typeof rateLimit>;
@@ -207,6 +243,62 @@ export function createLimiters(
         },
       },
       stores.authIdentifier,
+    ),
+
+    passwordForgot: build(
+      config.passwordForgot,
+      TOO_MANY_ATTEMPTS,
+      { keyGenerator: (req) => (req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown') },
+      stores.passwordForgot,
+    ),
+
+    /**
+     * Per-address limb. Like `authIdentifier` it runs before any database
+     * lookup, so its 429 cannot reveal whether the address has an account —
+     * which would undo the whole point of the endpoint's identical responses.
+     */
+    passwordForgotIdentifier: build(
+      config.passwordForgotIdentifier,
+      TOO_MANY_ATTEMPTS,
+      {
+        keyGenerator: (req) => {
+          const identifier = extractIdentifier(req.body);
+          if (identifier) return `reset:${hashIdentifier(identifier)}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.passwordForgotIdentifier,
+    ),
+
+    passwordReset: build(
+      config.passwordReset,
+      TOO_MANY_ATTEMPTS,
+      { keyGenerator: (req) => (req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown') },
+      stores.passwordReset,
+    ),
+
+    passwordChange: build(
+      config.passwordChange,
+      TOO_MANY_ATTEMPTS,
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.passwordChange,
+    ),
+
+    profileUpdate: build(
+      config.profileUpdate,
+      TOO_MANY_ATTEMPTS,
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.profileUpdate,
     ),
 
     createOrder: build(

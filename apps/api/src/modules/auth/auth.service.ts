@@ -5,9 +5,10 @@ import {
   classifyIdentifier,
 } from '@safelock/shared';
 import { prisma } from '../../lib/prisma';
-import { HttpError, conflict } from '../../lib/httpError';
+import { HttpError, conflict, unauthenticated } from '../../lib/httpError';
 import { hashPassword, verifyPassword } from './password';
 import { toPublicUser, userHasDevice, userHasPaid } from '../users/user.mapper';
+import { issueRefreshToken, type IssueContext, type IssuedToken } from './refreshToken.service';
 
 const SELECT = {
   id: true,
@@ -101,4 +102,98 @@ export async function login(input: {
     userHasDevice(row.id),
   ]);
   return toPublicUser(row, { hasPaid, deviceAllocated });
+}
+
+/**
+ * Changes a signed-in user's password, then ends every session and starts one.
+ *
+ * ## Revoke-all-then-reissue
+ * Changing a password is how someone evicts a session they no longer trust, so
+ * **every** refresh token for the user is revoked — and then a brand-new
+ * family is issued to the caller, who stays signed in. Anything else is wrong
+ * in one direction or the other: revoking nothing makes the change cosmetic,
+ * and revoking everything without reissuing logs people out of the tab they
+ * just used, which trains them not to change passwords.
+ *
+ * All three steps are one transaction. Revoking and reissuing separately would
+ * leave a window where the caller holds no valid refresh token, and a parallel
+ * request in that window would be indistinguishable from a replay.
+ *
+ * ## The 15-minute caveat
+ * Access tokens are stateless 15-minute JWTs, so another session's *access*
+ * token keeps working until it expires — it just cannot be renewed. That
+ * window is documented in docs/decisions.md and is deliberately not closed.
+ */
+export async function changePassword(input: {
+  userId: string;
+  currentPassword: string;
+  password: string;
+  context?: IssueContext;
+}): Promise<{ user: PublicUser; refresh: IssuedToken }> {
+  const user = await prisma.user.findUnique({
+    where: { id: input.userId },
+    select: { ...SELECT, passwordHash: true },
+  });
+
+  // A valid access token for a user who no longer exists: treat as signed out.
+  if (!user) throw unauthenticated();
+
+  if (!(await verifyPassword(user.passwordHash, input.currentPassword))) {
+    throw new HttpError({
+      status: 400,
+      code: ERROR_CODES.PASSWORD_INCORRECT,
+      message: 'That is not your current password.',
+    });
+  }
+
+  // Hashed before the transaction: argon2 costs real time by design, and
+  // holding a transaction open across it pins a connection for no reason.
+  const passwordHash = await hashPassword(input.password);
+
+  const refresh = await prisma.$transaction(async (tx) => {
+    await tx.user.update({
+      where: { id: user.id },
+      data: { passwordHash },
+      select: { id: true },
+    });
+
+    await tx.refreshToken.updateMany({
+      where: { userId: user.id, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+
+    // A new family, not a rotation: the old chain is gone, and this login is
+    // a new one as far as reuse detection is concerned.
+    return issueRefreshToken(user.id, input.context ?? {}, tx);
+  });
+
+  const { passwordHash: _ignored, ...row } = user;
+  const [hasPaid, deviceAllocated] = await Promise.all([
+    userHasPaid(row.id),
+    userHasDevice(row.id),
+  ]);
+
+  return { user: toPublicUser(row, { hasPaid, deviceAllocated }), refresh };
+}
+
+/**
+ * Updates the profile. **Name only** — see `updateProfileSchema`, which
+ * rejects anything else rather than ignoring it.
+ */
+export async function updateProfile(input: {
+  userId: string;
+  name: string;
+}): Promise<PublicUser> {
+  const user = await prisma.user.update({
+    where: { id: input.userId },
+    data: { name: input.name },
+    select: SELECT,
+  });
+
+  const [hasPaid, deviceAllocated] = await Promise.all([
+    userHasPaid(user.id),
+    userHasDevice(user.id),
+  ]);
+
+  return toPublicUser(user, { hasPaid, deviceAllocated });
 }

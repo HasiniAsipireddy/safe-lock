@@ -45,6 +45,25 @@ export const ERROR_CODES = {
    */
   REFRESH_REUSE_DETECTED: 'REFRESH_REUSE_DETECTED',
 
+  // --- Account / password ---------------------------------------------------
+  /**
+   * A password reset token that was unknown, expired or already used.
+   *
+   * **One code for all three on purpose.** Telling the holder of a token which
+   * of those it is tells them whether it ever existed, and a reset link is
+   * exactly the kind of thing that ends up in a forwarded email or a shared
+   * browser history.
+   */
+  RESET_TOKEN_INVALID: 'RESET_TOKEN_INVALID',
+  /**
+   * The `currentPassword` supplied to `POST /auth/password/change` was wrong.
+   *
+   * Deliberately a **400, not a 401**: the session is perfectly valid, and a
+   * 401 would send the web client through its refresh-and-retry path and end
+   * with the user signed out for mistyping a password.
+   */
+  PASSWORD_INCORRECT: 'PASSWORD_INCORRECT',
+
   // --- Devices / allocation -------------------------------------------------
   /** Allocation attempted for a user with no server-verified payment. */
   NOT_PAID: 'NOT_PAID',

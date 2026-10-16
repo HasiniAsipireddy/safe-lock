@@ -6,6 +6,7 @@ import { env } from '../config/env';
 import { prisma } from '../lib/prisma';
 import { ACCESS_COOKIE, REFRESH_COOKIE, signAccessToken } from '../modules/auth/tokens';
 import { hashRefreshToken } from '../modules/auth/refreshToken.service';
+import { hashPassword } from '../modules/auth/password';
 import { allocateDevice } from '../modules/devices/device.service';
 
 /**
@@ -32,6 +33,11 @@ export function app(options: CreateAppOptions = {}): Express {
     rateLimits: {
       auth: { windowMs: 60_000, limit: 1000 },
       authIdentifier: { windowMs: 60_000, limit: 1000 },
+      passwordForgot: { windowMs: 60_000, limit: 1000 },
+      passwordForgotIdentifier: { windowMs: 60_000, limit: 1000 },
+      passwordReset: { windowMs: 60_000, limit: 1000 },
+      passwordChange: { windowMs: 60_000, limit: 1000 },
+      profileUpdate: { windowMs: 60_000, limit: 1000 },
       createOrder: { windowMs: 60_000, limit: 1000 },
       verifyPayment: { windowMs: 60_000, limit: 1000 },
       adminWrite: { windowMs: 60_000, limit: 1000 },
@@ -336,6 +342,73 @@ export async function withCapturedOtp<T>(
   }
 
   return { result, code: match[1], lines };
+}
+
+/**
+ * Runs something that mints a password reset token and returns the token.
+ *
+ * Read back off the dev console line, exactly like {@link withCapturedOtp} and
+ * for the same reasons: it exercises the **real** delivery path rather than
+ * reaching into the service, nothing else can recover the value (only the
+ * SHA-256 is stored), and a test fails loudly if the print is ever removed or
+ * accidentally gated off in the test environment.
+ */
+export async function withCapturedResetToken<T>(
+  run: () => Promise<T>,
+): Promise<{ result: T; token: string; lines: string[] }> {
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+    lines.push(args.map(String).join(' '));
+  });
+
+  let result: T;
+  try {
+    result = await run();
+  } finally {
+    spy.mockRestore();
+  }
+
+  const match = lines.join('\n').match(/Password reset token: ([A-Za-z0-9_-]+)/);
+  if (!match?.[1]) {
+    throw new Error(`No reset token was printed. Console output:\n${lines.join('\n')}`);
+  }
+
+  return { result, token: match[1], lines };
+}
+
+/**
+ * A user with a known password, created through the real hashing path.
+ *
+ * {@link createTestUser} plants a placeholder hash that no password verifies
+ * against, which is fine for tests that never sign in — but change-password
+ * and reset both have to *verify* a password, so they need the real thing.
+ */
+export async function createTestUserWithPassword(
+  password: string,
+): Promise<TestUser & { password: string }> {
+  userSequence += 1;
+  const email = `pw${userSequence}.${Date.now()}@example.com`;
+  const phone = `9${String(200000000 + userSequence).slice(0, 9)}`;
+
+  const user = await prisma.user.create({
+    data: {
+      name: `Password User ${userSequence}`,
+      email,
+      phone,
+      passwordHash: await hashPassword(password),
+    },
+    select: { id: true, email: true, phone: true, role: true },
+  });
+
+  const token = signAccessToken({ sub: user.id, role: user.role });
+
+  return {
+    id: user.id,
+    email: user.email,
+    phone: user.phone,
+    cookie: `${ACCESS_COOKIE}=${token}`,
+    password,
+  };
 }
 
 // --- Signatures (computed for real, with the test secrets) -------------------

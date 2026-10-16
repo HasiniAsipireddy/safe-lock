@@ -10,6 +10,7 @@ import { prisma } from '../lib/prisma';
 
 const TABLES = [
   'RefreshToken',
+  'PasswordResetToken',
   'Notification',
   'DeviceEvent',
   'UnlockChallenge',

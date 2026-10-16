@@ -1,5 +1,14 @@
 import type { Request, RequestHandler } from 'express';
-import { ERROR_CODES, type AuthResponse } from '@safelock/shared';
+import {
+  ERROR_CODES,
+  type AuthResponse,
+  type ChangePasswordBody,
+  type ForgotPasswordInput,
+  type ForgotPasswordResponse,
+  type PasswordResetResponse,
+  type ResetPasswordBody,
+  type UpdateProfileInput,
+} from '@safelock/shared';
 import { HttpError, unauthenticated } from '../../lib/httpError';
 import { AUDIT_ACTIONS, auditContext, writeAudit } from '../audit/audit.service';
 import { loadPublicUser } from '../users/user.mapper';
@@ -10,6 +19,7 @@ import {
   redeemRefreshToken,
   revokeByRawToken,
 } from './refreshToken.service';
+import { completePasswordReset, requestPasswordReset } from './passwordReset.service';
 import type { SignupBody } from './auth.schemas';
 import type { LoginInput } from '@safelock/shared';
 
@@ -183,6 +193,155 @@ export const postRefresh: RequestHandler = async (req, res, next) => {
       next(unauthenticated());
       return;
     }
+
+    const response: AuthResponse = { user };
+    res.status(200).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * `POST /auth/password/forgot` — asks for a reset link.
+ *
+ * **The response is identical whether or not the address has an account**: the
+ * same status, the same body, no `requestId` difference, nothing conditional.
+ * A "no such user" answer here would turn the endpoint into a way to test
+ * whether someone owns a safe, which is a worse disclosure than it first looks
+ * for a physical-security product.
+ *
+ * The difference is recorded server-side instead, as two distinct audit
+ * actions — neither of which carries the address (the audit service drops any
+ * key matching `email`).
+ */
+export const postForgotPassword: RequestHandler = async (req, res, next) => {
+  const { email } = req.body as ForgotPasswordInput;
+  const context = auditContext(req);
+
+  try {
+    const outcome = await requestPasswordReset({
+      email,
+      ip: context.ip,
+      userAgent: context.userAgent,
+    });
+
+    await writeAudit({
+      action: outcome.userId
+        ? AUDIT_ACTIONS.PASSWORD_RESET_REQUESTED
+        : AUDIT_ACTIONS.PASSWORD_RESET_REQUESTED_UNKNOWN,
+      userId: outcome.userId,
+      ...context,
+    });
+
+    const response: ForgotPasswordResponse = { status: 'ok' };
+    res.status(200).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * `POST /auth/password/reset` — sets a new password from a reset link.
+ *
+ * **Does not sign the user in.** No access cookie, no refresh cookie, no user
+ * in the body. Holding a reset link proves control of a delivery channel, and
+ * the product's answer to that is "you may set a password, now sign in with
+ * it" rather than "here is a live session to your safe". It also means a link
+ * forwarded or left in a shared browser's history cannot be turned straight
+ * into access.
+ *
+ * Cookies are *cleared* rather than left alone, because the service has just
+ * revoked every refresh token for the account — leaving a dead session in the
+ * browser would show a signed-in shell that 401s on its first request.
+ */
+export const postResetPassword: RequestHandler = async (req, res, next) => {
+  const { token, password } = req.body as ResetPasswordBody;
+  const context = auditContext(req);
+
+  try {
+    const { userId } = await completePasswordReset({ token, password });
+
+    clearAuthCookies(res);
+
+    await writeAudit({
+      action: AUDIT_ACTIONS.PASSWORD_RESET_COMPLETED,
+      userId,
+      ...context,
+    });
+
+    const response: PasswordResetResponse = { status: 'ok' };
+    res.status(200).json(response);
+  } catch (error) {
+    // No userId to record: a rejected token is by definition not tied to a
+    // known account. The code says which way it failed, and there is only one.
+    await writeAudit({
+      action: AUDIT_ACTIONS.PASSWORD_RESET_REJECTED,
+      ...context,
+      metadata: { code: error instanceof HttpError ? error.code : 'INTERNAL_ERROR' },
+    });
+    next(error);
+  }
+};
+
+/**
+ * `POST /auth/password/change` — a signed-in user changing their own password.
+ *
+ * Every other session is revoked and the caller is handed a fresh refresh
+ * family, so they stay signed in here and are signed out everywhere else. See
+ * `authService.changePassword` for why that is one transaction.
+ */
+export const postChangePassword: RequestHandler = async (req, res, next) => {
+  const userId = req.user!.id;
+  const body = req.body as ChangePasswordBody;
+  const context = auditContext(req);
+
+  try {
+    const { user, refresh } = await authService.changePassword({
+      userId,
+      currentPassword: body.currentPassword,
+      password: body.password,
+      context: { ip: context.ip, userAgent: context.userAgent },
+    });
+
+    // Both cookies, with the same attributes and paths as a fresh login — the
+    // access token has to be re-minted too, not just the refresh token.
+    setAuthCookies(res, { sub: user.id, role: user.role }, refresh.rawToken);
+
+    await writeAudit({
+      action: AUDIT_ACTIONS.PASSWORD_CHANGED,
+      userId,
+      ...context,
+      metadata: { familyId: refresh.familyId },
+    });
+
+    const response: AuthResponse = { user };
+    res.status(200).json(response);
+  } catch (error) {
+    await writeAudit({
+      action: AUDIT_ACTIONS.PASSWORD_CHANGE_FAILED,
+      userId,
+      ...context,
+      metadata: { code: error instanceof HttpError ? error.code : 'INTERNAL_ERROR' },
+    });
+    next(error);
+  }
+};
+
+/** `PATCH /auth/profile` — name only; the schema rejects anything else. */
+export const patchProfile: RequestHandler = async (req, res, next) => {
+  const userId = req.user!.id;
+  const { name } = req.body as UpdateProfileInput;
+
+  try {
+    const user = await authService.updateProfile({ userId, name });
+
+    await writeAudit({
+      action: AUDIT_ACTIONS.PROFILE_UPDATED,
+      userId,
+      ...auditContext(req),
+      // The name itself is not recorded: it is user-supplied free text, and
+      // the row only needs to say that a change happened and when.
+    });
 
     const response: AuthResponse = { user };
     res.status(200).json(response);

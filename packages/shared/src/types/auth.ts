@@ -29,9 +29,38 @@ export interface PublicUser {
   deviceAllocated: boolean;
 }
 
-/** Response body of `POST /auth/login`, `POST /auth/signup` and `GET /auth/me`. */
+/**
+ * Response body of `POST /auth/login`, `POST /auth/signup`, `GET /auth/me`,
+ * `PATCH /auth/profile` and `POST /auth/password/change`.
+ *
+ * Note which account endpoint is **not** here: `POST /auth/password/reset`
+ * returns {@link PasswordResetResponse} and no user, because completing a
+ * reset does not sign anyone in.
+ */
 export interface AuthResponse {
   user: PublicUser;
+}
+
+/**
+ * Response body of `POST /auth/password/forgot`.
+ *
+ * Always exactly this, for a registered address and an unregistered one
+ * alike — the endpoint must not become a way to find out who has an account.
+ */
+export interface ForgotPasswordResponse {
+  status: 'ok';
+}
+
+/**
+ * Response body of `POST /auth/password/reset`.
+ *
+ * Carries no user and sets no session cookie. Whoever holds a reset link is
+ * not yet known to be the account owner — they have proved control of an
+ * inbox, which is enough to set a password and then be asked to sign in with
+ * it, not enough to be handed a live session to a safe.
+ */
+export interface PasswordResetResponse {
+  status: 'ok';
 }
 
 /** The consistent error envelope used by every endpoint. */

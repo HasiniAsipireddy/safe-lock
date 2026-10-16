@@ -93,9 +93,10 @@ model User {
   // SMS verification is built. Deliberately absent for now so no route can
   // start depending on a column that is never populated.
 
-  payments          Payment[]
-  auditLogs         AuditLog[]
-  refreshTokens     RefreshToken[]
+  payments            Payment[]
+  auditLogs           AuditLog[]
+  refreshTokens       RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
   deviceEvents      DeviceEvent[]
   unlockChallenges  UnlockChallenge[]
   notifications     Notification[]
@@ -278,6 +279,42 @@ model RefreshToken {
 
   @@index([userId])
   @@index([familyId])
+  @@index([expiresAt])
+}
+
+/// One outstanding password reset.
+///
+/// Only `sha256(token)` is stored, exactly as for `RefreshToken` — and for the
+/// same reason, not a weaker one. The token is 32 random bytes, so there is no
+/// guess space to brute-force and nothing a keyed hash would protect that the
+/// entropy does not already. (`UnlockChallenge.otpHash` is an HMAC precisely
+/// because a 6-digit code has only 10^6 values. See docs/decisions.md.)
+///
+/// The raw token exists in one message and one URL. It is never stored, never
+/// logged, and cannot be recovered from this row.
+model PasswordResetToken {
+  id     String @id @default(cuid())
+  userId String
+
+  /// SHA-256 hex of the opaque token. Unique so one secret can never have two
+  /// live rows.
+  tokenHash String @unique
+
+  expiresAt DateTime
+  /// Set when the token was redeemed, **or** when a newer request superseded
+  /// it. Either way it can never be used again — one live link at a time, the
+  /// same discipline `UnlockChallenge` follows.
+  consumedAt DateTime?
+
+  /// Captured at request time to make an audit trail useful, never for auth.
+  requestedIp String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Finding and superseding a user's outstanding tokens.
+  @@index([userId, consumedAt])
   @@index([expiresAt])
 }
 

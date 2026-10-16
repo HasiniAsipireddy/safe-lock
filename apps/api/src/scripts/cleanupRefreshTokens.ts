@@ -1,22 +1,37 @@
 import { logger } from '../lib/logger';
 import { disconnectPrisma } from '../lib/prisma';
 import { cleanupRefreshTokens } from '../modules/auth/refreshToken.service';
+import { cleanupPasswordResetTokens } from '../modules/auth/passwordReset.service';
 
 /**
- * Deletes refresh token rows that can no longer authorise anything.
+ * Deletes token rows that can no longer authorise anything.
  *
  * Run from cron or a scheduled job:
  *   npm --workspace apps/api run db:cleanup-tokens
  *
- * Revoked rows are retained for 30 days rather than deleted on revocation —
- * they are what makes reuse detection work. Delete one immediately and a
- * replayed stolen token looks like an unknown token instead of a theft signal.
+ * **Refresh tokens:** revoked rows are retained for 30 days rather than
+ * deleted on revocation — they are what makes reuse detection work. Delete one
+ * immediately and a replayed stolen token looks like an unknown token instead
+ * of a theft signal.
+ *
+ * **Password reset tokens:** consumed rows are kept only 7 days, and purely
+ * for forensics. There is no reuse-detection reason to hold them: a replayed
+ * reset link and an expired one answer identically by design, so nothing
+ * distinguishes them at request time anyway.
  */
 
 async function main(): Promise<void> {
-  const { deleted } = await cleanupRefreshTokens();
-  logger.info({ deleted }, 'Refresh token cleanup complete');
-  process.stdout.write(`Deleted ${deleted} expired or long-revoked refresh token(s)\n`);
+  const refresh = await cleanupRefreshTokens();
+  const resets = await cleanupPasswordResetTokens();
+
+  logger.info(
+    { refreshDeleted: refresh.deleted, resetDeleted: resets.deleted },
+    'Token cleanup complete',
+  );
+  process.stdout.write(
+    `Deleted ${refresh.deleted} expired or long-revoked refresh token(s) ` +
+      `and ${resets.deleted} spent password reset token(s)\n`,
+  );
 }
 
 main()
