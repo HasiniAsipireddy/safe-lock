@@ -193,12 +193,16 @@ describe('CloudApiWhatsAppClient', () => {
   it('keeps the one-time code out of the error it throws', async () => {
     stubFetch({ status: 400, body: { error: { code: 132001, message: 'bad params' } } });
 
-    const error = await new CloudApiWhatsAppClient()
-      .sendTemplate(SEND)
-      .catch((cause: unknown) => cause as WhatsAppError);
+    let error: unknown;
+    try {
+      await new CloudApiWhatsAppClient().sendTemplate(SEND);
+    } catch (cause) {
+      error = cause;
+    }
 
     expect(error).toBeInstanceOf(WhatsAppError);
-    expect(JSON.stringify({ message: error.message, stack: error.stack })).not.toContain(
+    const thrown = error as WhatsAppError;
+    expect(JSON.stringify({ message: thrown.message, stack: thrown.stack })).not.toContain(
       '123456',
     );
   });
