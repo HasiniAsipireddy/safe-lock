@@ -18,6 +18,8 @@ export interface DeviceSummary {
   id: string;
   serialNumber: string;
   lockState: LockState;
+  /** ISO timestamp of the last confirmed lock-state change, or null. */
+  lockStateUpdatedAt: string | null;
   online: boolean;
   /** ISO timestamp of the last device heartbeat, or null if never seen. */
   lastSeenAt: string | null;
@@ -29,12 +31,60 @@ export interface MyDeviceResponse {
   device: DeviceSummary | null;
 }
 
+// --- Lock / unlock -----------------------------------------------------------
+
+/**
+ * A recorded lock/unlock event. Append-only and user-visible — this is what
+ * the `/history` page will read.
+ *
+ * `UNLOCK_REQUESTED` means a code was sent, not that anything opened.
+ * `UNLOCK_FAILED` covers a wrong, expired or exhausted code.
+ */
+export type DeviceEventType = 'LOCK' | 'UNLOCK_REQUESTED' | 'UNLOCK_CONFIRMED' | 'UNLOCK_FAILED';
+
+/** Where a device event originated. Only the web app for now. */
+export type DeviceEventSource = 'WEB';
+
+/** Response body of `POST /devices/lock`. */
+export interface LockResponse {
+  device: DeviceSummary;
+  /**
+   * True when the safe was already locked and no command was sent. Locking is
+   * idempotent, so this is a success, not an error — the UI can say
+   * "already locked" rather than claiming it just locked it.
+   */
+  alreadyLocked: boolean;
+}
+
+/**
+ * Response body of `POST /devices/unlock/request`.
+ *
+ * Carries no code and nothing derived from one — only when it expires and how
+ * many tries the user gets.
+ */
+export interface UnlockRequestResponse {
+  /** ISO timestamp the challenge expires at. */
+  expiresAt: string;
+  /** Seconds until expiry, so a client with a skewed clock still counts down. */
+  expiresInSeconds: number;
+  /** Attempts allowed against this challenge before it is invalidated. */
+  attemptsAllowed: number;
+  /** Seconds the client should disable "Resend" for. */
+  resendAfterSeconds: number;
+}
+
+/** Response body of `POST /devices/unlock/confirm`. */
+export interface UnlockConfirmResponse {
+  device: DeviceSummary;
+}
+
 /** The device as an admin sees it — adds inventory state and the owner. */
 export interface AdminDeviceRow {
   id: string;
   serialNumber: string;
   status: DeviceStatus;
   lockState: LockState;
+  lockStateUpdatedAt: string | null;
   online: boolean;
   lastSeenAt: string | null;
   allocatedAt: string | null;

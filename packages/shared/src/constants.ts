@@ -60,6 +60,37 @@ export const ERROR_CODES = {
   USER_NOT_FOUND: 'USER_NOT_FOUND',
   /** A serial number that already exists in the inventory. */
   DUPLICATE_SERIAL: 'DUPLICATE_SERIAL',
+
+  // --- Lock / unlock --------------------------------------------------------
+  /**
+   * The caller is paid but holds no device yet — still waiting for an admin to
+   * allocate one. Distinct from NOT_PAID: paying again would not help.
+   */
+  NO_DEVICE: 'NO_DEVICE',
+  /**
+   * The caller's payment was refunded while they still hold hardware. Remote
+   * operation is withdrawn; reclaiming the safe is a deliberate admin action.
+   * See docs/decisions.md.
+   */
+  REFUNDED_CONTACT_SUPPORT: 'REFUNDED_CONTACT_SUPPORT',
+  /** The submitted OTP did not match. The challenge is still open. */
+  OTP_INVALID: 'OTP_INVALID',
+  /** The challenge passed its 5-minute expiry. Request a new code. */
+  OTP_EXPIRED: 'OTP_EXPIRED',
+  /** The challenge burned its 5 attempts and has been invalidated. */
+  OTP_TOO_MANY_ATTEMPTS: 'OTP_TOO_MANY_ATTEMPTS',
+  /**
+   * No open challenge for this user and device — never requested, already
+   * used, or superseded by a newer request.
+   */
+  OTP_NOT_FOUND: 'OTP_NOT_FOUND',
+  /** The device gateway refused or failed to deliver the command. */
+  DEVICE_COMMAND_FAILED: 'DEVICE_COMMAND_FAILED',
+  /**
+   * The device's lock state is UNKNOWN, so no command can be reasoned about.
+   * Should not occur for an owned device — allocation sets LOCKED.
+   */
+  DEVICE_STATE_UNKNOWN: 'DEVICE_STATE_UNKNOWN',
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];

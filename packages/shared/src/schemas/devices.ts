@@ -80,6 +80,46 @@ export const allocateDeviceSchema = z
 /** `POST /admin/devices/:id/unassign` and `/retire` take no body. */
 export const emptyBodySchema = z.object({}).strict();
 
+// --- Unlock OTP --------------------------------------------------------------
+
+/**
+ * OTP parameters, defined once so the API, the UI copy and the countdown
+ * cannot disagree about them. Rationale in docs/decisions.md.
+ */
+export const OTP_LENGTH = 6;
+/** 5 minutes. Long enough to read a message, short enough to matter. */
+export const OTP_TTL_MS = 5 * 60 * 1000;
+/** Wrong guesses allowed before the challenge is invalidated outright. */
+export const OTP_MAX_ATTEMPTS = 5;
+/** How long the UI disables "Resend" after a code is sent. */
+export const OTP_RESEND_COOLDOWN_SECONDS = 30;
+
+/**
+ * A submitted one-time code.
+ *
+ * Exactly six digits, with spaces and dashes stripped first so a pasted
+ * `123 456` is accepted. The length check is on the cleaned value, so padding
+ * cannot be used to smuggle a longer string through.
+ */
+export const otpSchema = z
+  .string()
+  .trim()
+  .transform((value) => value.replace(/[\s-]/g, ''))
+  .pipe(
+    z
+      .string()
+      .regex(new RegExp(`^\\d{${OTP_LENGTH}}$`), `Enter the ${OTP_LENGTH}-digit code`),
+  );
+
+/** Body of `POST /devices/unlock/confirm`. */
+export const confirmUnlockSchema = z
+  .object({
+    otp: otpSchema,
+  })
+  .strict();
+
+export type ConfirmUnlockInput = z.infer<typeof confirmUnlockSchema>;
+
 // --- Admin list queries ------------------------------------------------------
 
 const pageSchema = z.coerce.number().int().min(1).default(1);
