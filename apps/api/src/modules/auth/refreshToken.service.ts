@@ -129,7 +129,10 @@ export type RedeemResult =
       familyId: string;
     }
   | { outcome: 'reuse'; userId: string; familyId: string }
-  | { outcome: 'invalid'; reason: 'unknown' | 'expired' | 'user-missing' };
+  | {
+      outcome: 'invalid';
+      reason: 'unknown' | 'expired' | 'user-missing' | 'password-changed';
+    };
 
 /**
  * Redeems a presented refresh token.
@@ -158,6 +161,9 @@ export async function redeemRefreshToken(
       // Required: the grace window only applies to rotation-revoked tokens,
       // which are exactly the ones with a successor recorded here.
       replacedById: true,
+      // Required: distinguishes a token we revoked on purpose from one that
+      // might have been stolen. See the replay path below.
+      revokedReason: true,
     },
   });
 
@@ -177,6 +183,31 @@ export async function redeemRefreshToken(
 
   // --- Replay of an already-revoked token ---------------------------------
   if (existing.revokedAt) {
+    /**
+     * A token revoked by a password change or reset is **not** a theft
+     * signal, and must not trigger the cascade.
+     *
+     * Those revocations already ended every session for the user on purpose,
+     * and then handed the caller a brand-new one. The old tokens are still
+     * sitting in other devices' cookie jars — a phone in a pocket, a
+     * background tab polling notifications every 60 seconds — and each of
+     * them will present a revoked token within moments. Reading that as theft
+     * runs `revokeAllForUser`, which kills the successor too: the user
+     * changes their password and is silently signed out of the very device
+     * they changed it on, seconds later. (Observed exactly that way before
+     * this check existed.)
+     *
+     * There is also nothing left to protect. The cascade exists for "we
+     * cannot know which sessions are compromised"; here we revoked them all
+     * deliberately a moment ago, so it can only do collateral damage. The
+     * honest answer is a plain "your session ended, sign in again".
+     */
+    const deliberate =
+      existing.revokedReason === 'PASSWORD_CHANGE' ||
+      existing.revokedReason === 'PASSWORD_RESET';
+
+    if (deliberate) return { outcome: 'invalid', reason: 'password-changed' };
+
     const elapsed = now.getTime() - existing.revokedAt.getTime();
 
     /**
@@ -248,7 +279,7 @@ export async function redeemRefreshToken(
 
       const revoked = await tx.refreshToken.updateMany({
         where: { id: existing.id, revokedAt: null },
-        data: { revokedAt: now, replacedById: successor.id },
+        data: { revokedAt: now, replacedById: successor.id, revokedReason: 'ROTATED' },
       });
 
       if (revoked.count !== 1) throw new Error(LOST_RACE);
@@ -283,7 +314,7 @@ export async function redeemRefreshToken(
 export async function revokeFamily(familyId: string): Promise<number> {
   const result = await prisma.refreshToken.updateMany({
     where: { familyId, revokedAt: null },
-    data: { revokedAt: new Date() },
+    data: { revokedAt: new Date(), revokedReason: 'REUSE_CASCADE' },
   });
   return result.count;
 }
@@ -291,14 +322,25 @@ export async function revokeFamily(familyId: string): Promise<number> {
 /**
  * Revokes every live refresh token for a user, across all families.
  *
- * Used on reuse detection: if one token leaked we cannot know which other
- * sessions are also compromised, so every session is ended and the user signs
- * in again.
+ * Three callers, and the `reason` is what separates them:
+ * - **reuse detection** (`REUSE_CASCADE`): one token leaked and we cannot know
+ *   which other sessions are compromised, so all of them end.
+ * - **password change / reset** (`PASSWORD_CHANGE` / `PASSWORD_RESET`): a
+ *   deliberate eviction. Replaying one of these tokens afterwards is ordinary
+ *   — other devices still hold them — and is **not** treated as theft. See
+ *   the replay path in {@link redeemRefreshToken}.
+ *
+ * Optionally runs on a transaction client, so a password change can revoke and
+ * reissue atomically.
  */
-export async function revokeAllForUser(userId: string): Promise<number> {
-  const result = await prisma.refreshToken.updateMany({
+export async function revokeAllForUser(
+  userId: string,
+  reason: 'REUSE_CASCADE' | 'PASSWORD_CHANGE' | 'PASSWORD_RESET' = 'REUSE_CASCADE',
+  client: PrismaTransaction | typeof prisma = prisma,
+): Promise<number> {
+  const result = await client.refreshToken.updateMany({
     where: { userId, revokedAt: null },
-    data: { revokedAt: new Date() },
+    data: { revokedAt: new Date(), revokedReason: reason },
   });
   return result.count;
 }
@@ -307,7 +349,7 @@ export async function revokeAllForUser(userId: string): Promise<number> {
 export async function revokeByRawToken(rawToken: string): Promise<boolean> {
   const result = await prisma.refreshToken.updateMany({
     where: { tokenHash: hashRefreshToken(rawToken), revokedAt: null },
-    data: { revokedAt: new Date() },
+    data: { revokedAt: new Date(), revokedReason: 'LOGOUT' },
   });
   return result.count > 0;
 }

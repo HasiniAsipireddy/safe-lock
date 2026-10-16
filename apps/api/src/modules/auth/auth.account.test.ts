@@ -23,11 +23,12 @@ const LOGIN_URL = '/api/v1/auth/login';
 const OLD_PASSWORD = 'OldPassword123';
 const NEW_PASSWORD = 'BrandNewPass456';
 
-function postChange(cookie: string, body: unknown) {
+/** Bodies are typed loosely so a test can send fields the schema must reject. */
+function postChange(cookie: string, body: Record<string, unknown>) {
   return request(app()).post(CHANGE_URL).set('Origin', TEST_ORIGIN).set('Cookie', cookie).send(body);
 }
 
-function patchProfileRequest(cookie: string, body: unknown) {
+function patchProfileRequest(cookie: string, body: Record<string, unknown>) {
   return request(app())
     .patch(PROFILE_URL)
     .set('Origin', TEST_ORIGIN)
@@ -175,6 +176,66 @@ describe('POST /auth/password/change', () => {
         .send();
       expect(refresh.status).toBe(401);
     }
+  });
+
+  /**
+   * The regression this column exists for.
+   *
+   * Found by walking the flow against a running server: another device's
+   * perfectly ordinary refresh attempt was read as token theft, which fired
+   * the reuse cascade and revoked the successor too — so changing your
+   * password signed you out of the device you changed it on, seconds later,
+   * as soon as a background tab polled. The cascade has nothing to protect
+   * here: every token was already revoked deliberately.
+   */
+  it('a stale session refreshing afterwards does not sign the caller out', async () => {
+    const user = await createTestUserWithPassword(OLD_PASSWORD);
+    const otherDevice = await seedRefreshToken({ userId: user.id });
+
+    const changed = await postChange(user.cookie, {
+      currentPassword: OLD_PASSWORD,
+      password: NEW_PASSWORD,
+    });
+    const mine = cookieValue(changed, REFRESH_COOKIE)!;
+
+    // The other device presents its now-revoked token, as it will within
+    // seconds of the change. It must be refused...
+    const stale = await request(app())
+      .post(REFRESH_URL)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', refreshCookie(otherDevice.rawToken))
+      .send();
+    expect(stale.status).toBe(401);
+    // ...as an ended session, NOT as detected theft.
+    expect(stale.body.error.code).toBe('REFRESH_TOKEN_INVALID');
+    expect(stale.body.error.code).not.toBe('REFRESH_REUSE_DETECTED');
+
+    // And the caller's own session survives it.
+    const refreshed = await request(app())
+      .post(REFRESH_URL)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', refreshCookie(mine))
+      .send();
+    expect(refreshed.status).toBe(200);
+
+    // No cascade was audited.
+    const cascade = await prisma.auditLog.findFirst({
+      where: { userId: user.id, action: 'auth.refresh.reuse_detected' },
+    });
+    expect(cascade).toBeNull();
+  });
+
+  it('records why each token was revoked', async () => {
+    const user = await createTestUserWithPassword(OLD_PASSWORD);
+    const otherDevice = await seedRefreshToken({ userId: user.id });
+
+    await postChange(user.cookie, {
+      currentPassword: OLD_PASSWORD,
+      password: NEW_PASSWORD,
+    });
+
+    const revoked = await prisma.refreshToken.findUnique({ where: { id: otherDevice.id } });
+    expect(revoked?.revokedReason).toBe('PASSWORD_CHANGE');
   });
 
   it('leaves another user’s sessions alone', async () => {

@@ -211,7 +211,10 @@ export async function completePasswordReset(input: {
   // Outside the transaction on purpose: the password is already changed, and a
   // failure to revoke must not roll that back. It is logged by the caller's
   // error path instead, and the sessions are 15-minute access tokens at worst.
-  await revokeAllForUser(row.userId);
+  //
+  // PASSWORD_RESET rather than the reuse cascade: a device still holding one
+  // of these will present it shortly, and that is ordinary rather than theft.
+  await revokeAllForUser(row.userId, 'PASSWORD_RESET');
 
   return { userId: row.userId };
 }

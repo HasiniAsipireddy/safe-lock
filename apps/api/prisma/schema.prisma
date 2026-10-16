@@ -68,6 +68,29 @@ enum UnlockFailureReason {
   NO_CHALLENGE
 }
 
+/// Why a refresh token was revoked.
+///
+/// This exists for one decision: whether replaying the token should be treated
+/// as **theft**. The reuse cascade is the right answer when we cannot know
+/// which other sessions are compromised — but after a password change or reset
+/// every token was already revoked deliberately, so cascading protects nothing
+/// and its only effect is to log the user out of the device they just used.
+/// See docs/decisions.md.
+///
+/// Null on rows revoked before this column existed; those keep the old
+/// behaviour (treated as theft), which is the safe direction to be wrong in.
+enum RefreshTokenRevokedReason {
+  /// Redeemed normally and replaced by a successor. The grace window applies.
+  ROTATED
+  LOGOUT
+  /// The user changed their own password, knowing the current one.
+  PASSWORD_CHANGE
+  /// A password reset link was redeemed.
+  PASSWORD_RESET
+  /// Collateral of a reuse detection, or of a family revocation.
+  REUSE_CASCADE
+}
+
 /// What an in-app notification is about.
 ///
 /// Deliberately not DeviceEventType: most device events notify nobody, and a
@@ -263,6 +286,10 @@ model RefreshToken {
 
   expiresAt DateTime
   revokedAt DateTime?
+  /// Why it was revoked — specifically, whether a replay is theft. See the
+  /// enum. Null for a live token, and for rows revoked before the column
+  /// existed.
+  revokedReason RefreshTokenRevokedReason?
   /// The token issued when this one was redeemed.
   replacedById String?
   /// Set when this already-revoked token was replayed inside the grace window

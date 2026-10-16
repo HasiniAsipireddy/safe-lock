@@ -1236,3 +1236,46 @@ trade ever looks wrong.
 button that promises immediate eviction and delivers it in up to 15 minutes is
 a different thing from an invisible implementation detail, and that promise
 would justify option 1.
+
+---
+
+## 2026-10-16 — A deliberate revocation is not a theft signal
+
+**The bug, found by walking the flow against a running server rather than by a
+test:** `POST /auth/password/change` revokes every refresh token and issues the
+caller a new one. Moments later another device — a phone in a pocket, a
+background tab polling `/notifications` every 60 seconds — presents its
+now-revoked token to `/auth/refresh`. Reuse detection saw a revoked token with
+no `replacedById`, correctly concluded "this was not a rotation", and ran
+`revokeAllForUser`. That cascade revoked the **successor** too. Net effect:
+you changed your password and were silently signed out of the device you
+changed it on, seconds afterwards, with `REFRESH_REUSE_DETECTED` in the audit
+log claiming theft that never happened.
+
+**Decision:** `RefreshToken.revokedReason` records *why* a token was revoked
+(`ROTATED`, `LOGOUT`, `PASSWORD_CHANGE`, `PASSWORD_RESET`, `REUSE_CASCADE`).
+Replaying a token revoked by `PASSWORD_CHANGE` or `PASSWORD_RESET` returns a
+plain 401 `REFRESH_TOKEN_INVALID` and **does not cascade**. Every other
+reason behaves exactly as before.
+
+**Why this is not a weakening of reuse detection:** the cascade answers "one
+token leaked and we cannot know which other sessions are compromised". After a
+password change that question is already settled — every session was revoked
+deliberately a moment ago, and the only token the cascade can still reach is
+the legitimate successor. It has nothing left to protect and one thing left to
+break. The attacker's stolen token is dead either way; the difference is purely
+whether the owner's new session dies with it.
+
+**It also fixes what the user is told.** "Your session was ended for security
+reasons" is the wrong message for someone who just reset their own password,
+and a false theft signal in the audit log is worse than no signal: it would
+have fired on *every* password change, which is exactly how a real one gets
+ignored.
+
+**Consequence:** `revokedReason` is null for rows revoked before the column
+existed, and null falls through to the old behaviour — treated as theft, which
+is the safe direction to be wrong in. Two tests pin the regression (one for
+change, one for reset): the stale device is refused as an ended session, the
+caller's own refresh still succeeds, and no `reuse_detected` row is written.
+The existing reuse-detection tests are unchanged and still pass, so genuine
+replay still kills the family.

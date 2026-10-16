@@ -26,7 +26,8 @@ function postForgot(email: unknown, instance = app()) {
   return request(instance).post(FORGOT_URL).set('Origin', TEST_ORIGIN).send({ email });
 }
 
-function postReset(body: unknown, instance = app()) {
+/** Loosely typed so a test can send fields and shapes the schema must reject. */
+function postReset(body: Record<string, unknown>, instance = app()) {
   return request(instance).post(RESET_URL).set('Origin', TEST_ORIGIN).send(body);
 }
 
@@ -243,6 +244,39 @@ describe('POST /auth/password/reset', () => {
         .send();
       expect(refresh.status).toBe(401);
     }
+  });
+
+  /**
+   * Same reasoning as the change-password case: a device still holding a
+   * token revoked by the reset will present it shortly, and that is ordinary.
+   * Reading it as theft would audit a false theft signal on every reset — and
+   * "your session was ended for security reasons" is the wrong thing to tell
+   * someone who just reset their own password.
+   */
+  it('treats a revoked token presented afterwards as an ended session, not theft', async () => {
+    const user = await createTestUserWithPassword(OLD_PASSWORD);
+    const otherDevice = await seedRefreshToken({ userId: user.id });
+
+    const token = await requestTokenFor(user.email);
+    await postReset({ token, password: NEW_PASSWORD });
+
+    const stale = await request(app())
+      .post('/api/v1/auth/refresh')
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', refreshCookie(otherDevice.rawToken))
+      .send();
+
+    expect(stale.status).toBe(401);
+    expect(stale.body.error.code).toBe('REFRESH_TOKEN_INVALID');
+    expect(stale.body.error.code).not.toBe('REFRESH_REUSE_DETECTED');
+
+    const row = await prisma.refreshToken.findUnique({ where: { id: otherDevice.id } });
+    expect(row?.revokedReason).toBe('PASSWORD_RESET');
+
+    const cascade = await prisma.auditLog.findFirst({
+      where: { userId: user.id, action: 'auth.refresh.reuse_detected' },
+    });
+    expect(cascade).toBeNull();
   });
 
   it('rejects a password that fails the policy, without consuming the token', async () => {

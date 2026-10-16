@@ -8,7 +8,12 @@ import { prisma } from '../../lib/prisma';
 import { HttpError, conflict, unauthenticated } from '../../lib/httpError';
 import { hashPassword, verifyPassword } from './password';
 import { toPublicUser, userHasDevice, userHasPaid } from '../users/user.mapper';
-import { issueRefreshToken, type IssueContext, type IssuedToken } from './refreshToken.service';
+import {
+  issueRefreshToken,
+  revokeAllForUser,
+  type IssueContext,
+  type IssuedToken,
+} from './refreshToken.service';
 
 const SELECT = {
   id: true,
@@ -157,10 +162,10 @@ export async function changePassword(input: {
       select: { id: true },
     });
 
-    await tx.refreshToken.updateMany({
-      where: { userId: user.id, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
+    // PASSWORD_CHANGE, not the reuse cascade: other devices still hold these
+    // tokens and will present them within moments. That is ordinary, not
+    // theft, and must not take the successor below down with it.
+    await revokeAllForUser(user.id, 'PASSWORD_CHANGE', tx);
 
     // A new family, not a rotation: the old chain is gone, and this login is
     // a new one as far as reuse detection is concerned.
