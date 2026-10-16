@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { OTP_LENGTH } from '@safelock/shared';
 import { env } from '../../config/env';
 import { logger } from '../../lib/logger';
+import { loadRecipient, sendWhatsApp, type SendOutcome } from '../../lib/whatsapp/send';
 
 /**
  * Unlock OTP generation, hashing and (for now) delivery.
@@ -13,10 +14,11 @@ import { logger } from '../../lib/logger';
  *    an unkeyed hash of one is trivially reversible by brute force; the
  *    secret, held outside the database, is what makes the stored digest
  *    useless to someone holding a database dump.
- * 3. The plaintext code leaves this module exactly twice: to the notifier,
- *    and (outside production) to the console. It is never returned by an
- *    endpoint, never written to an audit row, and never written to a
- *    DeviceEvent.
+ * 3. The plaintext code leaves this module exactly twice: to the WhatsApp
+ *    client as a template parameter, and (outside production) to the console.
+ *    It is never returned by an endpoint, never written to an audit row, never
+ *    written to a DeviceEvent, and never queued — the outbox stores no
+ *    template parameters precisely so a code cannot reach a table.
  */
 
 /**
@@ -67,37 +69,62 @@ export function mayPrintOtp(nodeEnv: string): boolean {
 }
 
 /**
- * Delivers a code to the user.
+ * Delivers an unlock code over WhatsApp.
  *
- * Today that means a console line in development. WhatsApp/SMS delivery is a
- * later step; when it lands it replaces the body of this function and nothing
- * else — callers already treat delivery as fire-and-forget side effect that
- * must not leak the code back into their own return values.
+ * ## Sent inline, not through the outbox
+ * The user is standing in front of the dashboard waiting for it. A queued
+ * message that arrives after a retry backoff is a code that has already
+ * expired, and the outbox structurally cannot carry one anyway: it stores no
+ * template parameters, because a code must never be written to a table.
+ * See `lib/outbox/params.ts`.
+ *
+ * ## The outcome matters to the caller
+ * Unlike the notifier, this returns its outcome rather than swallowing it.
+ * A code nobody received is worse than an error: the user would sit waiting
+ * for a message that is never coming, and a challenge would be left open for
+ * five minutes with a code only an attacker could have. `requestUnlock`
+ * invalidates the challenge and answers `OTP_DELIVERY_FAILED`.
+ *
+ * The dev console print survives, still behind {@link mayPrintOtp}, because
+ * local development has no WhatsApp number to message.
  */
-export function deliverOtp(params: {
+export async function deliverOtp(params: {
+  userId: string;
   code: string;
   serialNumber: string;
   expiresAt: Date;
-}): void {
-  if (!mayPrintOtp(env.NODE_ENV)) {
-    // TODO(whatsapp): send via the notification provider. Until then a
-    // production deployment delivers nothing, which is the correct failure
-    // mode — better than printing a working unlock code into a log
-    // aggregator that half the company can read.
-    logger.warn(
-      { serialNumber: params.serialNumber },
-      'No OTP delivery channel is configured; the code was generated but not sent',
+}): Promise<SendOutcome> {
+  if (mayPrintOtp(env.NODE_ENV)) {
+    // Deliberately `console.log`, not the logger: pino output is shipped to
+    // log storage, and a code that reaches log storage has outlived its 5
+    // minutes. This line is for a developer watching their own terminal, and
+    // the `mayPrintOtp` guard is what keeps it out of production.
+    // eslint-disable-next-line no-console -- see above; the only console call in the API
+    console.log(
+      `\n  [dev] Unlock code for ${params.serialNumber}: ${params.code}` +
+        `  (expires ${params.expiresAt.toISOString()})\n`,
     );
-    return;
   }
 
-  // Deliberately `console.log`, not the logger: pino output is shipped to log
-  // storage, and a code that reaches log storage has outlived its 5 minutes.
-  // This line is for a developer watching their own terminal, and the
-  // `mayPrintOtp` guard above is what keeps it out of production.
-  // eslint-disable-next-line no-console -- see above; the only console call in the API
-  console.log(
-    `\n  [dev] Unlock code for ${params.serialNumber}: ${params.code}` +
-      `  (expires ${params.expiresAt.toISOString()})\n`,
-  );
+  const recipient = await loadRecipient(params.userId);
+  if (!recipient) {
+    logger.error({ userId: params.userId }, 'No recipient for an unlock code');
+    return { status: 'SKIPPED', reason: 'NO_VERIFIED_PHONE' };
+  }
+
+  /**
+   * The unlock code ignores the daily cap on purpose.
+   *
+   * Everything else a cap protects — cost, spam — is bounded here by the
+   * unlock rate limiter (3 codes per 10 minutes per user) and by the fact
+   * that only a paid owner with a verified number can reach this at all.
+   * Letting a cap lock someone out of their own safe would be the cap doing
+   * more harm than the abuse it exists to prevent.
+   */
+  return sendWhatsApp({
+    recipient,
+    kind: 'UNLOCK_OTP',
+    params: [params.code, params.serialNumber],
+    ignoreCap: true,
+  });
 }

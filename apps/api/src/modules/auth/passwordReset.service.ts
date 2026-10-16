@@ -1,9 +1,9 @@
 import crypto from 'node:crypto';
 import { ERROR_CODES, PASSWORD_RESET_TTL_MS, RESET_TOKEN_BYTES } from '@safelock/shared';
-import { env } from '../../config/env';
 import { HttpError } from '../../lib/httpError';
 import { logger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
+import { resetSender } from '../../lib/resetSender';
 import { hashPassword } from './password';
 import { revokeAllForUser } from './refreshToken.service';
 
@@ -58,36 +58,44 @@ export function mayPrintResetToken(nodeEnv: string): boolean {
 }
 
 /**
- * Delivers a reset link to the user.
+ * Delivers a reset to the user, through the {@link resetSender} seam.
  *
- * Today that means a console line outside production. Email/WhatsApp delivery
- * is the same open question as OTP delivery (see CLAUDE.md) and replaces the
- * body of this function and nothing else.
+ * The outcome is **logged and discarded**. `/auth/password/forgot` must answer
+ * byte-identically for every input — a registered address, an unregistered
+ * one, a user with no verified phone, a user whose daily send cap is spent —
+ * because any observable difference turns the endpoint into an
+ * account-enumeration oracle. The send cap in particular would otherwise leak
+ * "this address has an account that has been messaged a lot today".
  *
- * **In production this currently sends nothing** and logs a warning. That is
- * the correct failure mode — better than printing a credential that can take
- * over an account into a log aggregator.
+ * So: nothing here throws, and nothing here changes what the caller returns.
  */
-export function deliverPasswordReset(params: { token: string; expiresAt: Date }): void {
-  if (!mayPrintResetToken(env.NODE_ENV)) {
-    // TODO(reset-delivery): send through the notification provider. Until then
-    // password reset does not work in production.
-    logger.warn(
-      {},
-      'No password-reset delivery channel is configured; a token was generated but not sent',
-    );
-    return;
-  }
+export async function deliverPasswordReset(params: {
+  userId: string;
+  token: string;
+  expiresAt: Date;
+}): Promise<void> {
+  try {
+    const outcome = await resetSender.send({
+      userId: params.userId,
+      token: params.token,
+      expiresAt: params.expiresAt,
+    });
 
-  // Deliberately `console.log`, not the logger: pino output is shipped to log
-  // storage, and a token that reaches log storage has outlived its 30 minutes.
-  // This line is for a developer watching their own terminal, and
-  // `mayPrintResetToken` is what keeps it out of production.
-  // eslint-disable-next-line no-console -- see above
-  console.log(
-    `\n  [dev] Password reset token: ${params.token}` +
-      `  (expires ${params.expiresAt.toISOString()})\n`,
-  );
+    if (outcome.status !== 'SENT') {
+      // Diagnostic only. The user is told nothing either way.
+      logger.info(
+        { sender: resetSender.name, status: outcome.status, reason: outcome.reason },
+        'Password reset was not delivered',
+      );
+    }
+  } catch (cause) {
+    // A sender is contractually not supposed to throw. If one does, it must
+    // not change the response shape — that is the whole property.
+    logger.error(
+      { reason: cause instanceof Error ? cause.message : 'unknown' },
+      'Password reset sender threw',
+    );
+  }
 }
 
 export interface ResetRequestOutcome {
@@ -144,7 +152,7 @@ export async function requestPasswordReset(input: {
     });
   });
 
-  deliverPasswordReset({ token: rawToken, expiresAt });
+  await deliverPasswordReset({ userId: user.id, token: rawToken, expiresAt });
 
   return { userId: user.id };
 }

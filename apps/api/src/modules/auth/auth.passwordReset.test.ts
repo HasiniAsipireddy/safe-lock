@@ -1,7 +1,9 @@
 import crypto from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import request from 'supertest';
+import { env } from '../../config/env';
 import { prisma } from '../../lib/prisma';
+import { fakeWhatsAppClient } from '../../lib/whatsapp';
 import {
   TEST_ORIGIN,
   app,
@@ -9,6 +11,7 @@ import {
   createTestUserWithPassword,
   refreshCookie,
   seedRefreshToken,
+  verifyUserPhone,
   withCapturedResetToken,
 } from '../../test/helpers';
 import { ACCESS_COOKIE, REFRESH_COOKIE } from './tokens';
@@ -21,6 +24,8 @@ const LOGIN_URL = '/api/v1/auth/login';
 
 const OLD_PASSWORD = 'OldPassword123';
 const NEW_PASSWORD = 'BrandNewPass456';
+
+const fake = fakeWhatsAppClient()!;
 
 function postForgot(email: unknown, instance = app()) {
   return request(instance).post(FORGOT_URL).set('Origin', TEST_ORIGIN).send({ email });
@@ -112,6 +117,81 @@ describe('POST /auth/password/forgot', () => {
     // Neither row may carry the address that was submitted.
     expect(JSON.stringify(known?.metadata)).not.toContain(user.email);
     expect(JSON.stringify(unknown?.metadata)).not.toContain('nobody.at.all@example.com');
+  });
+
+  /**
+   * The cap must not become the oracle the identical response was built to
+   * deny. "This address has an account that has been messaged a lot today" is
+   * exactly the disclosure `/forgot` exists to withhold.
+   */
+  it('answers identically when the user’s daily WhatsApp cap is spent', async () => {
+    const user = await createTestUserWithPassword(OLD_PASSWORD);
+    await verifyUserPhone(user.id);
+    fake.reset();
+
+    // Spend the whole allowance.
+    for (let index = 0; index < env.WHATSAPP_DAILY_SEND_CAP; index += 1) {
+      await prisma.outboundMessage.create({
+        data: { userId: user.id, kind: 'UNLOCK_ALERT', status: 'SENT', sentAt: new Date() },
+      });
+    }
+
+    const capped = await postForgot(user.email);
+    const unknown = await postForgot('definitely.nobody@example.com');
+
+    expect(capped.status).toBe(200);
+    expect(JSON.stringify(capped.body)).toBe(JSON.stringify(unknown.body));
+    expect(capped.body).toEqual({ status: 'ok' });
+    // Nothing was sent, and the token still exists so the link in hand works.
+    expect(fake.sent()).toHaveLength(0);
+    expect(await prisma.passwordResetToken.count({ where: { userId: user.id } })).toBe(1);
+  });
+
+  it('answers identically for a user with no verified phone', async () => {
+    const unverified = await createTestUserWithPassword(OLD_PASSWORD);
+    const verified = await createTestUserWithPassword(OLD_PASSWORD);
+    await verifyUserPhone(verified.id);
+    fake.reset();
+
+    const a = await postForgot(unverified.email);
+    const b = await postForgot(verified.email);
+    const c = await postForgot('definitely.nobody@example.com');
+
+    for (const response of [a, b, c]) {
+      expect(response.status).toBe(200);
+      expect(JSON.stringify(response.body)).toBe(JSON.stringify({ status: 'ok' }));
+    }
+
+    // Only the verified user was actually messaged — invisibly to the caller.
+    expect(fake.sentWithTemplate(env.WHATSAPP_TEMPLATE_PASSWORD_RESET)).toHaveLength(1);
+  });
+
+  it('sends the reset alert without the token in it', async () => {
+    const user = await createTestUserWithPassword(OLD_PASSWORD);
+    await verifyUserPhone(user.id);
+    fake.reset();
+
+    const token = await requestTokenFor(user.email);
+
+    const sent = fake.sentWithTemplate(env.WHATSAPP_TEMPLATE_PASSWORD_RESET);
+    expect(sent).toHaveLength(1);
+    // A chat message is persistent and forwardable; a reset token is an
+    // account takeover in one string. See docs/decisions.md.
+    expect(JSON.stringify(sent[0]!.params)).not.toContain(token);
+    expect(sent[0]!.params).toEqual([]);
+  });
+
+  it('still answers 200 when the WhatsApp send itself fails', async () => {
+    const user = await createTestUserWithPassword(OLD_PASSWORD);
+    await verifyUserPhone(user.id);
+    fake.reset();
+    fake.failAlways('TRANSPORT');
+
+    const response = await postForgot(user.email);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ status: 'ok' });
+    fake.recover();
   });
 
   it('rejects a malformed address before looking anything up', async () => {

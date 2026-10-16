@@ -76,16 +76,40 @@ describe('enqueue', () => {
     expect(fake.sent()).toHaveLength(0);
   });
 
-  it('stores no template parameters, so no code can reach the table', async () => {
+  /**
+   * The structural guarantee that no one-time code can reach this table:
+   * there is nowhere to put one. Asserted as an exact column allow-list so
+   * adding a `params` or `body` column later fails here and has to be a
+   * deliberate decision rather than a quiet one.
+   *
+   * (Deliberately not a `/\d{6}/` scan over the serialised row — a random cuid
+   * can contain six consecutive digits, which would make this flaky and prove
+   * nothing.)
+   */
+  it('has no column that could hold a template parameter', async () => {
     const user = await messageableUser();
     const id = await queue(user.id);
 
     const row = await prisma.outboundMessage.findUniqueOrThrow({ where: { id } });
-    // There is no column for them, which is the point — assert on the shape
-    // so adding one later has to be a deliberate decision.
-    expect(Object.keys(row)).not.toContain('params');
-    expect(Object.keys(row)).not.toContain('body');
-    expect(JSON.stringify(row)).not.toMatch(/\d{6}/);
+
+    expect(Object.keys(row).sort()).toEqual(
+      [
+        'attempts',
+        'createdAt',
+        'deliveryStatus',
+        'deliveryUpdatedAt',
+        'deviceEventId',
+        'failureCategory',
+        'id',
+        'kind',
+        'nextAttemptAt',
+        'providerMessageId',
+        'sentAt',
+        'status',
+        'updatedAt',
+        'userId',
+      ].sort(),
+    );
   });
 });
 

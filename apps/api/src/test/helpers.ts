@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { vi } from 'vitest';
 import type { Express } from 'express';
+import { WHATSAPP_CONSENT_VERSION } from '@safelock/shared';
 import { createApp, type CreateAppOptions } from '../app';
 import { env } from '../config/env';
 import { prisma } from '../lib/prisma';
@@ -198,17 +199,44 @@ export async function seedDevices(count: number): Promise<Array<{ id: string; se
 }
 
 /**
- * A paid user holding an allocated, locked safe — the state every lock/unlock
- * test starts from. Goes through the real `allocateDevice`, so the lock-state
- * transition it performs is exercised rather than bypassed.
+ * Marks a user's phone verified and records WhatsApp consent.
+ *
+ * Required before any message can be sent to them — including an unlock code —
+ * so most lock/unlock tests need it. Separate from {@link createTestUser} so a
+ * test can deliberately construct the *unverified* state and assert it is
+ * refused.
  */
-export async function createUserWithDevice(): Promise<{
+export async function verifyUserPhone(userId: string): Promise<void> {
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      phoneVerifiedAt: new Date(),
+      whatsappConsentAt: new Date(),
+      whatsappConsentVersion: WHATSAPP_CONSENT_VERSION,
+    },
+  });
+}
+
+/**
+ * A paid user with a verified phone, holding an allocated, locked safe — the
+ * state every lock/unlock test starts from. Goes through the real
+ * `allocateDevice`, so the lock-state transition it performs is exercised
+ * rather than bypassed.
+ *
+ * The phone is verified here because unlocking requires it: the one-time code
+ * has to have somewhere to go. Pass `{ phoneVerified: false }` to build the
+ * state that must be refused.
+ */
+export async function createUserWithDevice(
+  options: { phoneVerified?: boolean } = {},
+): Promise<{
   user: TestUser;
   deviceId: string;
   serialNumber: string;
 }> {
   const user = await createTestUser();
   await givePaidPayment(user.id);
+  if (options.phoneVerified !== false) await verifyUserPhone(user.id);
   const device = await seedDevice();
   await allocateDevice(user.id, device.id);
 

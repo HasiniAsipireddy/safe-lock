@@ -349,6 +349,18 @@ export function createLimiters(
       stores.deviceLock,
     ),
 
+    /**
+     * Both unlock-request limbs **refund a 5xx**.
+     *
+     * A WhatsApp outage answers 502 `OTP_DELIVERY_FAILED`. Charging that
+     * against the user's three-codes-per-ten-minutes allowance would mean our
+     * upstream failure locking them out of their own safe — three failed
+     * sends and they are done for ten minutes, having received nothing.
+     *
+     * Scoped to 5xx deliberately, via `requestWasSuccessful`: every 4xx still
+     * counts, so a caller cycling request/confirm with wrong codes is still
+     * bounded exactly as before. There is a test for both halves.
+     */
     unlockRequest: build(
       config.unlockRequest,
       'Too many unlock codes requested. Please wait a few minutes and try again.',
@@ -357,6 +369,8 @@ export function createLimiters(
           if (req.user?.id) return `u:${req.user.id}`;
           return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
         },
+        skipFailedRequests: true,
+        requestWasSuccessful: (_req, res) => res.statusCode < 500,
       },
       stores.unlockRequest,
     ),
@@ -364,7 +378,11 @@ export function createLimiters(
     unlockRequestIp: build(
       config.unlockRequestIp,
       'Too many unlock codes requested. Please wait a few minutes and try again.',
-      { keyGenerator: (req) => (req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown') },
+      {
+        keyGenerator: (req) => (req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown'),
+        skipFailedRequests: true,
+        requestWasSuccessful: (_req, res) => res.statusCode < 500,
+      },
       stores.unlockRequestIp,
     ),
 

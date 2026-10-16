@@ -83,14 +83,18 @@ describe('mayPrintOtp — the production guard', () => {
 });
 
 describe('deliverOtp', () => {
-  it('prints the code under the test environment', () => {
+  it('prints the code under the test environment', async () => {
     // The suite runs with NODE_ENV=test, so the dev branch is the live one
     // here. This asserts the branch works at all — `mayPrintOtp` above is
     // what pins it shut in production.
     const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
     try {
-      deliverOtp({
+      // No such user, so delivery itself is skipped — this test is only about
+      // the console branch. The WhatsApp path is covered against the fake
+      // client in deviceControl.routes.test.ts.
+      await deliverOtp({
+        userId: 'usr_does_not_exist',
         code: '987654',
         serialNumber: 'SAFE-0001',
         expiresAt: new Date('2026-10-16T12:00:00.000Z'),

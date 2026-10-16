@@ -11,6 +11,7 @@ import {
 } from '@safelock/shared';
 import { prisma, type PrismaTransaction } from '../../lib/prisma';
 import { HttpError, conflict } from '../../lib/httpError';
+import type { SendOutcome } from '../../lib/whatsapp/send';
 import { deviceGateway } from '../../lib/deviceGateway';
 import { logger } from '../../lib/logger';
 import { notifier } from '../../lib/notifier';
@@ -80,6 +81,55 @@ const commandFailed = () =>
     code: ERROR_CODES.DEVICE_COMMAND_FAILED,
     message: 'Your safe did not respond. Please try again in a moment.',
   });
+
+/**
+ * A code was generated but could not be delivered.
+ *
+ * **502, not 500**: the failure is in an upstream service, and the status is
+ * what tells the rate limiter to refund this attempt (see
+ * `requestWasSuccessful` on the unlock limiters) so a WhatsApp outage does not
+ * also burn the user's three-codes-per-ten-minutes allowance. A wrong code is
+ * a 4xx and still counts.
+ *
+ * A spent send cap is the one case that is the *user's* situation rather than
+ * ours, so it keeps its own code and a 429 — the one place in the OTP flow
+ * where "back off and retry later" is literally the right advice.
+ */
+function deliveryFailed(outcome: SendOutcome): HttpError {
+  if (outcome.status === 'SKIPPED' && outcome.reason === 'CAP_REACHED') {
+    return new HttpError({
+      status: 429,
+      code: ERROR_CODES.WHATSAPP_SEND_CAP_REACHED,
+      message:
+        'You have reached today’s limit for WhatsApp messages. Please try again later, or contact support if you are locked out.',
+    });
+  }
+
+  if (outcome.status === 'SKIPPED' && outcome.reason === 'NO_VERIFIED_PHONE') {
+    // Should be unreachable: assertCanOperate checks this first. Kept so the
+    // answer is still accurate if that order ever changes.
+    return new HttpError({
+      status: 403,
+      code: ERROR_CODES.PHONE_NOT_VERIFIED,
+      message: 'Verify your phone number before unlocking your safe.',
+    });
+  }
+
+  if (outcome.status === 'SKIPPED' && outcome.reason === 'NO_CONSENT') {
+    return new HttpError({
+      status: 403,
+      code: ERROR_CODES.CONSENT_REQUIRED,
+      message:
+        'We need your permission to send WhatsApp messages before we can send an unlock code.',
+    });
+  }
+
+  return new HttpError({
+    status: 502,
+    code: ERROR_CODES.OTP_DELIVERY_FAILED,
+    message: 'We could not send your unlock code. Please try again in a moment.',
+  });
+}
 
 // --- Eligibility -------------------------------------------------------------
 
@@ -297,19 +347,20 @@ export async function requestUnlock(
   const code = generateOtp();
   const expiresAt = new Date(Date.now() + OTP_TTL_MS);
 
-  await prisma.$transaction(async (tx) => {
+  const challengeId = await prisma.$transaction(async (tx) => {
     await tx.unlockChallenge.updateMany({
       where: { userId: input.userId, deviceId: target.deviceId, consumedAt: null },
       data: { consumedAt: new Date() },
     });
 
-    await tx.unlockChallenge.create({
+    const challenge = await tx.unlockChallenge.create({
       data: {
         userId: input.userId,
         deviceId: target.deviceId,
         otpHash: hashOtp(code),
         expiresAt,
       },
+      select: { id: true },
     });
 
     await recordEvent(tx, {
@@ -318,11 +369,39 @@ export async function requestUnlock(
       type: 'UNLOCK_REQUESTED',
       requestId: input.requestId,
     });
+
+    return challenge.id;
   });
 
-  // After the commit: a code the user has been told about must correspond to
-  // a challenge that actually exists.
-  deliverOtp({ code, serialNumber: target.serialNumber, expiresAt });
+  /**
+   * Delivery happens after the commit, so a code the user has been told about
+   * always corresponds to a challenge that exists.
+   *
+   * If it fails, the challenge is **consumed immediately**: leaving it open
+   * would mean a live code for five minutes that the owner never received,
+   * which is a code only someone who intercepted it could use. The user gets
+   * `OTP_DELIVERY_FAILED` and can simply ask again.
+   *
+   * **Window, stated plainly:** these are two steps, not one, and nothing can
+   * make them atomic — a send cannot join a database transaction, and a
+   * transaction cannot un-send. If the process dies between the commit and
+   * the compensating consume, an undelivered challenge is left open until it
+   * expires on its own five minutes later. That is the same five-minute
+   * exposure an ordinary unread code already has, it needs a crash inside a
+   * ~100ms window to happen at all, and the code itself only ever existed in
+   * the memory of the dead process. See docs/decisions.md.
+   */
+  const delivery = await deliverOtp({
+    userId: input.userId,
+    code,
+    serialNumber: target.serialNumber,
+    expiresAt,
+  });
+
+  if (delivery.status !== 'SENT') {
+    await consume(challengeId);
+    throw deliveryFailed(delivery);
+  }
 
   return {
     expiresAt: expiresAt.toISOString(),
