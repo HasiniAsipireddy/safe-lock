@@ -29,6 +29,28 @@ export interface PublicUser {
   deviceAllocated: boolean;
 }
 
+/** Response body of `POST /account/phone/request-verification`. */
+export interface PhoneVerificationRequestResponse {
+  /**
+   * The number the code was sent to, **masked** (`+91 98****10`).
+   *
+   * Echoed back on purpose: a request for a number that belongs to someone
+   * else answers exactly like a successful one (see docs/decisions.md), so
+   * this masked value is the only way a user who mistyped can notice. It
+   * reveals nothing — they supplied the number in the request.
+   */
+  maskedPhone: string;
+  expiresAt: string;
+  expiresInSeconds: number;
+  attemptsAllowed: number;
+  resendAfterSeconds: number;
+}
+
+/** Response body of `POST /account/phone/confirm`. */
+export interface PhoneVerificationConfirmResponse {
+  user: PublicUser;
+}
+
 /**
  * Response body of `POST /auth/login`, `POST /auth/signup`, `GET /auth/me`,
  * `PATCH /auth/profile` and `POST /auth/password/change`.

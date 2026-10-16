@@ -64,6 +64,39 @@ export const ERROR_CODES = {
    */
   PASSWORD_INCORRECT: 'PASSWORD_INCORRECT',
 
+  // --- Phone verification / WhatsApp ----------------------------------------
+  /**
+   * Unlock requires a verified phone number, because that is where the
+   * one-time code goes. Distinct from `NO_DEVICE` and `NOT_PAID`: the user has
+   * something to *do* about it, and the dashboard shows them how.
+   */
+  PHONE_NOT_VERIFIED: 'PHONE_NOT_VERIFIED',
+  /**
+   * A one-time code was generated but could not be delivered. The challenge it
+   * belonged to has been invalidated, so there is no code in flight — the
+   * caller should simply try again.
+   */
+  OTP_DELIVERY_FAILED: 'OTP_DELIVERY_FAILED',
+  /** The submitted verification code did not match. The challenge is open. */
+  PHONE_VERIFICATION_INVALID: 'PHONE_VERIFICATION_INVALID',
+  PHONE_VERIFICATION_EXPIRED: 'PHONE_VERIFICATION_EXPIRED',
+  PHONE_VERIFICATION_TOO_MANY_ATTEMPTS: 'PHONE_VERIFICATION_TOO_MANY_ATTEMPTS',
+  /** No open verification challenge — never requested, used, or superseded. */
+  PHONE_VERIFICATION_NOT_FOUND: 'PHONE_VERIFICATION_NOT_FOUND',
+  /** The submitted number is already the caller's verified number. */
+  PHONE_ALREADY_VERIFIED: 'PHONE_ALREADY_VERIFIED',
+  /**
+   * The per-user daily WhatsApp send cap is spent. Messages cost money, and an
+   * uncapped send endpoint is a way to bill us for someone else's spam.
+   *
+   * **Never returned by `/auth/password/forgot`** — doing so would turn the cap
+   * into an account-enumeration oracle. That endpoint stays byte-identical and
+   * silently skips the send.
+   */
+  WHATSAPP_SEND_CAP_REACHED: 'WHATSAPP_SEND_CAP_REACHED',
+  /** WhatsApp opt-in is required before any message may be sent. */
+  CONSENT_REQUIRED: 'CONSENT_REQUIRED',
+
   // --- Devices / allocation -------------------------------------------------
   /** Allocation attempted for a user with no server-verified payment. */
   NOT_PAID: 'NOT_PAID',

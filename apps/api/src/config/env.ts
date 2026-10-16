@@ -86,6 +86,64 @@ const envSchema = z
      */
     DEVICE_GATEWAY: z.enum(['mock']).default('mock'),
 
+    // --- WhatsApp (Meta Cloud API) -------------------------------------------
+    /**
+     * Which WhatsApp client to use.
+     *
+     * `fake` records messages in memory and sends nothing; it is **refused in
+     * production** by `mayUseFakeWhatsApp` and by the superRefine below, the
+     * same belt-and-braces as `mayPrintOtp`. An enum rather than a free string
+     * so a typo is a boot failure instead of a silent fallback to the fake.
+     */
+    WHATSAPP_PROVIDER: z.enum(['fake', 'cloud']).default('fake'),
+
+    /**
+     * Graph API credentials. Required when the provider is `cloud` — see the
+     * superRefine, which fails the boot rather than discovering a missing
+     * token at the first unlock.
+     */
+    WHATSAPP_ACCESS_TOKEN: z.string().optional(),
+    WHATSAPP_PHONE_NUMBER_ID: z.string().optional(),
+    /** Keys the HMAC on `X-Hub-Signature-256` for the delivery webhook. */
+    WHATSAPP_APP_SECRET: z.string().optional(),
+    /** Echoed back during Meta's `GET` subscription handshake. */
+    WHATSAPP_WEBHOOK_VERIFY_TOKEN: z.string().optional(),
+
+    /**
+     * Approved template names, one per message kind.
+     *
+     * From the environment, not hardcoded: template names are created and
+     * approved in Meta's console, and nothing in this codebase should assume a
+     * name that may not exist in a given WhatsApp Business account.
+     */
+    WHATSAPP_TEMPLATE_UNLOCK_OTP: z.string().default('safelock_unlock_code'),
+    WHATSAPP_TEMPLATE_PHONE_OTP: z.string().default('safelock_phone_verification'),
+    WHATSAPP_TEMPLATE_PASSWORD_RESET: z.string().default('safelock_password_reset'),
+    WHATSAPP_TEMPLATE_UNLOCK_ALERT: z.string().default('safelock_unlock_alert'),
+    WHATSAPP_TEMPLATE_FAILED_ATTEMPTS: z.string().default('safelock_failed_attempts'),
+
+    /** Template language tag, as registered with Meta. */
+    WHATSAPP_LANGUAGE: z.string().default('en'),
+    /** Graph API version. Pinned, so Meta rolling forward cannot change behaviour. */
+    WHATSAPP_API_VERSION: z.string().default('v21.0'),
+    /** Per-request timeout. A send that hangs must not hold an unlock open. */
+    WHATSAPP_TIMEOUT_MS: z.coerce.number().int().positive().max(60_000).default(8_000),
+
+    /**
+     * Messages per user per rolling 24 hours, across every kind.
+     *
+     * Each message costs money and lands on someone's phone, so an uncapped
+     * send endpoint is both a billing risk and a way to use us to harass
+     * someone. 10 clears an ordinary day (a verification, a few unlocks and
+     * their alerts) with room to spare.
+     */
+    WHATSAPP_DAILY_SEND_CAP: z.coerce.number().int().positive().max(1000).default(10),
+
+    /** How often the outbox worker looks for pending messages. */
+    OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().positive().max(600_000).default(5_000),
+    /** Give-up point for one outbound message. Backoff is exponential. */
+    OUTBOX_MAX_ATTEMPTS: z.coerce.number().int().positive().max(20).default(5),
+
     // --- ADMIN seed (prisma/seed.ts) -----------------------------------------
     SEED_ADMIN_EMAIL: z.string().optional(),
     SEED_ADMIN_PASSWORD: z.string().optional(),
@@ -112,7 +170,65 @@ const envSchema = z
     RAZORPAY_WEBHOOK_SECRET: z.string().min(1, 'RAZORPAY_WEBHOOK_SECRET is required'),
   })
   .superRefine((value, ctx) => {
+    /**
+     * Cloud mode needs all four credentials, in every environment.
+     *
+     * Checked outside the production block on purpose: someone pointing a
+     * staging box at the real Cloud API deserves the same fail-fast. A missing
+     * app secret in particular would mean the delivery webhook could not
+     * verify a signature, and "cannot verify" must never degrade to "accept".
+     */
+    if (value.WHATSAPP_PROVIDER === 'cloud') {
+      const required = [
+        ['WHATSAPP_ACCESS_TOKEN', value.WHATSAPP_ACCESS_TOKEN],
+        ['WHATSAPP_PHONE_NUMBER_ID', value.WHATSAPP_PHONE_NUMBER_ID],
+        ['WHATSAPP_APP_SECRET', value.WHATSAPP_APP_SECRET],
+        ['WHATSAPP_WEBHOOK_VERIFY_TOKEN', value.WHATSAPP_WEBHOOK_VERIFY_TOKEN],
+      ] as const;
+
+      for (const [name, supplied] of required) {
+        if (!supplied?.trim()) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [name],
+            message: `${name} is required when WHATSAPP_PROVIDER=cloud`,
+          });
+        }
+      }
+    }
+
     if (value.NODE_ENV !== 'production') return;
+
+    /**
+     * The fake client must be unreachable in production.
+     *
+     * Two independent guards, like the OTP console print: this one refuses the
+     * boot, and `mayUseFakeWhatsApp` refuses to construct it. A deployment
+     * that silently recorded unlock codes to memory and sent nothing would
+     * look healthy and open nothing.
+     */
+    if (value.WHATSAPP_PROVIDER === 'fake') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['WHATSAPP_PROVIDER'],
+        message:
+          'WHATSAPP_PROVIDER=fake is not allowed in production; it sends no messages',
+      });
+    }
+
+    for (const [name, supplied] of [
+      ['WHATSAPP_ACCESS_TOKEN', value.WHATSAPP_ACCESS_TOKEN],
+      ['WHATSAPP_APP_SECRET', value.WHATSAPP_APP_SECRET],
+      ['WHATSAPP_WEBHOOK_VERIFY_TOKEN', value.WHATSAPP_WEBHOOK_VERIFY_TOKEN],
+    ] as const) {
+      if (supplied && /change_me|replace_me|placeholder/i.test(supplied)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [name],
+          message: `${name} still holds a placeholder value; set a real secret`,
+        });
+      }
+    }
 
     // Live keys in a test deployment (or the reverse) is a costly mistake to
     // make quietly, and the placeholder secrets must never reach production.

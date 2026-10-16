@@ -7,6 +7,7 @@ export * from './schemas/auth';
 export * from './schemas/devices';
 export * from './schemas/history';
 export * from './schemas/payments';
+export * from './schemas/phone';
 export * from './types/auth';
 export * from './types/devices';
 export * from './types/history';

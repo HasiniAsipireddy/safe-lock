@@ -25,14 +25,37 @@ const REDACTED = '[redacted]';
  *
  * `hash` is included so a password hash never lands in a log line; `otp` is
  * here ahead of the OTP work so the rule exists before the feature does.
+ *
+ * `phone`, `mobile`, `recipient`, `to` and `msisdn` cover WhatsApp delivery:
+ * a full phone number is personal data and a log aggregator is the wrong place
+ * for a list of customer mobiles. Code that genuinely needs to identify a
+ * number in a log line passes `maskedPhone` (see `maskPhone` in
+ * `@safelock/shared`), which is on the safe list below.
+ *
+ * `templateParams` is here because a template's parameters are exactly where
+ * an OTP would be if anyone ever logged a send payload.
  */
 const SENSITIVE_KEY =
-  /secret|signature|password|passwd|token|otp|authorization|auth|cookie|hash|credential|apikey|api_key|privatekey|private_key/i;
+  /secret|signature|password|passwd|token|otp|authorization|auth|cookie|hash|credential|apikey|api_key|privatekey|private_key|phone|mobile|msisdn|recipient|templateparams|^to$|^body$/i;
 
-/** Keys that merely *sound* sensitive but are safe and useful to keep. */
-const SAFE_KEY = /^(tokenType|hasPaid|authenticated|authorized)$/;
+/**
+ * Keys that merely *sound* sensitive but are safe and useful to keep.
+ *
+ * `maskedPhone` is already masked by construction — `maskPhone` returns
+ * `+91 98****10` or a constant, never the input — so redacting it again would
+ * only remove the one phone representation that is safe to keep.
+ */
+const SAFE_KEY =
+  /^(tokenType|hasPaid|authenticated|authorized|maskedPhone|phoneVerified|templateName)$/;
 
-function sanitise(value: unknown, depth = 0): unknown {
+/**
+ * Replaces the value of any sensitive-looking key, at any depth.
+ *
+ * Exported so the rule itself is directly testable: this is the backstop that
+ * catches keys nobody listed, and a backstop nobody has watched work is not a
+ * backstop. Not intended to be called outside the logger.
+ */
+export function sanitise(value: unknown, depth = 0): unknown {
   if (depth > 6) return '[truncated]';
   if (value === null || typeof value !== 'object') return value;
   if (value instanceof Date) return value.toISOString();
