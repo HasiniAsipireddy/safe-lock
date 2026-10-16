@@ -86,7 +86,10 @@ middleware/    # auth, rateLimit, validate, errorHandler
 - ~~**Command**~~ — **deferred to the MQTT gateway.** The mock acks synchronously, so
   there is nothing in flight to track and nothing to time out. Command ids/nonces and the
   15s timeout land with it. See `docs/decisions.md`.
-- **RefreshToken**: id, userId, tokenHash (unique — sha256 of an opaque token; the raw value is never stored), familyId, expiresAt, revokedAt, replacedById, graceUsedAt, userAgent, ip, createdAt
+- **RefreshToken**: id, userId, tokenHash (unique — sha256 of an opaque token; the raw value is never stored), familyId, expiresAt, revokedAt, **revokedReason** (`ROTATED` | `LOGOUT` | `PASSWORD_CHANGE` | `PASSWORD_RESET` | `REUSE_CASCADE`, nullable), replacedById, graceUsedAt, userAgent, ip, createdAt
+  — `revokedReason` exists for exactly one decision: whether a replay is
+  **theft**. `PASSWORD_CHANGE` / `PASSWORD_RESET` replays are not. Null on rows
+  revoked before the column existed, and null means "treat as theft".
 - **PasswordResetToken**: id, userId, tokenHash (unique), expiresAt, consumedAt, requestedIp, userAgent, createdAt
   — 32 random bytes, stored as **plain `sha256`, not an HMAC**, and there is no
   `RESET_TOKEN_HMAC_SECRET`. A 2^256 space has nothing to brute-force; the OTP
@@ -146,6 +149,12 @@ middleware/    # auth, rateLimit, validate, errorHandler
 - **Reuse detection**: replaying a rotated token after the grace window — or a
   second time — revokes the whole family *and* every other refresh token for that
   user, audits `REFRESH_REUSE_DETECTED`, and returns 401.
+  **Exception:** `RefreshToken.revokedReason` records why a token was revoked,
+  and a token revoked by `PASSWORD_CHANGE` or `PASSWORD_RESET` answers a plain
+  401 `REFRESH_TOKEN_INVALID` **without cascading**. Those revocations were
+  deliberate and already covered every session, so the cascade can only reach
+  the legitimate successor — which is how changing your password used to sign
+  you out of the device you changed it on. See `docs/decisions.md`.
 - **Grace window**: `REFRESH_GRACE_WINDOW_MS` (10s, in `refreshToken.service.ts`).
   A replay inside it mints **one** sibling in the family (two tabs racing), tracked
   by `graceUsedAt` and audited as `REFRESH_GRACE_USED`. **Set to 0 to disable.**
