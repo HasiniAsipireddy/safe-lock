@@ -91,6 +91,60 @@ enum RefreshTokenRevokedReason {
   REUSE_CASCADE
 }
 
+/// What kind of message an outbound row carries.
+///
+/// One value per approved WhatsApp template. The template *name* comes from
+/// configuration (Meta approves names per business account), so this enum
+/// names the intent rather than the template.
+enum OutboundMessageKind {
+  /// The unlock one-time code. Authentication category.
+  UNLOCK_OTP
+  /// The phone-verification one-time code. Authentication category.
+  PHONE_OTP
+  /// A password reset link/token. Authentication category.
+  PASSWORD_RESET
+  /// "Your safe was opened." Utility category.
+  UNLOCK_ALERT
+  /// "Five wrong codes were entered." Utility category.
+  FAILED_ATTEMPTS_ALERT
+}
+
+/// Where an outbound message got to.
+///
+/// `SKIPPED` is **not** a failure and is deliberately distinct from `FAILED`:
+/// it means we decided not to send — no verified number, or no consent — so
+/// nothing was attempted and nothing should be retried. Collapsing the two
+/// would make a dashboard of delivery failures mostly noise, and would hide a
+/// real provider outage inside a pile of "this user has no phone yet".
+enum OutboundMessageStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+/// Why a message was skipped or failed, as a closed set.
+///
+/// Mirrors `WhatsAppErrorCategory` in `lib/whatsapp/client.ts` plus the two
+/// skip reasons. A category, never a provider message: the raw detail is
+/// logged once and never stored, because a provider error string is
+/// unbounded, unversioned text of exactly the kind that ends up quoted in a
+/// UI by accident.
+enum OutboundFailureCategory {
+  /// Skip: the user has no verified phone number.
+  NO_VERIFIED_PHONE
+  /// Skip: the user has not opted in to WhatsApp.
+  NO_CONSENT
+  /// Skip: the user's daily send cap is spent.
+  CAP_REACHED
+  INVALID_NUMBER
+  TEMPLATE
+  AUTH
+  RATE_LIMITED
+  TRANSPORT
+  UNKNOWN
+}
+
 /// What an in-app notification is about.
 ///
 /// Deliberately not DeviceEventType: most device events notify nobody, and a
@@ -112,14 +166,31 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  // TODO(phone-verification): add `phoneVerifiedAt DateTime?` when WhatsApp /
-  // SMS verification is built. Deliberately absent for now so no route can
-  // start depending on a column that is never populated.
+  /// When the user confirmed a one-time code sent to `phone`.
+  ///
+  /// Null means unverified, and unverified means **no unlock** (the code has
+  /// nowhere to go) and **no WhatsApp message of any kind**. Locking is still
+  /// allowed: locking is the safe direction, and refusing it would leave
+  /// someone unable to secure their own safe.
+  ///
+  /// There is no grandfathering. Nothing is deployed, so every account
+  /// verifies — see docs/decisions.md.
+  phoneVerifiedAt DateTime?
+
+  /// When the user opted in to WhatsApp, and to which wording.
+  ///
+  /// Meta requires an explicit opt-in before a business may message someone.
+  /// The version records *what* they agreed to (`WHATSAPP_CONSENT_VERSION` in
+  /// `@safelock/shared`); "we have consent" is only meaningful if we can say
+  /// which text it was. Both null until the user ticks the box.
+  whatsappConsentAt      DateTime?
+  whatsappConsentVersion Int?
 
   payments            Payment[]
   auditLogs           AuditLog[]
   refreshTokens       RefreshToken[]
   passwordResetTokens PasswordResetToken[]
+  outboundMessages    OutboundMessage[]
   deviceEvents      DeviceEvent[]
   unlockChallenges  UnlockChallenge[]
   notifications     Notification[]
@@ -189,9 +260,10 @@ model DeviceEvent {
 
   createdAt DateTime @default(now())
 
-  device        Device         @relation(fields: [deviceId], references: [id], onDelete: Cascade)
-  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
-  notifications Notification[]
+  device           Device            @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  notifications    Notification[]
+  outboundMessages OutboundMessage[]
 
   /// The /history page's query: one user's events, newest first.
   ///
@@ -307,6 +379,63 @@ model RefreshToken {
   @@index([userId])
   @@index([familyId])
   @@index([expiresAt])
+}
+
+/// The WhatsApp outbox: one row per message we intend to send.
+///
+/// ## Why an outbox exists at all
+/// A WhatsApp send is a network call, and the unlock flow writes its
+/// `DeviceEvent` and in-app `Notification` inside a transaction. Sending from
+/// inside that transaction would be wrong in both directions: a rollback
+/// cannot unsend a message (so someone could be told their safe opened when it
+/// did not), and a WhatsApp outage would roll back the unlock (so the safe
+/// would refuse to open because a *notification* channel was down).
+///
+/// Writing a row is a local insert, so it stays atomic with the event. The
+/// worker sends after the commit. That reverses the step-2 trade-off — where a
+/// notifier failure deliberately blocked the unlock — **for the external
+/// channel only**. The in-app notification is still atomic and still blocking.
+/// See docs/decisions.md.
+///
+/// ## What it never holds
+/// No message text and no template parameters. Parameters can contain a
+/// one-time code, so they are rebuilt from live data at send time
+/// (`lib/whatsapp/send.ts`) and exist only in memory. A dump of this table
+/// yields who was messaged about what, and no codes.
+model OutboundMessage {
+  id     String              @id @default(cuid())
+  userId String
+  kind   OutboundMessageKind
+
+  status   OutboundMessageStatus   @default(PENDING)
+  /// Delivery attempts so far. Compared against OUTBOX_MAX_ATTEMPTS.
+  attempts Int                     @default(0)
+  /// Why it failed or was skipped. Null while PENDING or once SENT.
+  failureCategory OutboundFailureCategory?
+
+  /// Earliest time the worker may try again. Exponential backoff.
+  nextAttemptAt DateTime @default(now())
+
+  /// Meta's `wamid.…`, once accepted. The key a delivery webhook matches on.
+  providerMessageId String? @unique
+  /// Delivery state reported by the webhook: sent / delivered / read / failed.
+  deliveryStatus    String?
+  deliveryUpdatedAt DateTime?
+
+  /// The device event this message is about, when there is one.
+  deviceEventId String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  sentAt    DateTime?
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceEvent DeviceEvent? @relation(fields: [deviceEventId], references: [id], onDelete: SetNull)
+
+  /// The worker's claim query: PENDING rows whose backoff has elapsed.
+  @@index([status, nextAttemptAt])
+  /// The daily cap count, and a user's message history.
+  @@index([userId, createdAt])
 }
 
 /// One outstanding password reset.

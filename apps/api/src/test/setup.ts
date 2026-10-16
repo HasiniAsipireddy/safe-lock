@@ -37,6 +37,7 @@ globalThis.fetch = (() =>
 const TABLES = [
   'RefreshToken',
   'PasswordResetToken',
+  'OutboundMessage',
   'Notification',
   'DeviceEvent',
   'UnlockChallenge',

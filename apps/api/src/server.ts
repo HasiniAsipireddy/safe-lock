@@ -2,6 +2,7 @@ import { API_PREFIX, createApp } from './app';
 import { WEB_ORIGINS, env } from './config/env';
 import { logger } from './lib/logger';
 import { disconnectPrisma } from './lib/prisma';
+import { startOutboxWorker, stopOutboxWorker } from './lib/outbox/worker';
 
 /**
  * Process entry point: listen, then shut down cleanly.
@@ -28,6 +29,14 @@ const server = app.listen(env.PORT, () => {
     },
     'API listening',
   );
+
+  /**
+   * The outbox poll loop starts here and **only** here — not in
+   * `createApp()`. A worker that started with the app would tick during the
+   * test suite, racing every assertion about outbox state and sending on a
+   * timer nobody asked for. Tests call `processPending()` directly.
+   */
+  startOutboxWorker();
 });
 
 let shuttingDown = false;
@@ -42,6 +51,10 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   shuttingDown = true;
 
   logger.info({ reason }, 'Shutting down');
+
+  // Stop claiming new outbound messages first. A row already claimed keeps its
+  // pushed-out backoff, so the next process picks it up rather than losing it.
+  stopOutboxWorker();
 
   // Hard deadline. unref'd so it never by itself keeps the process alive.
   const forceExit = setTimeout(() => {
