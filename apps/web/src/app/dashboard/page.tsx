@@ -61,6 +61,15 @@ function DashboardContent() {
         <PaidUserSafe />
       )}
 
+      {/* Reachable for every signed-in user, not only those holding a safe:
+          history is their own record and stays readable after a refund. */}
+      <Link
+        href="/history"
+        className="inline-flex min-h-12 items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-5 text-base font-semibold text-slate-900 transition-colors hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
+      >
+        View activity history
+      </Link>
+
       <Button
         variant="secondary"
         loading={signingOut}

@@ -12,11 +12,16 @@
  */
 
 import {
+  DEVICE_EVENT_LABELS,
   ERROR_CODES,
   GENERIC_LOGIN_ERROR,
+  HISTORY_DEFAULT_LIMIT,
+  HISTORY_MAX_LIMIT,
+  NOTIFICATION_COPY,
   OTP_MAX_ATTEMPTS,
   OTP_RESEND_COOLDOWN_SECONDS,
   OTP_TTL_MS,
+  UNLOCK_FAILURE_LABELS,
   classifyIdentifier,
   normaliseSerial,
   otpSchema,
@@ -30,16 +35,24 @@ import {
   type BulkCreateResult,
   type BulkCreateRowResult,
   type CreateOrderResponse,
+  type DeviceEventType,
   type DeviceStatus,
   type DeviceSummary,
+  type HistoryEvent,
+  type HistoryResponse,
   type LockResponse,
   type LockState,
+  type MarkNotificationsReadResponse,
   type MyDeviceResponse,
+  type NotificationItem,
+  type NotificationType,
+  type NotificationsResponse,
   type Paginated,
   type PaymentMeResponse,
   type PaymentSummary,
   type PublicUser,
   type UnlockConfirmResponse,
+  type UnlockFailureReason,
   type UnlockRequestResponse,
   type VerifyPaymentResponse,
 } from '@safelock/shared';
@@ -138,6 +151,116 @@ function makeMockDevice(serialNumber: string, ageIndex: number): MockDevice {
 /** A mock audit trail, newest last. */
 const auditLog: AdminAuditRow[] = [];
 
+// --- Device events and notifications (mock) ----------------------------------
+
+/**
+ * The mock's `DeviceEvent` rows, newest last.
+ *
+ * Mirrors the API's table closely enough that `/history` exercises the same
+ * cursor pagination and day grouping — including the case the real
+ * implementation is careful about, several events sharing one timestamp.
+ */
+interface MockDeviceEvent {
+  id: string;
+  userId: string;
+  serialNumber: string;
+  type: DeviceEventType;
+  failureReason: UnlockFailureReason | null;
+  createdAt: string;
+}
+
+const deviceEvents: MockDeviceEvent[] = [];
+let eventSequence = 0;
+
+interface MockNotification {
+  id: string;
+  userId: string;
+  type: NotificationType;
+  deviceEventId: string | null;
+  createdAt: string;
+  readAt: string | null;
+}
+
+const notifications: MockNotification[] = [];
+let notificationSequence = 0;
+
+function recordMockEvent(input: {
+  userId: string;
+  serialNumber: string;
+  type: DeviceEventType;
+  failureReason?: UnlockFailureReason | null;
+  createdAt?: string;
+}): MockDeviceEvent {
+  eventSequence += 1;
+  const event: MockDeviceEvent = {
+    id: `evt_mock_${String(eventSequence).padStart(4, '0')}`,
+    userId: input.userId,
+    serialNumber: input.serialNumber,
+    type: input.type,
+    failureReason: input.failureReason ?? null,
+    createdAt: input.createdAt ?? new Date().toISOString(),
+  };
+  deviceEvents.push(event);
+  return event;
+}
+
+/** Mirrors the API: a notification is created with the event, never alone. */
+function recordMockNotification(input: {
+  userId: string;
+  type: NotificationType;
+  deviceEventId: string;
+  createdAt?: string;
+}): void {
+  notificationSequence += 1;
+  notifications.push({
+    id: `ntf_mock_${String(notificationSequence).padStart(4, '0')}`,
+    userId: input.userId,
+    type: input.type,
+    deviceEventId: input.deviceEventId,
+    createdAt: input.createdAt ?? new Date().toISOString(),
+    readAt: null,
+  });
+}
+
+/**
+ * Invents a few days of past activity for a freshly allocated safe.
+ *
+ * Mock-only, and the one place this fake deliberately diverges from the API:
+ * without it `/history` is empty until someone clicks Lock twenty times, so
+ * day grouping, "Load more" and the unread badge could not be reviewed at all.
+ * Two events share a timestamp on purpose — that is the case the real cursor
+ * is built to survive.
+ */
+function seedMockHistory(userId: string, serialNumber: string): void {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const start = Date.now() - 3 * dayMs;
+  const script: Array<{ type: DeviceEventType; failureReason?: UnlockFailureReason }> = [
+    { type: 'LOCK' },
+    { type: 'UNLOCK_REQUESTED' },
+    { type: 'UNLOCK_CONFIRMED' },
+    { type: 'UNLOCK_FAILED', failureReason: 'WRONG_CODE' },
+    { type: 'UNLOCK_REQUESTED' },
+    { type: 'UNLOCK_FAILED', failureReason: 'EXPIRED' },
+    { type: 'LOCK' },
+    { type: 'UNLOCK_REQUESTED' },
+  ];
+
+  for (let index = 0; index < 24; index += 1) {
+    const step = script[index % script.length]!;
+    // Spread across three days, with every 7th event sharing its predecessor's
+    // timestamp so the tie-breaking path is exercised.
+    const offset = index % 7 === 0 && index > 0 ? (index - 1) * 2 * 60 * 60 * 1000 : index * 2 * 60 * 60 * 1000;
+
+    recordMockEvent({
+      userId,
+      serialNumber,
+      type: step.type,
+      failureReason: step.failureReason ?? null,
+      createdAt: new Date(start + offset).toISOString(),
+    });
+  }
+}
+
 function recordAudit(action: string, extra: Partial<AdminAuditRow> = {}): void {
   auditLog.push({
     id: `aud_mock_${auditLog.length + 1}`,
@@ -217,6 +340,12 @@ export async function mockRequest<T>(
       return handleVerifyPayment(body) as T;
     case 'GET /devices/mine':
       return handleMyDevice() as T;
+    case 'GET /devices/history':
+      return handleMockHistory(query) as T;
+    case 'GET /notifications':
+      return handleMockNotifications(query) as T;
+    case 'POST /notifications/read':
+      return handleMockMarkRead(body) as T;
     case 'POST /devices/lock':
       return handleMockLock() as T;
     case 'POST /devices/unlock/request':
@@ -613,6 +742,12 @@ function handleMockLock(): LockResponse {
   device.online = true;
   device.lastSeenAt = now;
   recordAudit('device.lock.success', { userId: account.user.id, deviceId: device.id });
+  // No notification: locking is the safe state, matching the API.
+  recordMockEvent({
+    userId: account.user.id,
+    serialNumber: device.serialNumber,
+    type: 'LOCK',
+  });
 
   return { device: toDeviceSummary(device), alreadyLocked: false };
 }
@@ -633,6 +768,11 @@ function handleMockUnlockRequest(): UnlockRequestResponse {
   recordAudit('device.unlock.otp_requested', {
     userId: account.user.id,
     deviceId: device.id,
+  });
+  recordMockEvent({
+    userId: account.user.id,
+    serialNumber: device.serialNumber,
+    type: 'UNLOCK_REQUESTED',
   });
 
   return {
@@ -672,6 +812,12 @@ function handleMockUnlockConfirm(body: unknown): UnlockConfirmResponse {
 
   if (challenge.expiresAt <= Date.now()) {
     challenge.consumed = true;
+    recordMockEvent({
+      userId: account.user.id,
+      serialNumber: device.serialNumber,
+      type: 'UNLOCK_FAILED',
+      failureReason: 'EXPIRED',
+    });
     return fail(400, ERROR_CODES.OTP_EXPIRED, 'That code has expired. Request a new one.');
   }
 
@@ -685,12 +831,31 @@ function handleMockUnlockConfirm(body: unknown): UnlockConfirmResponse {
 
     if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
       challenge.consumed = true;
+      // Only the burned challenge notifies — a single typo does not.
+      const event = recordMockEvent({
+        userId: account.user.id,
+        serialNumber: device.serialNumber,
+        type: 'UNLOCK_FAILED',
+        failureReason: 'TOO_MANY_ATTEMPTS',
+      });
+      recordMockNotification({
+        userId: account.user.id,
+        type: 'UNLOCK_FAILED_MAX_ATTEMPTS',
+        deviceEventId: event.id,
+      });
       return fail(
         400,
         ERROR_CODES.OTP_TOO_MANY_ATTEMPTS,
         'Too many incorrect codes. Request a new one.',
       );
     }
+
+    recordMockEvent({
+      userId: account.user.id,
+      serialNumber: device.serialNumber,
+      type: 'UNLOCK_FAILED',
+      failureReason: 'WRONG_CODE',
+    });
 
     const left = OTP_MAX_ATTEMPTS - challenge.attempts;
     return fail(
@@ -708,7 +873,186 @@ function handleMockUnlockConfirm(body: unknown): UnlockConfirmResponse {
   device.lastSeenAt = now;
   recordAudit('device.unlock.success', { userId: account.user.id, deviceId: device.id });
 
+  // Event and notification together, as one step — the API writes both in one
+  // transaction and neither can exist without the other.
+  const event = recordMockEvent({
+    userId: account.user.id,
+    serialNumber: device.serialNumber,
+    type: 'UNLOCK_CONFIRMED',
+  });
+  recordMockNotification({
+    userId: account.user.id,
+    type: 'UNLOCK_CONFIRMED',
+    deviceEventId: event.id,
+  });
+
   return { device: toDeviceSummary(device) };
+}
+
+// --- History (mock) ----------------------------------------------------------
+
+/**
+ * Same cursor format as the API: `base64url("<iso>|<id>")`.
+ *
+ * Deliberately identical so the client's pagination is exercised against a
+ * value of the same shape, and so a cursor is just as opaque here.
+ */
+function encodeMockCursor(event: MockDeviceEvent): string {
+  return btoa(`${event.createdAt}|${event.id}`)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function decodeMockCursor(cursor: string): { createdAt: string; id: string } {
+  let decoded: string;
+  try {
+    decoded = atob(cursor.replace(/-/g, '+').replace(/_/g, '/'));
+  } catch {
+    return fail(400, ERROR_CODES.INVALID_CURSOR, 'That page link is no longer valid.');
+  }
+
+  const parts = decoded.split('|');
+  if (parts.length !== 2) {
+    return fail(400, ERROR_CODES.INVALID_CURSOR, 'That page link is no longer valid.');
+  }
+
+  const [createdAt, id] = parts as [string, string];
+  const parsed = new Date(createdAt);
+
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString() !== createdAt) {
+    return fail(400, ERROR_CODES.INVALID_CURSOR, 'That page link is no longer valid.');
+  }
+
+  return { createdAt, id };
+}
+
+function toMockHistoryEvent(event: MockDeviceEvent): HistoryEvent {
+  const failureReason = event.type === 'UNLOCK_FAILED' ? event.failureReason : null;
+
+  return {
+    id: event.id,
+    type: event.type,
+    label: DEVICE_EVENT_LABELS[event.type],
+    serialNumber: event.serialNumber,
+    failureReason,
+    failureLabel: failureReason ? UNLOCK_FAILURE_LABELS[failureReason] : null,
+    createdAt: event.createdAt,
+  };
+}
+
+/**
+ * The caller's activity, newest first, keyset-paginated.
+ *
+ * Note there is no paid or device check, matching the API: history is the
+ * user's own record, and an empty list is the answer when there is nothing.
+ */
+function handleMockHistory(query: URLSearchParams): HistoryResponse {
+  const account = requireAccount();
+  const limit = parseMockLimit(query.get('limit'));
+  const rawCursor = query.get('cursor');
+
+  // Same total order as the API: createdAt DESC, then id DESC.
+  const ordered = deviceEvents
+    .filter((event) => event.userId === account.user.id)
+    .slice()
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+
+  let start = 0;
+  if (rawCursor) {
+    const after = decodeMockCursor(rawCursor);
+    start = ordered.findIndex(
+      (event) =>
+        event.createdAt < after.createdAt ||
+        (event.createdAt === after.createdAt && event.id < after.id),
+    );
+    if (start === -1) start = ordered.length;
+  }
+
+  const page = ordered.slice(start, start + limit);
+  const hasMore = ordered.length > start + limit;
+  const last = page.at(-1);
+
+  return {
+    items: page.map(toMockHistoryEvent),
+    nextCursor: hasMore && last ? encodeMockCursor(last) : null,
+  };
+}
+
+/** Mirrors the shared limit schema, including refusing rather than clamping. */
+function parseMockLimit(raw: string | null): number {
+  if (raw === null) return HISTORY_DEFAULT_LIMIT;
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > HISTORY_MAX_LIMIT) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      `Limit must be a whole number between 1 and ${HISTORY_MAX_LIMIT}`,
+    );
+  }
+  return value;
+}
+
+// --- Notifications (mock) ----------------------------------------------------
+
+function toMockNotification(notification: MockNotification): NotificationItem {
+  const copy = NOTIFICATION_COPY[notification.type];
+
+  return {
+    id: notification.id,
+    type: notification.type,
+    title: copy.title,
+    body: copy.body,
+    deviceEventId: notification.deviceEventId,
+    createdAt: notification.createdAt,
+    readAt: notification.readAt,
+  };
+}
+
+function handleMockNotifications(query: URLSearchParams): NotificationsResponse {
+  const account = requireAccount();
+  const limit = parseMockLimit(query.get('limit'));
+
+  const mine = notifications.filter(
+    (notification) => notification.userId === account.user.id,
+  );
+
+  // Unread first, then newest first — the same ordering as the API.
+  const ordered = mine.slice().sort((a, b) => {
+    const unread = Number(a.readAt !== null) - Number(b.readAt !== null);
+    return unread !== 0 ? unread : b.createdAt.localeCompare(a.createdAt);
+  });
+
+  return {
+    items: ordered.slice(0, limit).map(toMockNotification),
+    // The total, not the page's — the badge must not under-report.
+    unreadCount: mine.filter((notification) => notification.readAt === null).length,
+  };
+}
+
+function handleMockMarkRead(body: unknown): MarkNotificationsReadResponse {
+  const account = requireAccount();
+  const input = (body ?? {}) as { ids?: unknown };
+  const ids = Array.isArray(input.ids) ? (input.ids as string[]) : undefined;
+
+  let markedRead = 0;
+  for (const notification of notifications) {
+    // Ids that are not the caller's never match, exactly as on the server.
+    if (notification.userId !== account.user.id) continue;
+    if (notification.readAt !== null) continue;
+    if (ids && !ids.includes(notification.id)) continue;
+
+    notification.readAt = new Date().toISOString();
+    markedRead += 1;
+  }
+
+  return {
+    markedRead,
+    unreadCount: notifications.filter(
+      (notification) => notification.userId === account.user.id && notification.readAt === null,
+    ).length,
+  };
 }
 
 // --- Admin -------------------------------------------------------------------
@@ -899,6 +1243,9 @@ function handleAdminAllocate(body: unknown, deviceId?: string): { device: AdminD
   device.ownerId = target.user.id;
   device.allocatedAt = new Date().toISOString();
   syncAllocationFlag(target.user.id);
+  // Mock-only: gives /history something to page through immediately. The real
+  // API has no equivalent — a new owner's history starts empty.
+  seedMockHistory(target.user.id, device.serialNumber);
   recordAudit('device.allocated', {
     userId: target.user.id,
     deviceId: device.id,

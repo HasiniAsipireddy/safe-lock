@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useAuth } from '@/context/AuthContext';
+import { NotificationBell } from '@/components/NotificationBell';
 import { cn } from '@/lib/cn';
 
 /**
@@ -24,6 +25,7 @@ export function AppHeader() {
 
   const links = [
     { href: '/dashboard', label: 'Dashboard' },
+    { href: '/history', label: 'Activity' },
     ...(user.role === 'ADMIN' ? [{ href: '/admin', label: 'Admin' }] : []),
   ];
 
@@ -51,7 +53,7 @@ export function AppHeader() {
         </Link>
 
         <nav aria-label="Main" className="ml-auto">
-          <ul className="flex items-center gap-1">
+          <ul className="flex items-center gap-0.5 sm:gap-1">
             {links.map((link) => {
               const active = pathname === link.href || pathname.startsWith(`${link.href}/`);
               return (
@@ -60,7 +62,7 @@ export function AppHeader() {
                     href={link.href}
                     aria-current={active ? 'page' : undefined}
                     className={cn(
-                      'inline-flex min-h-10 items-center rounded-lg px-3 text-sm font-semibold transition-colors',
+                      'inline-flex min-h-10 items-center rounded-lg px-2 text-sm font-semibold transition-colors sm:px-3',
                       active
                         ? 'bg-slate-100 text-slate-900 dark:bg-slate-800 dark:text-white'
                         : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white',
@@ -73,6 +75,9 @@ export function AppHeader() {
             })}
           </ul>
         </nav>
+
+        {/* Outside the nav list: it is a control, not a navigation link. */}
+        <NotificationBell />
       </div>
     </header>
   );
