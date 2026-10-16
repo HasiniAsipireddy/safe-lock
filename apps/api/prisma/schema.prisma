@@ -1,8 +1,9 @@
 // Safe Lock platform — database schema.
 //
-// Scope note: this migration covers the user model and the payment flow only.
-// Device, OtpRequest and Command (see CLAUDE.md "Data Model") land with the
-// device-allocation and lock/unlock tasks.
+// Scope note: users, payments, device inventory/allocation and the lock/unlock
+// flow are all here. `Command` (see CLAUDE.md "Data Model") is deliberately
+// absent — the mock gateway acks synchronously, so there is nothing to track
+// asynchronously or time out yet. It lands with the real MQTT gateway.
 
 generator client {
   provider = "prisma-client-js"
@@ -33,7 +34,24 @@ enum DeviceStatus {
 enum LockState {
   LOCKED
   UNLOCKED
+  /// Only for a device nobody owns. An allocated safe is never UNKNOWN —
+  /// allocation sets LOCKED, unassign sets it back to UNKNOWN.
   UNKNOWN
+}
+
+/// What happened to a safe. Append-only; the /history page reads these.
+enum DeviceEventType {
+  LOCK
+  /// A one-time code was sent. Nothing has opened at this point.
+  UNLOCK_REQUESTED
+  UNLOCK_CONFIRMED
+  /// A wrong, expired or exhausted code.
+  UNLOCK_FAILED
+}
+
+/// Where a device event came from. Mobile and hardware join this later.
+enum DeviceEventSource {
+  WEB
 }
 
 model User {
@@ -50,11 +68,13 @@ model User {
   // SMS verification is built. Deliberately absent for now so no route can
   // start depending on a column that is never populated.
 
-  payments      Payment[]
-  auditLogs     AuditLog[]
-  refreshTokens RefreshToken[]
+  payments          Payment[]
+  auditLogs         AuditLog[]
+  refreshTokens     RefreshToken[]
+  deviceEvents      DeviceEvent[]
+  unlockChallenges  UnlockChallenge[]
   /// At most one, enforced by the unique constraint on Device.ownerId.
-  device        Device?
+  device            Device?
 }
 
 /// A physical safe lock in the inventory.
@@ -62,11 +82,14 @@ model Device {
   id           String       @id @default(cuid())
   serialNumber String       @unique
   status       DeviceStatus @default(UNASSIGNED)
-  /// UNKNOWN until real hardware reports its state — the UI must show the
-  /// device's actual state, never "what the last button press implied".
-  lockState    LockState    @default(UNKNOWN)
-  online       Boolean      @default(false)
-  lastSeenAt   DateTime?
+  /// A safe ships locked, so a device in stock defaults to LOCKED and
+  /// allocation re-asserts it. The UI must show the device's actual state,
+  /// never "what the last button press implied" — hence lockStateUpdatedAt,
+  /// which is set only when a command is *acked*, not when one is sent.
+  lockState           LockState @default(LOCKED)
+  lockStateUpdatedAt  DateTime?
+  online              Boolean   @default(false)
+  lastSeenAt          DateTime?
 
   /// Unique: a user owns at most one device for now. The constraint, not just
   /// a service check, is what makes concurrent allocation safe.
@@ -83,8 +106,71 @@ model Device {
 
   owner User? @relation(fields: [ownerId], references: [id], onDelete: SetNull)
 
+  events           DeviceEvent[]
+  unlockChallenges UnlockChallenge[]
+
   /// Supports the "oldest UNASSIGNED first" allocation pick.
   @@index([status, createdAt])
+}
+
+/// One row per lock/unlock event, append-only.
+///
+/// Separate from AuditLog on purpose: AuditLog is the internal security trail
+/// (admin actions, failed logins, origin rejections) and is not shown to
+/// users. This table is the **user-visible** activity feed that the /history
+/// page will render, so it carries only what an owner should see.
+///
+/// Never holds an OTP, a hash of one, or any credential.
+model DeviceEvent {
+  id       String            @id @default(cuid())
+  deviceId String
+  userId   String
+  type     DeviceEventType
+  source   DeviceEventSource @default(WEB)
+
+  /// The X-Request-Id of the request that caused this, so a user-visible
+  /// event can be tied back to its server log lines.
+  requestId String?
+
+  createdAt DateTime @default(now())
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// The /history page's query: one user's events, newest first.
+  @@index([userId, createdAt])
+  @@index([deviceId, createdAt])
+}
+
+/// An outstanding unlock OTP.
+///
+/// Only an HMAC of the code is stored — never the code itself. A 6-digit
+/// space is just 10^6, so a slow hash buys little; what protects it is a key
+/// (OTP_HMAC_SECRET) held outside the database. See docs/decisions.md.
+model UnlockChallenge {
+  id       String @id @default(cuid())
+  userId   String
+  deviceId String
+
+  /// HMAC-SHA256(code, OTP_HMAC_SECRET), hex. The plaintext code exists only
+  /// in memory and in the notification, never at rest.
+  otpHash String
+
+  expiresAt DateTime
+  /// Wrong guesses so far. At OTP_MAX_ATTEMPTS the challenge is dead.
+  attempts  Int       @default(0)
+  /// Set when the code was accepted, or when the challenge was superseded by
+  /// a newer request. Either way it can never be used again.
+  consumedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Finding the one open challenge for a user's device.
+  @@index([userId, deviceId, consumedAt])
+  @@index([expiresAt])
 }
 
 /// One row per issued refresh token.

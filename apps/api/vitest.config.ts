@@ -25,6 +25,8 @@ export default defineConfig({
     env: {
       NODE_ENV: 'test',
       JWT_ACCESS_SECRET: 'test_access_secret_for_vitest_only_32+chars',
+      // Fixed so an OTP's HMAC is reproducible inside a test.
+      OTP_HMAC_SECRET: 'test_otp_hmac_secret_for_vitest_only_32+chars',
       SAFE_PRICE_PAISE: '99900',
       RAZORPAY_KEY_ID: 'rzp_test_vitest',
       RAZORPAY_KEY_SECRET: 'vitest_key_secret_do_not_use_anywhere',

@@ -67,6 +67,25 @@ const envSchema = z
     /** Refresh token lifetime in days. */
     REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().max(365).default(7),
 
+    /**
+     * Keys the HMAC that unlock OTPs are stored under.
+     *
+     * Deliberately **separate** from JWT_ACCESS_SECRET: these protect
+     * different things with different lifetimes, and reusing one secret means
+     * rotating it breaks both at once. A 6-digit code is only 10^6 values, so
+     * the hash function is not what makes the stored digest useless to an
+     * attacker — a key that lives outside the database is.
+     */
+    OTP_HMAC_SECRET: secret('OTP_HMAC_SECRET'),
+
+    /**
+     * Which hardware gateway to talk to. Only `mock` exists today; `mqtt`
+     * arrives with the real units. An enum rather than a free string so a
+     * typo is a boot failure, not a silent fallback to the mock in
+     * production.
+     */
+    DEVICE_GATEWAY: z.enum(['mock']).default('mock'),
+
     // --- ADMIN seed (prisma/seed.ts) -----------------------------------------
     SEED_ADMIN_EMAIL: z.string().optional(),
     SEED_ADMIN_PASSWORD: z.string().optional(),
@@ -102,6 +121,14 @@ const envSchema = z
         code: 'custom',
         path: ['JWT_ACCESS_SECRET'],
         message: 'JWT_ACCESS_SECRET still holds its placeholder value; set a real secret',
+      });
+    }
+
+    if (value.OTP_HMAC_SECRET.includes('change_me')) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['OTP_HMAC_SECRET'],
+        message: 'OTP_HMAC_SECRET still holds its placeholder value; set a real secret',
       });
     }
 
