@@ -87,6 +87,12 @@ middleware/    # auth, rateLimit, validate, errorHandler
   there is nothing in flight to track and nothing to time out. Command ids/nonces and the
   15s timeout land with it. See `docs/decisions.md`.
 - **RefreshToken**: id, userId, tokenHash (unique — sha256 of an opaque token; the raw value is never stored), familyId, expiresAt, revokedAt, replacedById, graceUsedAt, userAgent, ip, createdAt
+- **PasswordResetToken**: id, userId, tokenHash (unique), expiresAt, consumedAt, requestedIp, userAgent, createdAt
+  — 32 random bytes, stored as **plain `sha256`, not an HMAC**, and there is no
+  `RESET_TOKEN_HMAC_SECRET`. A 2^256 space has nothing to brute-force; the OTP
+  is keyed because 10^6 does. See `docs/decisions.md`.
+  — Requesting a reset **consumes any older open token**, so one link is live
+  at a time. Redeeming one revokes every refresh token for the user.
 - **AuditLog**: id, userId, deviceId, action, ip, userAgent, metadata (json), createdAt
 
 ## Business Rules
@@ -147,6 +153,32 @@ middleware/    # auth, rateLimit, validate, errorHandler
   revocation. Tradeoff documented in `docs/decisions.md`.
 - **Logout** revokes the presented refresh token server-side, then clears cookies.
   Cookies must be cleared with the same `Path` they were set with.
+- **Password reset** is two endpoints, neither authenticated:
+  `POST /auth/password/forgot` (email only; the response is **byte-identical**
+  whether or not the address has an account — the difference is two distinct
+  audit actions, nothing more) and `POST /auth/password/reset`. A token lasts
+  30 minutes, is single-use, and unknown / expired / already-used all answer
+  the same `RESET_TOKEN_INVALID`. **Reset does not log the user in** — no user,
+  no cookies; they sign in with the new password.
+  **It does not work in production yet**: like the unlock OTP, delivery is
+  unbuilt, so `deliverPasswordReset` prints to the dev console behind
+  `mayPrintResetToken(NODE_ENV)` and logs a warning in production. Same open
+  question, same one function body to change.
+- **`POST /auth/password/change`** (authenticated) verifies the current
+  password, then revokes **every** refresh token and reissues a fresh family to
+  the caller in one transaction: still signed in here, signed out everywhere
+  else. A wrong current password is a **400 `PASSWORD_INCORRECT`, never a
+  401** — a 401 sends the web client through refresh-and-retry and would sign
+  someone out for a typo.
+- **Access tokens cannot be revoked early.** Reset and change-password both
+  kill every refresh token, but an already-issued access token stays valid for
+  up to **15 minutes** — it just cannot be renewed. Accepted deliberately; the
+  two alternatives (a `tokenVersion` column, a jti denylist) and why they were
+  not taken are in `docs/decisions.md`.
+- **`PATCH /auth/profile`** updates the **name and nothing else**.
+  `updateProfileSchema` is `.strict()`, so a body also carrying `email` or
+  `phone` is a 400 — both are identifiers needing a verification flow that does
+  not exist, and silently ignoring them would look like a change that worked.
 - Cookies are `httpOnly`, `sameSite=lax`, `secure` in production. **This requires
   web and API to be same-site in production.** The mobile app will need a bearer
   token flow, not cookies.
@@ -249,6 +281,15 @@ interface DeviceGateway {
 
 ## Frontend Pages
 - `/signup`, `/login`
+- `/forgot-password` — email field; the confirmation panel is worded to be true
+  for a registered and an unregistered address alike, since the API answers
+  identically. In mock mode it shows the token and a link, guarded like
+  `peekMockUnlockCode`.
+- `/reset-password?token=…` — new password + confirm. Distinct states for a
+  missing token, a dead link and success. **Ends at "sign in", not signed in.**
+- `/account` — name (editable), email and phone (read-only, with the reason),
+  and change-password. Two independent forms: a password change ends every
+  other session and a name change does not, so they do not share a button.
 - `/pay` — plan/price + Razorpay Checkout
 - `/dashboard` — safe status card, Lock / Unlock buttons, last activity
 - `/dashboard/unlock` — OTP entry (6 input boxes, resend timer 30s)
@@ -288,6 +329,8 @@ RAZORPAY_KEY_SECRET=xxxxx
 RAZORPAY_WEBHOOK_SECRET=xxxxx
 OTP_HMAC_SECRET=change_me     # REQUIRED, 32+ chars; keys the unlock-code HMAC.
                               # Keep it separate from JWT_ACCESS_SECRET.
+                              # Password reset needs NO secret of its own — its
+                              # tokens are 32 random bytes under a plain sha256.
 DEVICE_GATEWAY=mock           # mock (only value today; mqtt arrives with hardware)
 # Not yet used — added with WhatsApp delivery and the MQTT gateway:
 # SMS_PROVIDER_API_KEY=xxxxx
@@ -315,7 +358,7 @@ npm run dev:api                              # tsx watch, :4000  (separate termi
 npm run dev:web                              # next dev,   :3000  (separate terminal)
 npm --workspace apps/api run prisma:migrate  # prisma migrate dev
 npm --workspace apps/api run db:seed         # create/update the ADMIN from SEED_ADMIN_*
-npm --workspace apps/api run db:cleanup-tokens  # prune dead refresh tokens
+npm --workspace apps/api run db:cleanup-tokens  # prune dead refresh + reset tokens
 npm test                                     # vitest + supertest against safelock_test
 npm run lint && npm run typecheck            # runs across all workspaces
 ```
@@ -341,6 +384,13 @@ portable to PowerShell, so use two terminals.
   API console only, so unlock works in development and **not in production**:
   `deliverOtp` logs a warning and sends nothing there. WhatsApp vs SMS vs email needs
   deciding before launch. One function body to change.
+  — **Password reset has the same gap, and is blocked on the same decision.**
+  `deliverPasswordReset` prints to the dev console behind
+  `mayPrintResetToken(NODE_ENV)` and sends nothing in production, so
+  `/forgot-password` works in development and **cannot work in production until
+  a channel exists**. Reset is email-shaped and the OTP is phone-shaped, so this
+  may well be two providers rather than one — but neither is built, and shipping
+  the account pages without saying so would be worse than the gap.
 - ~~Auto-allocation vs manual admin allocation~~ → **manual by ADMIN now**, with
   `allocateDevice()` ready for the webhook to call. Decide when to switch it on.
 - **Serial number format is provisional** (`^SAFE-[0-9A-Z]{4,12}$`). Confirm what the
@@ -386,10 +436,17 @@ portable to PowerShell, so use two terminals.
    a `Notification` table written through the `Notifier` seam inside the
    unlock transaction, `/notifications` list + idempotent mark-read, the
    `/history` page and a polling header bell. Retention is still open.
-6. Real hardware via MQTT — also brings the `Command` table, command nonces and the
+6. ✅ Account management — password reset (`/auth/password/forgot|reset`, one
+   live single-use token, byte-identical responses, no auto-login),
+   `POST /auth/password/change` (revoke-all-then-reissue), `PATCH /auth/profile`
+   (name only, `.strict()`), the `/forgot-password`, `/reset-password` and
+   `/account` pages, plus a polish pass (mock badge unstuck from the sticky
+   history headings, `prefers-reduced-motion` honoured). **Reset delivery is
+   not built**, so it works in development only.
+7. Real hardware via MQTT — also brings the `Command` table, command nonces and the
    15s ack timeout, all deliberately deferred until there is a transport that can
    lose a message
-7. Convert to mobile app (reuse `/api/v1`)
+8. Convert to mobile app (reuse `/api/v1`)
 
 **Postponed (deliberately not built):** WhatsApp/SMS phone verification. There
 is no `phoneVerifiedAt` column and no `requireVerifiedPhone` middleware. The

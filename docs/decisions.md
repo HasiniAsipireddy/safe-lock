@@ -1143,3 +1143,96 @@ flight to a physical safe — is exactly when a user should not be guessing.
 Every spinner already sits beside its own text and an `aria-busy` /
 `role="status"`, so the information survives regardless; the exception just
 keeps the visual affordance for people who can see it.
+
+---
+
+## 2026-10-16 — Reset tokens are a plain SHA-256, and the OTP is not
+
+**Decision:** `PasswordResetToken.tokenHash` is `sha256(token)` — the same
+construction as `RefreshToken`, with **no keyed HMAC and no new environment
+variable**. `RESET_TOKEN_HMAC_SECRET` was considered and deliberately not
+added.
+
+**Why, and why the OTP differs:** an unkeyed hash is reversible exactly when
+the input space is small enough to enumerate. A reset token is 32 bytes from
+`crypto.randomBytes` — 2^256 possibilities, so someone holding a database dump
+has a digest and no path back to the token. The unlock OTP is an HMAC under
+`OTP_HMAC_SECRET` because a 6-digit code has **10^6** possibilities, which the
+same attacker walks in milliseconds; there, the key living outside the database
+is the only thing that makes the stored digest useless. Same table, same
+threat, different answers, because the entropy is different by 70 orders of
+magnitude.
+
+A secret that protects nothing is not free: it is another required variable in
+every deployment, another thing to rotate, and another way for the API to fail
+to boot. The *structural* properties are what matter here and both are kept —
+the raw token is never stored, never logged (`mayPrintResetToken` gates the dev
+console print exactly like `mayPrintOtp`), never returned in a response body,
+and never written to an audit row. Tests assert all four.
+
+**Consequence:** nothing needs adding to `apps/api/.env` for password reset.
+
+---
+
+## 2026-10-16 — Reset does not sign anyone in; change-password revokes all and reissues
+
+**Decision:** `POST /auth/password/reset` returns `{ status: 'ok' }` — no user,
+no cookies — and the UI sends the visitor to `/login`. `POST
+/auth/password/change` revokes **every** refresh token for the user and issues
+the caller a fresh family in the same transaction, so they stay signed in on
+the device they used and are signed out everywhere else.
+
+**Why reset does not log in:** holding a reset link proves control of a
+delivery channel, not that the holder is the account owner. A link can be
+forwarded, sit in a shared browser's history, or be read on a screen someone
+else can see. "You may set a password, now sign in with it" costs the
+legitimate user one extra step and costs an opportunist the entire session.
+
+**Why change-password reissues rather than just revoking:** changing a password
+is how someone evicts a session they no longer trust, so revoking nothing makes
+the feature cosmetic. But revoking everything *including the tab in front of
+you* logs people out for doing the right thing, which teaches them not to do it
+again. All three steps are one transaction — revoke and reissue separately
+leaves a window where the caller holds no valid refresh token, and a parallel
+request landing in that window is indistinguishable from a replay.
+
+**A wrong current password is a 400 `PASSWORD_INCORRECT`, never a 401.** The
+web client treats 401 as "session expired" and runs its shared
+refresh-and-retry path; a 401 here would mean mistyping your own password
+signed you out. The session is in fact perfectly valid — only the submitted
+credential was wrong.
+
+---
+
+## 2026-10-16 — Access tokens stay un-revocable for up to 15 minutes
+
+**Decision:** Password reset and change-password both revoke every *refresh*
+token. Neither can invalidate an **access** token that has already been issued:
+it is a stateless signed JWT, so another device's access token keeps working
+until it expires — at most 15 minutes — it simply cannot be renewed. This
+window is accepted and nothing new is built to close it.
+
+**Two options were considered and not taken:**
+
+1. **A `tokenVersion` column on `User`, checked on every request.** Bumping it
+   on a password change would invalidate every outstanding access token
+   immediately. The cost is that every authenticated request becomes a database
+   read, which is precisely the property the stateless access token exists to
+   avoid — and it would apply to all traffic, forever, to shorten a 15-minute
+   window on a rare event.
+2. **A revocation list (a denylist of jti claims) in memory or Redis.** Same
+   per-request lookup, plus state to replicate and expire, plus a new failure
+   mode: if the list is unreachable the service has to choose between refusing
+   every request and trusting every token.
+
+**Why 15 minutes is acceptable here:** the attacker this protects against
+already had a live session. What a reset or a change takes away is their
+*ability to keep it* — within a quarter of an hour they are locked out, with no
+way back in, and the owner holds the only working password. Shrinking
+`ACCESS_TOKEN_TTL` shrinks the window further and needs no new code if that
+trade ever looks wrong.
+
+**Revisit if** an "end all other sessions now" control is ever user-facing. A
+button that promises immediate eviction and delivers it in up to 15 minutes is
+a different thing from an invisible implementation detail, and that promise
+would justify option 1.
