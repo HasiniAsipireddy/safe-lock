@@ -328,7 +328,8 @@ describe('an unconfigured app secret', () => {
    */
   it('rejects rather than throwing when there is no secret to verify with', async () => {
     const original = env.WHATSAPP_APP_SECRET;
-    // @ts-expect-error — deliberately unsetting a validated value for this test.
+    // Deliberately unset: the variable is optional in the schema (it is only
+    // required in cloud mode), so this is a reachable configuration.
     env.WHATSAPP_APP_SECRET = undefined;
 
     try {
@@ -338,7 +339,6 @@ describe('an unconfigured app secret', () => {
       expect(response.status).toBe(401);
       expect(response.body.error.code).toBe('INVALID_SIGNATURE');
     } finally {
-      // @ts-expect-error — restoring it.
       env.WHATSAPP_APP_SECRET = original;
     }
   });
