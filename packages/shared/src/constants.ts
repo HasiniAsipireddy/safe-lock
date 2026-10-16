@@ -66,6 +66,49 @@ export const ERROR_CODES = {
    */
   PASSWORD_INCORRECT: 'PASSWORD_INCORRECT',
 
+  // --- Rental bookings ------------------------------------------------------
+  /**
+   * The caller has no booking that entitles them to operate a safe.
+   *
+   * Covers "never booked", "booking ended", "cancelled" and "hold lapsed" with
+   * one code: from the dashboard's point of view they are the same situation —
+   * book a safe — and the booking record itself says which it was.
+   */
+  NO_ACTIVE_BOOKING: 'NO_ACTIVE_BOOKING',
+  /**
+   * An overstay fee is outstanding.
+   *
+   * **Unlock and collect are refused; lock is not.** Refusing to let someone
+   * secure a safe would punish them in the one direction that creates risk.
+   * Paying opens a collection window.
+   */
+  OVERSTAY_PAYMENT_REQUIRED: 'OVERSTAY_PAYMENT_REQUIRED',
+  /** No booking with that id, or it belongs to someone else. */
+  BOOKING_NOT_FOUND: 'BOOKING_NOT_FOUND',
+  /** The user already holds a live booking. One at a time. */
+  BOOKING_ALREADY_EXISTS: 'BOOKING_ALREADY_EXISTS',
+  /** The action needs a booking in a state this one is not in. */
+  BOOKING_STATE_INVALID: 'BOOKING_STATE_INVALID',
+  /** Every safe is booked for the requested window. */
+  NO_DEVICES_AVAILABLE: 'NO_DEVICES_AVAILABLE',
+  /**
+   * The device was taken by another booking between this one being created and
+   * its payment arriving. The payment is flagged for a manual refund.
+   */
+  DEVICE_NO_LONGER_AVAILABLE: 'DEVICE_NO_LONGER_AVAILABLE',
+  /** An extension would collide with a later booking, or is too late. */
+  EXTENSION_NOT_AVAILABLE: 'EXTENSION_NOT_AVAILABLE',
+  /** An overstay order was requested with no fee outstanding. */
+  NOTHING_TO_PAY: 'NOTHING_TO_PAY',
+  /**
+   * Money arrived that we could not apply. The row stays PAID and is listed
+   * for an admin to refund by hand — we never pretend a payment did not
+   * happen.
+   */
+  PAYMENT_NEEDS_REVIEW: 'PAYMENT_NEEDS_REVIEW',
+  /** The safe has not been inspected since its last booking ended. */
+  DEVICE_NEEDS_INSPECTION: 'DEVICE_NEEDS_INSPECTION',
+
   // --- Phone verification / WhatsApp ----------------------------------------
   /**
    * Unlock requires a verified phone number, because that is where the
