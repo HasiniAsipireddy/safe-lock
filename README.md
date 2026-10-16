@@ -11,10 +11,14 @@ packages/shared Types, zod schemas and constants used by both
 ```
 
 **Built so far:** auth (signup / login / rotating sessions), the one-time
-Razorpay payment flow, the legal pages, and device inventory + manual
-allocation with an admin panel. Lock/unlock, OTP and phone verification are
-**not** built yet — the safe card's Lock and Unlock buttons are deliberately
-disabled.
+Razorpay payment flow, the legal pages, device inventory + manual allocation
+with an admin panel, and **remote lock / unlock with a one-time code** against
+a mock device.
+
+**Not built yet:** real hardware (the gateway is a mock that always acks), the
+`/history` page, phone verification, and **OTP delivery** — codes are printed
+to the API console in development and are *not* sent anywhere in production.
+Pick a channel before launch; see `docs/decisions.md`.
 
 ---
 
@@ -39,7 +43,9 @@ npm run db:up
 
 # Backend config. The committed example already points at the Docker database.
 cp apps/api/.env.example apps/api/.env
-# Then: generate real JWT secrets and paste in your Razorpay test keys.
+# Then: generate secrets and paste in your Razorpay test keys. JWT_ACCESS_SECRET
+# and OTP_HMAC_SECRET are both required, both 32+ chars, and should be DIFFERENT
+# values — rotating one should not invalidate the other. Run this twice:
 node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
 
 # Frontend config.
@@ -342,6 +348,44 @@ user is refused with `402 NOT_PAID` and the failure is audited.
   hardware is never retired out of someone's hands.
 
 Both ask for confirmation.
+
+## Locking and unlocking
+
+Once a safe is allocated, its owner gets working controls on `/dashboard`.
+
+**Lock** is one tap plus a confirmation. It is idempotent — locking an
+already-locked safe is a success that sends no command, not a 409.
+
+**Unlock** always costs a one-time code:
+
+1. Tap **Unlock**. The API creates a challenge and generates a 6-digit code.
+2. In development the code is **printed to the API terminal**:
+   ```
+   [dev] Unlock code for SAFE-0001: 418290  (expires 2026-10-16T05:12:44.901Z)
+   ```
+   In mock mode (no backend) it is shown in an amber panel in the dialog
+   instead. In production nothing is sent yet — pick a delivery channel first.
+3. Type or paste it. 5 minutes, single use, 5 wrong attempts before the
+   challenge dies. Requesting a new code kills the old one.
+
+Both routes refuse anyone who is not entitled, with a code the UI can act on:
+
+| Code | Status | Meaning |
+| --- | --- | --- |
+| `NOT_PAID` | 402 | No settled payment. Paying fixes it. |
+| `REFUNDED_CONTACT_SUPPORT` | 403 | Refunded but still holding the safe. Paying does **not** fix it. |
+| `NO_DEVICE` | 409 | Paid, waiting for an admin to allocate. |
+| `DEVICE_STATE_UNKNOWN` | 409 | The safe is not reporting a state. Should be unreachable. |
+| `OTP_INVALID` / `OTP_EXPIRED` / `OTP_TOO_MANY_ATTEMPTS` / `OTP_NOT_FOUND` | 400 | Code problems. |
+
+Every state change writes a `DeviceEvent` (the owner's activity feed, which
+`/history` will read) **and** an `AuditLog` row. Failed code attempts are
+written to both as well — a run of them against one account is worth seeing.
+Neither ever contains the code.
+
+The device layer behind all of this is one interface, `DeviceGateway`, with a
+mock implementation that always acks after a short delay. Swapping in the real
+MQTT gateway touches no route. See `docs/decisions.md`.
 
 ### Refunded users who still hold a safe
 

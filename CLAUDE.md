@@ -56,11 +56,23 @@ middleware/    # auth, rateLimit, validate, errorHandler
   widens what a database leak exposes.
 - **WebhookEvent**: id, eventId (unique — Razorpay's `x-razorpay-event-id`), type, processedAt
   — the idempotency ledger. An event id already present is acknowledged and dropped.
-- **Device** (safe lock): id, serialNumber (unique), status (`UNASSIGNED` | `ASSIGNED` | `RETIRED`), lockState (`LOCKED` | `UNLOCKED` | `UNKNOWN`, default `UNKNOWN`), online (bool), lastSeenAt, **ownerId (nullable, UNIQUE — one device per user)**, allocatedAt, credentialHash (nullable, reserved for the hardware phase)
+- **Device** (safe lock): id, serialNumber (unique), status (`UNASSIGNED` | `ASSIGNED` | `RETIRED`), lockState (`LOCKED` | `UNLOCKED` | `UNKNOWN`, **default `LOCKED`**), lockStateUpdatedAt, online (bool), lastSeenAt, **ownerId (nullable, UNIQUE — one device per user)**, allocatedAt, credentialHash (nullable, reserved for the hardware phase)
   — `credentialHash` is **never populated or returned** today and appears in no `select` list.
   The unique `ownerId`, not just a service check, is what makes concurrent allocation safe.
-- **OtpRequest**: id, userId, deviceId, purpose (`UNLOCK`), codeHash, expiresAt, attempts, consumedAt, createdAt
-- **Command**: id, deviceId, userId, type (`LOCK` | `UNLOCK`), status (`PENDING` | `SENT` | `ACKED` | `FAILED` | `TIMEOUT`), createdAt, ackedAt
+  — An **allocated** device is never `UNKNOWN`: allocation sets `LOCKED`, unassign sets
+  `UNKNOWN`. `lockStateUpdatedAt` is the last **acked** state change, so it stays null
+  through allocation — neither of those is a device ack.
+- **UnlockChallenge**: id, userId, deviceId, otpHash, expiresAt, attempts, consumedAt, createdAt
+  — only `HMAC-SHA256(code, OTP_HMAC_SECRET)` is stored. A 6-digit space is 10^6, so a
+  slow hash buys nothing; the key living outside the database is what protects it.
+  A new request **consumes any older open challenge**, so one code is live at a time.
+- **DeviceEvent**: id, deviceId, userId, type (`LOCK` | `UNLOCK_REQUESTED` |
+  `UNLOCK_CONFIRMED` | `UNLOCK_FAILED`), source (`WEB`), requestId, createdAt
+  — the **user-visible** activity feed `/history` will read, indexed on
+  `[userId, createdAt]`. Distinct from `AuditLog`, which is the internal security trail.
+- ~~**Command**~~ — **deferred to the MQTT gateway.** The mock acks synchronously, so
+  there is nothing in flight to track and nothing to time out. Command ids/nonces and the
+  15s timeout land with it. See `docs/decisions.md`.
 - **RefreshToken**: id, userId, tokenHash (unique — sha256 of an opaque token; the raw value is never stored), familyId, expiresAt, revokedAt, replacedById, graceUsedAt, userAgent, ip, createdAt
 - **AuditLog**: id, userId, deviceId, action, ip, userAgent, metadata (json), createdAt
 
@@ -143,24 +155,42 @@ middleware/    # auth, rateLimit, validate, errorHandler
 - Max 5 wrong attempts per OTP, then invalidate it.
 - Rate limit OTP sending: e.g. max 3 requests / 10 minutes / user, plus per-IP limit.
 - OTP is bound to `userId` + `deviceId` + purpose; reject if any mismatch.
-- Never log OTPs or return them in API responses (in dev only, a mock notifier may print to console behind `NODE_ENV !== 'production'`).
-- Endpoints:
-  - `POST /api/v1/devices/:id/unlock/request-otp`
-  - `POST /api/v1/devices/:id/unlock/verify` `{ otp }` -> on success creates an `UNLOCK` command.
+- Never log OTPs or return them in API responses. The dev console print is guarded by
+  `mayPrintOtp(NODE_ENV)` in `otp.service.ts` — true only for `development`/`test`, so an
+  unset or misspelled `NODE_ENV` falls through to silence, not to printing a code.
+- A new request **invalidates the previous challenge**, so exactly one code is ever live.
+  Without that, "5 attempts per challenge" silently becomes "5 attempts per request".
+- Endpoints (no device id in the path — the device is resolved from the session, so
+  there is no id a caller could substitute):
+  - `POST /api/v1/devices/unlock/request`
+  - `POST /api/v1/devices/unlock/confirm` `{ otp }` -> on success sends the unlock command.
+- Failures are **400s with distinct codes** (`OTP_INVALID`, `OTP_EXPIRED`,
+  `OTP_TOO_MANY_ATTEMPTS`, `OTP_NOT_FOUND`) — not 429 for the attempt limit, which the
+  client reads as "back off and retry" when the challenge is in fact dead.
 
 ## Device / Hardware Layer
-Define one interface and keep everything else hardware-agnostic:
+Define one interface and keep everything else hardware-agnostic
+(`apps/api/src/lib/deviceGateway/`):
 ```ts
-interface DeviceDriver {
-  sendCommand(deviceId: string, type: 'LOCK' | 'UNLOCK'): Promise<void>;
-  getState(deviceId: string): Promise<{ lockState: string; online: boolean }>;
+interface DeviceGateway {
+  readonly name: string;
+  sendLock(serialNumber: string): Promise<DeviceCommandResult>;
+  sendUnlock(serialNumber: string): Promise<DeviceCommandResult>;
 }
 ```
-- `MockDriver` (now): simulates delay + random ack, updates DB state.
-- `MqttDriver` (later): topics like `safes/{serial}/cmd` and `safes/{serial}/state`; TLS + per-device credentials/certs; device sends an **ack** with the command id.
-- Commands are time-limited (e.g. 15s). If no ack -> mark `TIMEOUT` and show the user "device not responding".
-- Commands must include a nonce/command id + timestamp to prevent replay.
-- UI should reflect real state from device ack, not just "button pressed".
+- **Two methods, not one `sendCommand(type)`** — unlocking has a precondition
+  (a verified OTP) that locking does not, and the asymmetry should be visible
+  at every call site.
+- **The interface takes a serial number and nothing else**: no user, no payment
+  state, no request. Authorisation is settled before anything reaches a gateway.
+- `MockDeviceGateway` (now): small delay, **always acks** — a flaky mock makes
+  every test flaky. Selected by `DEVICE_GATEWAY=mock`.
+- `MqttGateway` (later): topics like `safes/{serial}/cmd` and `safes/{serial}/state`; TLS + per-device credentials/certs; device sends an **ack** with the command id.
+- Commands will be time-limited (e.g. 15s). If no ack -> mark `TIMEOUT` and show the user "device not responding". **Not built yet** — see the `Command` note above.
+- Commands must include a nonce/command id + timestamp to prevent replay. **Also deferred**: the mock cannot lose or replay a message.
+- UI reflects real state from the device ack, not "button pressed": `lockState`
+  only moves when a command is **acked**, and the dashboard renders what the
+  server returned rather than an optimistic guess.
 
 ## API Conventions
 - Base path `/api/v1`, JSON only, consistent error shape: `{ "error": { "code": "...", "message": "..." } }`.
@@ -215,13 +245,14 @@ SAFE_PRICE_PAISE=99900        # paise; the ONLY source of the price
 RAZORPAY_KEY_ID=rzp_test_xxxxx
 RAZORPAY_KEY_SECRET=xxxxx
 RAZORPAY_WEBHOOK_SECRET=xxxxx
-# Not yet used — added with the OTP / device work:
-# OTP_HMAC_SECRET=change_me
+OTP_HMAC_SECRET=change_me     # REQUIRED, 32+ chars; keys the unlock-code HMAC.
+                              # Keep it separate from JWT_ACCESS_SECRET.
+DEVICE_GATEWAY=mock           # mock (only value today; mqtt arrives with hardware)
+# Not yet used — added with WhatsApp delivery and the MQTT gateway:
 # SMS_PROVIDER_API_KEY=xxxxx
 # MQTT_URL=mqtts://broker.example.com
 # MQTT_USERNAME=
 # MQTT_PASSWORD=
-# DEVICE_DRIVER=mock   # mock | mqtt
 ```
 
 Frontend (`apps/web/.env.local`):
@@ -265,7 +296,10 @@ portable to PowerShell, so use two terminals.
 ## Open Questions (to decide)
 - ~~Price and plan structure~~ → **provisionally** one-time ₹999 (`SAFE_PRICE_PAISE=99900`),
   changeable via env. Confirm the real figure and whether GST is included.
-- OTP channel: SMS, email, or both?
+- **OTP channel — still open and now user-facing.** Codes are currently printed to the
+  API console only, so unlock works in development and **not in production**:
+  `deliverOtp` logs a warning and sends nothing there. WhatsApp vs SMS vs email needs
+  deciding before launch. One function body to change.
 - ~~Auto-allocation vs manual admin allocation~~ → **manual by ADMIN now**, with
   `allocateDevice()` ready for the webhook to call. Decide when to switch it on.
 - **Serial number format is provisional** (`^SAFE-[0-9A-Z]{4,12}$`). Confirm what the
@@ -293,10 +327,16 @@ portable to PowerShell, so use two terminals.
 3. ✅ Device inventory + allocation (admin) — `Device` model, `allocateDevice` with
    SKIP LOCKED, `requireAdmin`, `/admin` panel (devices / users / payments / audit),
    `GET /devices/mine`, dashboard allocation states
-4. Lock/Unlock flow with OTP using MockDriver
-   — **must require paid AND assigned device**; unlock additionally requires a valid OTP
-5. Audit log + history page (the `AuditLog` table and writes exist; the `/history` page does not)
-6. Real hardware via MQTT
+4. ✅ Lock/Unlock flow with OTP using `MockDeviceGateway` — `assertCanOperate`
+   (paid AND assigned, with `REFUNDED_CONTACT_SUPPORT` kept distinct from
+   `NOT_PAID`), `POST /devices/lock|unlock/request|unlock/confirm`, HMAC'd
+   single-use codes, `DeviceEvent` + `AuditLog` on every state change,
+   row-locked transactions, dashboard controls and OTP dialog
+5. Audit log + history page (`AuditLog` and `DeviceEvent` writes exist; the `/history`
+   page does not — it reads `DeviceEvent`, not `AuditLog`)
+6. Real hardware via MQTT — also brings the `Command` table, command nonces and the
+   15s ack timeout, all deliberately deferred until there is a transport that can
+   lose a message
 7. Convert to mobile app (reuse `/api/v1`)
 
 **Postponed (deliberately not built):** WhatsApp/SMS phone verification. There

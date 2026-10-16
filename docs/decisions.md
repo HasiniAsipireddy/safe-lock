@@ -759,3 +759,183 @@ literal text and the table survives.
 query, so handlers receive a `page` that is a number and a `q` within the cap
 rather than raw strings. Express 5 exposes `req.query` as a getter, so it is
 redefined rather than assigned.
+
+---
+
+## 2026-10-16 — OTP: 6 digits, 5 minutes, 5 attempts, one live code at a time
+
+**Decision:** An unlock code is 6 digits from `crypto.randomInt`, valid for 5
+minutes, single-use, with 5 wrong attempts before the challenge is invalidated
+outright. Requesting a new code **consumes any older open challenge** for that
+user and device, so at most one code is live at any moment. The parameters live
+in `packages/shared/src/schemas/devices.ts`, not in the API.
+
+**Why one live code matters more than the other three numbers:** leaving the
+previous code valid turns "5 attempts per challenge" into "5 attempts per
+*request*", and the request endpoint is the one a user can trigger repeatedly.
+The attempt limit would then be decorative. The rate limits (3 codes / 10 min
+per user, 10 per IP) are the second half of the same rule.
+
+**Why the numbers are what they are:** 6 digits and 5 minutes come from
+CLAUDE.md's OTP rules and match what people expect from a bank. 5 attempts is
+generous enough for a mistyped digit and still leaves a guesser a 5-in-10^6
+chance per challenge.
+
+**Consequence:** a burned challenge is a 400 with `OTP_TOO_MANY_ATTEMPTS`, not
+a 429 — the client already reads 429 as "the rate limiter, back off and retry",
+and a dead challenge is not retryable. All four OTP failures
+(`OTP_INVALID`, `OTP_EXPIRED`, `OTP_TOO_MANY_ATTEMPTS`, `OTP_NOT_FOUND`) are
+400s carrying distinct codes; the UI switches on the code, not the status.
+
+---
+
+## 2026-10-16 — OTPs are stored as a keyed HMAC, not a slow hash
+
+**Decision:** `UnlockChallenge.otpHash` is `HMAC-SHA256(code, OTP_HMAC_SECRET)`.
+Not bcrypt, not argon2, not a bare SHA-256. `OTP_HMAC_SECRET` is a new
+**required** environment variable (32+ chars) and the API refuses to boot
+without it.
+
+**Why not a slow hash:** a 6-digit code has 10^6 possible values. Someone
+holding a database dump can enumerate all of them against bcrypt too — it costs
+them minutes instead of milliseconds, which is not a security boundary for a
+credential that is valid for five of them. What actually makes the stored digest
+useless is a key that is **not in the database**. That is what an HMAC gives and
+a password hash does not.
+
+**Why a separate secret from `JWT_ACCESS_SECRET`:** they protect different
+things with different lifetimes. Sharing one means rotating it invalidates every
+session and every outstanding code at once, and makes a leak of either twice as
+expensive.
+
+**Consequence:** comparison is `timingSafeEqual` over the two *hashes*, so both
+sides are a fixed length — the function cannot throw on a length mismatch, and
+the comparison leaks nothing about how many leading digits were right. A
+malformed stored hash returns false rather than a 500. Tests assert the digest
+is not a bare `sha256('123456')`, which would mean the secret was not in play.
+
+---
+
+## 2026-10-16 — What is logged, and what the OTP never touches
+
+**Decision:** The plaintext code leaves `otp.service.ts` exactly twice: to the
+notifier, and — outside production — to `console.log`. It is never in a response
+body, an audit row, a `DeviceEvent`, or a pino log line.
+
+**The production guard is `mayPrintOtp(nodeEnv)`**, a pure function exported so
+it can be tested directly. It returns true only for `development` and `test`.
+Anything else — `production`, a typo, an unset `NODE_ENV` — is false: the
+default must be silence, not printing a working unlock code into whatever
+collects stdout. In production with no delivery channel configured the service
+logs a warning and sends nothing, which is the correct failure mode.
+
+**Why `console.log` rather than the logger:** pino output is shipped to log
+storage, and a code that reaches log storage has outlived its five minutes. The
+dev line is for a developer watching their own terminal. It is the only
+`console` call in the API and carries a narrow eslint-disable saying so.
+
+**What the audit trail holds instead:** `device.unlock.otp_failed` records a
+`reason` from a fixed enum (`wrong_code`, `expired`, `attempts_exhausted`,
+`no_challenge`) and the error code. Nothing the user typed and nothing derived
+from it. The audit service's existing key filter already drops anything matching
+`otp|hash|token|secret`, so a future careless metadata key is caught too.
+
+**Consequence:** tests read the code back off the dev console line rather than
+reaching into the service, which means they exercise the real delivery path —
+and a test fails loudly if that print is ever removed. A separate test asserts
+the code appears in no response, no audit row, no event and no device column.
+
+---
+
+## 2026-10-16 — `DeviceGateway`, and why it takes no user
+
+**Decision:** The hardware seam is `DeviceGateway` (`sendLock`, `sendUnlock`) in
+`apps/api/src/lib/deviceGateway/`, with `MockDeviceGateway` today and an MQTT
+implementation later, selected by the `DEVICE_GATEWAY` env enum. This supersedes
+the `DeviceDriver` / `sendCommand(deviceId, type)` sketch in CLAUDE.md, which
+has been updated to match.
+
+**Why two methods rather than one `sendCommand(type)`:** the two are not
+interchangeable. Unlocking has a precondition — a verified OTP — that locking
+does not, and a single parameterised method invites a caller to pass a variable
+where the OTP check has already been skipped. Two methods make the asymmetry
+visible at every call site.
+
+**Why the interface takes a serial number and nothing else:** no user id, no
+payment state, no request object. Authorisation is settled before anything
+reaches a gateway. A transport that could see who is asking is a transport that
+could be made to decide, and that decision belongs in one place.
+
+**The mock always acks** rather than failing randomly. A flaky mock makes every
+test flaky; the failure path is better exercised by a test that stubs the
+gateway than by a coin flip in production code.
+
+---
+
+## 2026-10-16 — The `Command` table and the 15s timeout are deferred to MQTT
+
+**Decision:** CLAUDE.md's `Command` model (`PENDING` / `SENT` / `ACKED` /
+`FAILED` / `TIMEOUT`) is **deliberately not built**. `DeviceEvent` records what
+happened; there is no row representing a command in flight.
+
+**Why:** the mock gateway acks synchronously, in-process. There is nothing
+asynchronous to track and nothing that can time out, so a `Command` table today
+would be a column of rows that are `ACKED` the microsecond they are created —
+a schema that looks load-bearing and is not. A half-built state machine is worse
+than none: the first real MQTT ack would have to be retrofitted into whatever
+shape we guessed at here.
+
+**What this defers, explicitly:** command ids and nonces for replay protection,
+the 15-second timeout and its `TIMEOUT` state, and "device not responding" in
+the UI. All of them are properties of a transport that can lose a message, which
+the mock cannot.
+
+**Consequence:** the lock/unlock service calls the gateway **inside** the
+database transaction, while holding the device row lock. That is correct and
+simple for an in-process mock. It is **not** acceptable over MQTT — a row lock
+held across a radio round trip will serialise the fleet — so the MQTT work must
+move to a claim-then-ack model, which is exactly what `Command` is for. The
+comment on `lockDevice()` says so at the call site.
+
+---
+
+## 2026-10-16 — `online` is mock-only, and not an eligibility gate
+
+**Decision:** `Device.online` and `lastSeenAt` are set to `true` / now whenever
+the mock gateway acks. Being offline does **not** block a lock or unlock
+command.
+
+**Why:** the mock is always reachable, so an offline check today would be
+unreachable code — a gate that has never once refused anything, which is the
+kind of code that quietly stops working. The honest version is to let the
+command fail at the transport and report that.
+
+**Revisit with real hardware.** Then `online` becomes a real signal with a
+heartbeat behind it, and there are genuine decisions to make: refuse a command
+to a safe that has not been seen for an hour, or send it and let it time out?
+Show the last known state with its age, or refuse to state one? Those are
+answerable once there is a device that can actually go quiet.
+
+---
+
+## 2026-10-16 — An allocated device is never `UNKNOWN`
+
+**Decision:** `Device.lockState` defaults to `LOCKED`, allocation re-asserts
+`LOCKED`, and unassigning sets `UNKNOWN`. `UNKNOWN` stays in the enum.
+
+**Why keep `UNKNOWN` at all:** a safe nobody owns genuinely has an unknown
+state — it is in transit, in a cupboard, or in someone's hands, and nothing is
+watching it. Removing the value would force a lie. Real hardware will need it
+too, for a device that has never reported in.
+
+**Why an owned device must never be in it:** there is no sensible UI for it. The
+dashboard cannot offer controls whose effect it cannot predict, so
+`assertCanOperate` refuses with `DEVICE_STATE_UNKNOWN` and the card shows "state
+unavailable" with both buttons disabled. That path should be unreachable; it
+exists so that if it ever happens, the product says so rather than guessing.
+
+**Consequence:** a backfill migration moves existing `ASSIGNED` rows from
+`UNKNOWN` to `LOCKED`. Without it every user allocated before this change would
+have found their new controls dead. `lockStateUpdatedAt` is deliberately left
+null by allocation and unassign: it means "last state the hardware confirmed",
+and neither of those is an ack.
