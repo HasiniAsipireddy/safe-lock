@@ -6,12 +6,14 @@ import {
   type DeviceSummary,
   type LockResponse,
   type UnlockConfirmResponse,
+  type UnlockFailureReason as StoredUnlockFailureReason,
   type UnlockRequestResponse,
 } from '@safelock/shared';
 import { prisma, type PrismaTransaction } from '../../lib/prisma';
 import { HttpError, conflict } from '../../lib/httpError';
 import { deviceGateway } from '../../lib/deviceGateway';
 import { logger } from '../../lib/logger';
+import { notifier } from '../../lib/notifier';
 import { userHasPaid } from '../users/user.mapper';
 import { DEVICE_SUMMARY_SELECT, toDeviceSummary } from './device.mapper';
 import { deliverOtp, generateOtp, hashOtp, verifyOtp } from './otp.service';
@@ -147,7 +149,12 @@ async function lockDeviceRow(tx: PrismaTransaction, deviceId: string): Promise<v
   await tx.$queryRaw`SELECT "id" FROM "Device" WHERE "id" = ${deviceId} FOR UPDATE`;
 }
 
-/** Records a user-visible device event. Never carries a code or a hash. */
+/**
+ * Records a user-visible device event. Never carries a code or a hash.
+ *
+ * Returns the new row's id so a notification can point at it in the same
+ * transaction.
+ */
 async function recordEvent(
   tx: PrismaTransaction | typeof prisma,
   input: {
@@ -155,17 +162,22 @@ async function recordEvent(
     userId: string;
     type: 'LOCK' | 'UNLOCK_REQUESTED' | 'UNLOCK_CONFIRMED' | 'UNLOCK_FAILED';
     requestId: string | null;
+    failureReason?: StoredUnlockFailureReason | undefined;
   },
-): Promise<void> {
-  await tx.deviceEvent.create({
+): Promise<string> {
+  const event = await tx.deviceEvent.create({
     data: {
       deviceId: input.deviceId,
       userId: input.userId,
       type: input.type,
       source: 'WEB',
       requestId: input.requestId,
+      ...(input.failureReason ? { failureReason: input.failureReason } : {}),
     },
+    select: { id: true },
   });
+
+  return event.id;
 }
 
 /** Reads the owner-facing view of a device. */
@@ -335,6 +347,22 @@ export type UnlockFailureReason =
   | 'attempts_exhausted'
   | 'wrong_code';
 
+/**
+ * The same four reasons as the `UnlockFailureReason` enum column.
+ *
+ * Two spellings exist because the audit metadata values above are already in
+ * the audit table and asserted by tests, while the column — being user-visible
+ * through `/devices/history` — follows the uppercase convention of every other
+ * Prisma enum. The map is the single place they are tied together, so a new
+ * reason cannot be added to one without the compiler demanding the other.
+ */
+const STORED_REASON: Record<UnlockFailureReason, StoredUnlockFailureReason> = {
+  no_challenge: 'NO_CHALLENGE',
+  expired: 'EXPIRED',
+  attempts_exhausted: 'TOO_MANY_ATTEMPTS',
+  wrong_code: 'WRONG_CODE',
+};
+
 export class UnlockFailed extends Error {
   constructor(
     readonly httpError: HttpError,
@@ -474,11 +502,29 @@ export async function confirmUnlock(
       },
     });
 
-    await recordEvent(tx, {
+    const eventId = await recordEvent(tx, {
       deviceId: target.deviceId,
       userId: input.userId,
       type: 'UNLOCK_CONFIRMED',
       requestId: input.requestId,
+    });
+
+    /**
+     * Tell the owner, in this transaction.
+     *
+     * Atomic with the event on purpose and in both directions: a rollback
+     * after this point takes the notification with it, so nobody is told their
+     * safe opened when it did not — and there is no path that opens the safe
+     * while silently failing to notify, because a notifier that cannot record
+     * throws and rolls the unlock back. For a product that physically opens a
+     * safe, "it opened but we never told you" is the worse of the two
+     * failures. See docs/decisions.md.
+     */
+    await notifier.notifyUnlock(tx, {
+      userId: input.userId,
+      type: 'UNLOCK_CONFIRMED',
+      deviceEventId: eventId,
+      serialNumber: current.serialNumber,
     });
 
     return readSummary(tx, target.deviceId);
@@ -496,27 +542,56 @@ async function consume(challengeId: string): Promise<void> {
 }
 
 /**
- * Records a failed unlock attempt as a user-visible event.
+ * Records a failed unlock attempt as a user-visible event, and notifies the
+ * owner if that failure burned the challenge.
  *
  * Separate from the happy path because it must survive the failure: the
  * controller calls this after catching {@link UnlockFailed}, so a wrong code
- * still shows up in the owner's history. The reason is a fixed enum string —
+ * still shows up in the owner's history. The reason is a fixed enum value —
  * nothing derived from what was typed.
+ *
+ * **Only `attempts_exhausted` notifies.** A single mistyped digit is the most
+ * ordinary thing a legitimate owner does, and a notification per typo would
+ * train people to ignore the bell — which is precisely the signal that needs
+ * to still mean something. Five wrong codes in a row against one challenge is
+ * different in kind: it is either a person who no longer has the code, or
+ * someone guessing at a physical safe. See docs/decisions.md.
  */
 export async function recordUnlockFailure(input: {
   deviceId: string;
   userId: string;
+  reason: UnlockFailureReason;
   requestId: string | null;
 }): Promise<void> {
+  const shouldNotify = input.reason === 'attempts_exhausted';
+
   try {
-    await recordEvent(prisma, {
-      deviceId: input.deviceId,
-      userId: input.userId,
-      type: 'UNLOCK_FAILED',
-      requestId: input.requestId,
+    await prisma.$transaction(async (tx) => {
+      const eventId = await recordEvent(tx, {
+        deviceId: input.deviceId,
+        userId: input.userId,
+        type: 'UNLOCK_FAILED',
+        requestId: input.requestId,
+        failureReason: STORED_REASON[input.reason],
+      });
+
+      if (!shouldNotify) return;
+
+      const device = await tx.device.findUniqueOrThrow({
+        where: { id: input.deviceId },
+        select: { serialNumber: true },
+      });
+
+      await notifier.notifyUnlock(tx, {
+        userId: input.userId,
+        type: 'UNLOCK_FAILED_MAX_ATTEMPTS',
+        deviceEventId: eventId,
+        serialNumber: device.serialNumber,
+      });
     });
   } catch (cause) {
     // Same rule as the audit log: recording must never turn a 400 into a 500.
+    // The user's answer is already decided — the code was wrong either way.
     logger.error(
       { reason: cause instanceof Error ? cause.message : 'unknown' },
       'Failed to record an UNLOCK_FAILED device event',

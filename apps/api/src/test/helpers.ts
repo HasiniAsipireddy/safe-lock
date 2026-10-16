@@ -39,6 +39,8 @@ export function app(options: CreateAppOptions = {}): Express {
       unlockRequest: { windowMs: 60_000, limit: 1000 },
       unlockRequestIp: { windowMs: 60_000, limit: 1000 },
       unlockConfirm: { windowMs: 60_000, limit: 1000 },
+      deviceHistory: { windowMs: 60_000, limit: 1000 },
+      notifications: { windowMs: 60_000, limit: 1000 },
       ...options.rateLimits,
     },
   });
@@ -205,6 +207,82 @@ export async function createUserWithDevice(): Promise<{
   await allocateDevice(user.id, device.id);
 
   return { user, deviceId: device.id, serialNumber: device.serialNumber };
+}
+
+// --- Device events / notifications -------------------------------------------
+
+/**
+ * Inserts a `DeviceEvent` with a caller-chosen timestamp.
+ *
+ * `createdAt` is settable because the history page's pagination is defined by
+ * the ordering of these rows, and the interesting cases — several events in
+ * the same millisecond, a page boundary falling between them — cannot be
+ * produced by making real requests fast enough.
+ */
+export async function seedDeviceEvent(input: {
+  userId: string;
+  deviceId: string;
+  type?: 'LOCK' | 'UNLOCK_REQUESTED' | 'UNLOCK_CONFIRMED' | 'UNLOCK_FAILED';
+  failureReason?: 'WRONG_CODE' | 'EXPIRED' | 'TOO_MANY_ATTEMPTS' | 'NO_CHALLENGE' | null;
+  createdAt?: Date;
+  requestId?: string | null;
+}): Promise<{ id: string; createdAt: Date }> {
+  return prisma.deviceEvent.create({
+    data: {
+      userId: input.userId,
+      deviceId: input.deviceId,
+      type: input.type ?? 'LOCK',
+      source: 'WEB',
+      failureReason: input.failureReason ?? null,
+      requestId: input.requestId ?? null,
+      ...(input.createdAt ? { createdAt: input.createdAt } : {}),
+    },
+    select: { id: true, createdAt: true },
+  });
+}
+
+/**
+ * Inserts `count` events for one user, newest last, one second apart.
+ *
+ * Returns them in insertion order (oldest first), so a test can assert against
+ * the reverse of this list — which is what the API should return.
+ */
+export async function seedDeviceEvents(
+  input: { userId: string; deviceId: string; count: number; startedAt?: Date },
+): Promise<Array<{ id: string; createdAt: Date }>> {
+  const base = (input.startedAt ?? new Date(Date.now() - input.count * 1000)).getTime();
+  const events: Array<{ id: string; createdAt: Date }> = [];
+
+  for (let index = 0; index < input.count; index += 1) {
+    events.push(
+      await seedDeviceEvent({
+        userId: input.userId,
+        deviceId: input.deviceId,
+        createdAt: new Date(base + index * 1000),
+      }),
+    );
+  }
+  return events;
+}
+
+/** Inserts an unread notification. */
+export async function seedNotification(input: {
+  userId: string;
+  type?: 'UNLOCK_CONFIRMED' | 'UNLOCK_FAILED_MAX_ATTEMPTS';
+  deviceEventId?: string | null;
+  createdAt?: Date;
+  readAt?: Date | null;
+}): Promise<{ id: string }> {
+  return prisma.notification.create({
+    data: {
+      userId: input.userId,
+      type: input.type ?? 'UNLOCK_CONFIRMED',
+      deviceEventId: input.deviceEventId ?? null,
+      readAt: input.readAt ?? null,
+      ...(input.createdAt ? { createdAt: input.createdAt } : {}),
+    },
+    select: { id: true },
+  });
 }
 
 /** Marks a user's payment PAID the way a settled payment would look. */

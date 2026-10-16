@@ -1,7 +1,10 @@
 import { Router } from 'express';
 import {
   confirmUnlockSchema,
+  historyQuerySchema,
   type ConfirmUnlockInput,
+  type HistoryQuery,
+  type HistoryResponse,
   type LockResponse,
   type MyDeviceResponse,
   type UnlockConfirmResponse,
@@ -9,11 +12,12 @@ import {
 } from '@safelock/shared';
 import { requireAuth } from '../../middleware/auth';
 import { requirePaid } from '../../middleware/requirePaid';
-import { validateBody } from '../../middleware/validate';
+import { validateBody, validateQuery } from '../../middleware/validate';
 import type { Limiters } from '../../middleware/rateLimit';
 import { HttpError } from '../../lib/httpError';
 import { AUDIT_ACTIONS, auditContext, writeAudit } from '../audit/audit.service';
 import { getDeviceForUser } from './device.service';
+import { getHistoryPage } from './history.service';
 import {
   UnlockFailed,
   confirmUnlock,
@@ -59,6 +63,38 @@ export function createDevicesRouter(limiters: Limiters): Router {
       next(error);
     }
   });
+
+  /**
+   * The caller's lock/unlock activity, newest first, cursor-paginated.
+   *
+   * `requireAuth` only — deliberately **no** `requirePaid` and no eligibility
+   * check. This is a read of the user's own record: someone waiting for
+   * allocation has no events and gets an empty list, and someone whose payment
+   * was refunded can still see what happened to the safe they were holding.
+   * Refusing either would be withholding their own data, and an empty list is
+   * the honest answer rather than an error.
+   */
+  router.get(
+    '/history',
+    requireAuth,
+    limiters.deviceHistory,
+    validateQuery(historyQuerySchema),
+    async (req, res, next) => {
+      try {
+        const { cursor, limit } = req.query as unknown as HistoryQuery;
+
+        const response: HistoryResponse = await getHistoryPage({
+          userId: req.user!.id,
+          limit,
+          cursor,
+        });
+
+        res.status(200).json(response);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
 
   /** Locks the safe. Idempotent — locking a locked safe is a 200, not a 409. */
   router.post('/lock', requireAuth, limiters.deviceLock, async (req, res, next) => {
@@ -150,6 +186,7 @@ export function createDevicesRouter(limiters: Limiters): Router {
           await recordUnlockFailure({
             deviceId: error.deviceId,
             userId,
+            reason: error.reason,
             requestId: req.id ?? null,
           });
 

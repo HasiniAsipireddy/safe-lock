@@ -46,6 +46,14 @@ export interface RateLimitConfig {
   unlockRequestIp: LimitSpec;
   /** Per-user limiter on `POST /devices/unlock/confirm`. */
   unlockConfirm: LimitSpec;
+  /** Per-user limiter on `GET /devices/history`. */
+  deviceHistory: LimitSpec;
+  /**
+   * Per-user limiter on the notification routes. The web client polls these
+   * every 60s per visible tab, so the limit has to clear several tabs doing
+   * that and still bound a client stuck in a loop.
+   */
+  notifications: LimitSpec;
 }
 
 export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
@@ -69,6 +77,14 @@ export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
   // counter is what normally stops a guesser and this is the backstop against
   // request/confirm cycling.
   unlockConfirm: { windowMs: 10 * 60 * 1000, limit: 15 },
+
+  // Reads of the caller's own data, so the limit only bounds a runaway client
+  // or a scraper hammering "Load more". Generous enough that paging through a
+  // long history by hand never trips it.
+  deviceHistory: { windowMs: 5 * 60 * 1000, limit: 60 },
+  // 5 minutes of 60s polling is 5 requests per tab, plus a fetch on every
+  // visibility change and bell open. 120 clears a handful of tabs comfortably.
+  notifications: { windowMs: 5 * 60 * 1000, limit: 120 },
 };
 
 const TOO_MANY_ATTEMPTS = 'Too many attempts. Please wait a few minutes and try again.';
@@ -153,6 +169,8 @@ export interface Limiters {
   unlockRequest: ReturnType<typeof rateLimit>;
   unlockRequestIp: ReturnType<typeof rateLimit>;
   unlockConfirm: ReturnType<typeof rateLimit>;
+  deviceHistory: ReturnType<typeof rateLimit>;
+  notifications: ReturnType<typeof rateLimit>;
 }
 
 export function createLimiters(
@@ -268,6 +286,30 @@ export function createLimiters(
         },
       },
       stores.unlockConfirm,
+    ),
+
+    deviceHistory: build(
+      config.deviceHistory,
+      'Too many history requests. Please wait a moment and try again.',
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.deviceHistory,
+    ),
+
+    notifications: build(
+      config.notifications,
+      'Too many notification requests. Please wait a moment and try again.',
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.notifications,
     ),
   };
 }
