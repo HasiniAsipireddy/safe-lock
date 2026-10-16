@@ -54,6 +54,31 @@ enum DeviceEventSource {
   WEB
 }
 
+/// Why an UNLOCK_FAILED event failed.
+///
+/// A closed enum, never free text: this is shown to the user and must never
+/// carry anything derived from what was typed. Mirrors the `reason` the audit
+/// trail already records (see deviceControl.service.ts). Events written before
+/// this column existed are null and render as a generic "Unlock failed".
+enum UnlockFailureReason {
+  WRONG_CODE
+  EXPIRED
+  TOO_MANY_ATTEMPTS
+  /// No code was outstanding — never requested, already used, or superseded.
+  NO_CHALLENGE
+}
+
+/// What an in-app notification is about.
+///
+/// Deliberately not DeviceEventType: most device events notify nobody, and a
+/// later non-device notification should not have to pose as a device event.
+enum NotificationType {
+  UNLOCK_CONFIRMED
+  /// An unlock attempt that burned every attempt — a possible tampering
+  /// signal, which is why it interrupts the owner. See docs/decisions.md.
+  UNLOCK_FAILED_MAX_ATTEMPTS
+}
+
 model User {
   id           String   @id @default(cuid())
   name         String
@@ -73,6 +98,7 @@ model User {
   refreshTokens     RefreshToken[]
   deviceEvents      DeviceEvent[]
   unlockChallenges  UnlockChallenge[]
+  notifications     Notification[]
   /// At most one, enforced by the unique constraint on Device.ownerId.
   device            Device?
 }
@@ -128,18 +154,58 @@ model DeviceEvent {
   type     DeviceEventType
   source   DeviceEventSource @default(WEB)
 
+  /// Why an UNLOCK_FAILED failed. Null for every other type, and null on rows
+  /// written before this column existed — deliberately not backfilled.
+  failureReason UnlockFailureReason?
+
   /// The X-Request-Id of the request that caused this, so a user-visible
-  /// event can be tied back to its server log lines.
+  /// event can be tied back to its server log lines. **Internal only** — it is
+  /// in no `select` the /history endpoint uses.
   requestId String?
 
   createdAt DateTime @default(now())
 
-  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device        Device         @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  notifications Notification[]
 
   /// The /history page's query: one user's events, newest first.
-  @@index([userId, createdAt])
+  ///
+  /// `id` is part of the index because the page is keyset-paginated on
+  /// `(createdAt DESC, id DESC)` — `createdAt` alone is not unique, and two
+  /// events sharing a timestamp across a page boundary would otherwise be
+  /// skipped or returned twice. See docs/decisions.md.
+  @@index([userId, createdAt, id])
   @@index([deviceId, createdAt])
+}
+
+/// An in-app notification for one user.
+///
+/// Written in the **same transaction** as the device event it describes, so
+/// there can never be a notification about an unlock that did not happen, nor
+/// an unlock the owner was not told about. See lib/notifier/.
+///
+/// Carries no message text: the wording comes from NOTIFICATION_COPY in
+/// @safelock/shared at render time, so copy can be fixed without a migration
+/// and nothing user-supplied is ever stored here.
+model Notification {
+  id     String           @id @default(cuid())
+  userId String
+  type   NotificationType
+
+  /// The event that caused this. Nullable so a future notification that is not
+  /// about a device event (an allocation, say) fits without a schema change.
+  deviceEventId String?
+
+  createdAt DateTime  @default(now())
+  /// Null while unread. Marking read is idempotent — only null rows are moved.
+  readAt    DateTime?
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceEvent DeviceEvent? @relation(fields: [deviceEventId], references: [id], onDelete: SetNull)
+
+  /// The bell's query: this user's notifications, unread first, newest first.
+  @@index([userId, readAt, createdAt])
 }
 
 /// An outstanding unlock OTP.

@@ -91,6 +91,13 @@ export const ERROR_CODES = {
    * Should not occur for an owned device — allocation sets LOCKED.
    */
   DEVICE_STATE_UNKNOWN: 'DEVICE_STATE_UNKNOWN',
+
+  // --- History / notifications ----------------------------------------------
+  /**
+   * A pagination cursor that was malformed, tampered with or oversized. The
+   * client should drop it and reload the list from the start.
+   */
+  INVALID_CURSOR: 'INVALID_CURSOR',
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
