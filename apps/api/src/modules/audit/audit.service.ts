@@ -55,6 +55,21 @@ export const AUDIT_ACTIONS = {
   /** A profile field (today: the name) was updated. */
   PROFILE_UPDATED: 'auth.profile.updated',
 
+  // --- Phone verification ---------------------------------------------------
+  /**
+   * A verification code was requested. Metadata records whether one was
+   * actually sent and whether the number belongs to another account — the
+   * **only** place that collision is visible, since the HTTP response is
+   * identical either way.
+   */
+  PHONE_VERIFICATION_REQUESTED: 'account.phone.verification_requested',
+  /** A request refused before any code was sent (no consent, wrong password, cap). */
+  PHONE_VERIFICATION_REFUSED: 'account.phone.verification_refused',
+  /** A number was confirmed and promoted onto the account. */
+  PHONE_VERIFIED: 'account.phone.verified',
+  /** A wrong, expired or exhausted verification code. */
+  PHONE_VERIFICATION_FAILED: 'account.phone.verification_failed',
+
   /** A state-changing request was blocked by the Origin allowlist. */
   ORIGIN_REJECTED: 'security.origin.rejected',
 
@@ -135,6 +150,20 @@ export function auditContext(req: Request): {
  */
 const FORBIDDEN_METADATA_KEY = /email|phone|mobile|password|secret|token|signature|otp|hash/i;
 
+/**
+ * Keys that match the forbidden pattern but are safe by construction.
+ *
+ * `maskedPhone` only ever holds the output of `maskPhone` — `+91 98****10`, or
+ * a constant for anything unparseable. Four digits of a number, which is what
+ * makes a verification trail investigable ("which number was verified?")
+ * without storing a mobile number. The logger allowlists exactly this value
+ * for exactly this reason; this keeps the two consistent.
+ *
+ * Add to this list only for a value that *cannot* contain the sensitive form,
+ * never for one that merely usually doesn't.
+ */
+const ALLOWED_METADATA_KEY = /^maskedPhone$/;
+
 function scrubMetadata(
   metadata: Record<string, unknown> | undefined,
   action: string,
@@ -143,7 +172,7 @@ function scrubMetadata(
 
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(metadata)) {
-    if (FORBIDDEN_METADATA_KEY.test(key)) {
+    if (FORBIDDEN_METADATA_KEY.test(key) && !ALLOWED_METADATA_KEY.test(key)) {
       logger.warn({ action, key }, 'Dropped a forbidden key from audit metadata');
       continue;
     }

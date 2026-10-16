@@ -22,6 +22,7 @@ const SELECT = {
   phone: true,
   role: true,
   createdAt: true,
+  phoneVerifiedAt: true,
 } as const;
 
 export async function signup(input: {
@@ -58,7 +59,8 @@ export async function signup(input: {
     select: SELECT,
   });
 
-  // A brand-new account cannot have a payment or a device yet.
+  // A brand-new account cannot have a payment or a device yet, and its phone
+  // is unverified until a code is confirmed.
   return toPublicUser(user, { hasPaid: false, deviceAllocated: false });
 }
 

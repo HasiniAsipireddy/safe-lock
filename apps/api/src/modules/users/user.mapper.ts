@@ -10,6 +10,8 @@ export interface UserRow {
   phone: string;
   role: 'USER' | 'ADMIN';
   createdAt: Date;
+  /** Null until the user confirms a code sent to their number. */
+  phoneVerifiedAt: Date | null;
 }
 
 /**
@@ -61,6 +63,8 @@ export function toPublicUser(
     createdAt: user.createdAt.toISOString(),
     hasPaid: flags.hasPaid,
     deviceAllocated: flags.deviceAllocated,
+    // Derived, like the other two flags — not a column a client could set.
+    phoneVerified: user.phoneVerifiedAt !== null,
   };
 }
 
@@ -68,7 +72,15 @@ export function toPublicUser(
 export async function loadPublicUser(userId: string): Promise<PublicUser | null> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { id: true, name: true, email: true, phone: true, role: true, createdAt: true },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      phone: true,
+      role: true,
+      createdAt: true,
+      phoneVerifiedAt: true,
+    },
   });
 
   if (!user) return null;

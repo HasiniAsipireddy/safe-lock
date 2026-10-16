@@ -27,6 +27,16 @@ export interface PublicUser {
    * explicit state for it, and lock/unlock must require **both** flags.
    */
   deviceAllocated: boolean;
+  /**
+   * True once the user has confirmed a one-time code sent to their number.
+   *
+   * Derived from `phoneVerifiedAt != null`, not a second column.
+   * **Unlocking is refused without it** (`PHONE_NOT_VERIFIED`) because the
+   * code has nowhere to go; locking is not, since locking is the safe
+   * direction and refusing it would leave someone unable to secure their own
+   * safe.
+   */
+  phoneVerified: boolean;
 }
 
 /** Response body of `POST /account/phone/request-verification`. */

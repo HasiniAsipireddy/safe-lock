@@ -58,6 +58,21 @@ const noDevice = () =>
     'No safe is allocated to your account yet. You will be notified once one is assigned.',
   );
 
+/**
+ * Unlock needs a verified number because that is where the code goes.
+ *
+ * **403, not 402**: this is not about money. A distinct code too — the
+ * dashboard shows a "verify your phone" prompt for it, which is useless for
+ * `NOT_PAID` or `NO_DEVICE`.
+ */
+const phoneNotVerified = () =>
+  new HttpError({
+    status: 403,
+    code: ERROR_CODES.PHONE_NOT_VERIFIED,
+    message:
+      'Verify your phone number before unlocking your safe — that is where your one-time code is sent.',
+  });
+
 const stateUnknown = () =>
   conflict(
     ERROR_CODES.DEVICE_STATE_UNKNOWN,
@@ -148,7 +163,15 @@ export interface OperableDevice {
  *   message instead of being flattened into "you have not paid". It is a real
  *   state (see docs/decisions.md) and paying again is not the remedy.
  * - then unpaid,
+ * - then — for unlock only — **an unverified phone**,
  * - then no device allocated.
+ *
+ * Why the phone check sits where it does: paid and refunded are facts about
+ * the account that the user may be unable to change right now, so they come
+ * first. An unverified number is something they can fix in a minute, and
+ * telling them so is more useful than "no safe is allocated yet" — which they
+ * can do nothing about. It is also checked before the device lookup so a user
+ * waiting on allocation still learns they should verify in the meantime.
  *
  * This is why the lock/unlock routes do **not** mount `requirePaid`: that
  * middleware answers 402 PAYMENT_REQUIRED for both the never-paid and the
@@ -157,9 +180,14 @@ export interface OperableDevice {
 export async function assertCanOperate(
   userId: string,
   client: PrismaTransaction | typeof prisma = prisma,
+  options: { requirePhoneVerified?: boolean } = {},
 ): Promise<OperableDevice> {
-  const [paid, device] = await Promise.all([
+  const [paid, user, device] = await Promise.all([
     userHasPaid(userId, client),
+    client.user.findUnique({
+      where: { id: userId },
+      select: { phoneVerifiedAt: true },
+    }),
     client.device.findUnique({
       where: { ownerId: userId },
       select: { id: true, serialNumber: true, lockState: true, status: true },
@@ -167,6 +195,20 @@ export async function assertCanOperate(
   ]);
 
   if (!paid) throw device ? refunded() : notPaid();
+
+  /**
+   * **Unlock requires a verified number; lock does not.**
+   *
+   * Unlocking needs somewhere to send the one-time code, so without a
+   * verified number the flow cannot complete at all — better to say so up
+   * front than to generate a code that goes nowhere.
+   *
+   * Locking is deliberately left open. It is the safe direction, needs no
+   * code, and blocking it would mean an unverified user could not secure
+   * their own safe — which would make the gate actively harmful.
+   */
+  if (options.requirePhoneVerified && !user?.phoneVerifiedAt) throw phoneNotVerified();
+
   if (!device || device.status !== 'ASSIGNED') throw noDevice();
 
   // Should be unreachable: allocation sets LOCKED and only unassign sets
@@ -342,7 +384,9 @@ export interface UnlockRequestInput {
 export async function requestUnlock(
   input: UnlockRequestInput,
 ): Promise<UnlockRequestResponse> {
-  const target = await assertCanOperate(input.userId);
+  const target = await assertCanOperate(input.userId, prisma, {
+    requirePhoneVerified: true,
+  });
 
   const code = generateOtp();
   const expiresAt = new Date(Date.now() + OTP_TTL_MS);
@@ -467,7 +511,12 @@ export class UnlockFailed extends Error {
 export async function confirmUnlock(
   input: UnlockConfirmInput,
 ): Promise<UnlockConfirmResponse> {
-  const target = await assertCanOperate(input.userId);
+  // Re-checked here too, not just on request: a number could have been
+  // unverified between the two calls, and the second call is the one that
+  // moves the bolt.
+  const target = await assertCanOperate(input.userId, prisma, {
+    requirePhoneVerified: true,
+  });
 
   const challenge = await prisma.unlockChallenge.findFirst({
     where: { userId: input.userId, deviceId: target.deviceId, consumedAt: null },

@@ -38,6 +38,7 @@ const TABLES = [
   'RefreshToken',
   'PasswordResetToken',
   'OutboundMessage',
+  'PhoneVerification',
   'Notification',
   'DeviceEvent',
   'UnlockChallenge',

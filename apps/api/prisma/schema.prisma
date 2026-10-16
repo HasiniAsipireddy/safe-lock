@@ -191,6 +191,7 @@ model User {
   refreshTokens       RefreshToken[]
   passwordResetTokens PasswordResetToken[]
   outboundMessages    OutboundMessage[]
+  phoneVerifications  PhoneVerification[]
   deviceEvents      DeviceEvent[]
   unlockChallenges  UnlockChallenge[]
   notifications     Notification[]
@@ -302,6 +303,45 @@ model Notification {
 
   /// The bell's query: this user's notifications, unread first, newest first.
   @@index([userId, readAt, createdAt])
+}
+
+/// An outstanding phone-verification code.
+///
+/// Separate from `UnlockChallenge`, which is bound to a device — this one is
+/// bound to a *candidate number*, and that difference is the point: the number
+/// being verified is held **here** and only written to `User.phone` once the
+/// code is confirmed. So changing a verified number leaves the old one live
+/// and receiving codes until the new one is proved, and an abandoned change
+/// costs the user nothing.
+///
+/// Only an HMAC of the code is stored, under the same `OTP_HMAC_SECRET` and
+/// for the same reason as `UnlockChallenge`: a 6-digit space is 10^6, so the
+/// key living outside the database is what protects the digest.
+model PhoneVerification {
+  id     String @id @default(cuid())
+  userId String
+
+  /// The number being verified, E.164. Not yet on the `User` row.
+  phoneE164 String
+
+  /// HMAC-SHA256(code, OTP_HMAC_SECRET), hex.
+  otpHash String
+
+  expiresAt DateTime
+  attempts  Int       @default(0)
+  /// Set on success, **or** when a newer request superseded this one.
+  consumedAt DateTime?
+
+  /// Captured at request time for the audit trail, never for auth.
+  requestedIp String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Finding the one open verification for a user.
+  @@index([userId, consumedAt])
+  @@index([expiresAt])
 }
 
 /// An outstanding unlock OTP.

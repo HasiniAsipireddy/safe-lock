@@ -99,9 +99,11 @@ const accounts: MockAccount[] = [
       phone: '9876543210',
       role: 'USER',
       createdAt: new Date('2026-01-01T00:00:00.000Z').toISOString(),
-      // Starts unpaid so the /pay flow can be walked through end to end.
+      // Starts unpaid so the /pay flow can be walked through end to end,
+      // and unverified so the phone-verification step can be too.
       hasPaid: false,
       deviceAllocated: false,
+      phoneVerified: false,
     },
     password: 'Demo1234',
     payments: [],
@@ -473,6 +475,7 @@ function handleSignup(body: unknown): AuthResponse {
     createdAt: new Date().toISOString(),
     hasPaid: false,
     deviceAllocated: false,
+    phoneVerified: false,
   };
 
   accounts.push({ user, password: input.password, payments: [] });

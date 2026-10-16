@@ -42,6 +42,15 @@ export interface RateLimitConfig {
   passwordChange: LimitSpec;
   /** Per-user limiter on `PATCH /auth/profile`. */
   profileUpdate: LimitSpec;
+  /** Per-user limiter on `POST /account/phone/request-verification`. */
+  phoneVerify: LimitSpec;
+  /**
+   * Per-IP limb on the same route. The per-user limb cannot see one host
+   * walking through many compromised sessions; this one can.
+   */
+  phoneVerifyIp: LimitSpec;
+  /** Per-user limiter on `POST /account/phone/confirm`. */
+  phoneConfirm: LimitSpec;
   /** Per-user limiter on /payments/order. */
   createOrder: LimitSpec;
   /** Per-user limiter on /payments/verify. */
@@ -91,6 +100,15 @@ export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
   // 400 the limiter should not let anyone grind through.
   passwordChange: { windowMs: 15 * 60 * 1000, limit: 10 },
   profileUpdate: { windowMs: 15 * 60 * 1000, limit: 20 },
+
+  // Each verification request sends a WhatsApp message, so this is tight —
+  // the daily cap is the hard ceiling, and this paces the burst. Mirrors the
+  // unlock OTP's 3-per-10-minutes.
+  phoneVerify: { windowMs: 10 * 60 * 1000, limit: 3 },
+  phoneVerifyIp: { windowMs: 10 * 60 * 1000, limit: 10 },
+  // Above the 5 attempts one challenge allows, so the per-challenge counter is
+  // what normally stops a guesser and this is the backstop against cycling.
+  phoneConfirm: { windowMs: 10 * 60 * 1000, limit: 15 },
 
   createOrder: { windowMs: 10 * 60 * 1000, limit: 5 },
   verifyPayment: { windowMs: 10 * 60 * 1000, limit: 20 },
@@ -198,6 +216,9 @@ export interface Limiters {
   passwordReset: ReturnType<typeof rateLimit>;
   passwordChange: ReturnType<typeof rateLimit>;
   profileUpdate: ReturnType<typeof rateLimit>;
+  phoneVerify: ReturnType<typeof rateLimit>;
+  phoneVerifyIp: ReturnType<typeof rateLimit>;
+  phoneConfirm: ReturnType<typeof rateLimit>;
   createOrder: ReturnType<typeof rateLimit>;
   verifyPayment: ReturnType<typeof rateLimit>;
   adminWrite: ReturnType<typeof rateLimit>;
@@ -299,6 +320,48 @@ export function createLimiters(
         },
       },
       stores.profileUpdate,
+    ),
+
+    /**
+     * Phone verification refunds a 5xx on the per-user limb, like the unlock
+     * request does: a WhatsApp outage answering 502 must not spend the user's
+     * three-per-ten-minutes. Every 4xx still counts.
+     */
+    phoneVerify: build(
+      config.phoneVerify,
+      'Too many verification codes requested. Please wait a few minutes and try again.',
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+        skipFailedRequests: true,
+        requestWasSuccessful: (_req, res) => res.statusCode < 500,
+      },
+      stores.phoneVerify,
+    ),
+
+    phoneVerifyIp: build(
+      config.phoneVerifyIp,
+      'Too many verification codes requested. Please wait a few minutes and try again.',
+      {
+        keyGenerator: (req) => (req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown'),
+        skipFailedRequests: true,
+        requestWasSuccessful: (_req, res) => res.statusCode < 500,
+      },
+      stores.phoneVerifyIp,
+    ),
+
+    phoneConfirm: build(
+      config.phoneConfirm,
+      'Too many code attempts. Please wait a few minutes and try again.',
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.phoneConfirm,
     ),
 
     createOrder: build(
