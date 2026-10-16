@@ -19,7 +19,11 @@ import {
   redeemRefreshToken,
   revokeByRawToken,
 } from './refreshToken.service';
-import { completePasswordReset, requestPasswordReset } from './passwordReset.service';
+import {
+  completePasswordReset,
+  requestPasswordReset,
+  wasExhausted,
+} from './passwordReset.service';
 import type { SignupBody } from './auth.schemas';
 import type { LoginInput } from '@safelock/shared';
 
@@ -215,12 +219,12 @@ export const postRefresh: RequestHandler = async (req, res, next) => {
  * key matching `email`).
  */
 export const postForgotPassword: RequestHandler = async (req, res, next) => {
-  const { email } = req.body as ForgotPasswordInput;
+  const { identifier } = req.body as ForgotPasswordInput;
   const context = auditContext(req);
 
   try {
     const outcome = await requestPasswordReset({
-      email,
+      identifier,
       ip: context.ip,
       userAgent: context.userAgent,
     });
@@ -241,25 +245,24 @@ export const postForgotPassword: RequestHandler = async (req, res, next) => {
 };
 
 /**
- * `POST /auth/password/reset` — sets a new password from a reset link.
+ * `POST /auth/password/reset` — sets a new password from a reset code.
  *
  * **Does not sign the user in.** No access cookie, no refresh cookie, no user
- * in the body. Holding a reset link proves control of a delivery channel, and
+ * in the body. Holding a reset code proves control of a delivery channel, and
  * the product's answer to that is "you may set a password, now sign in with
- * it" rather than "here is a live session to your safe". It also means a link
- * forwarded or left in a shared browser's history cannot be turned straight
- * into access.
+ * it" rather than "here is a live session to your safe". It also means a code
+ * read off a shared screen cannot be turned straight into access.
  *
  * Cookies are *cleared* rather than left alone, because the service has just
  * revoked every refresh token for the account — leaving a dead session in the
  * browser would show a signed-in shell that 401s on its first request.
  */
 export const postResetPassword: RequestHandler = async (req, res, next) => {
-  const { token, password } = req.body as ResetPasswordBody;
+  const { identifier, code, password } = req.body as ResetPasswordBody;
   const context = auditContext(req);
 
   try {
-    const { userId } = await completePasswordReset({ token, password });
+    const { userId } = await completePasswordReset({ identifier, code, password });
 
     clearAuthCookies(res);
 
@@ -272,10 +275,21 @@ export const postResetPassword: RequestHandler = async (req, res, next) => {
     const response: PasswordResetResponse = { status: 'ok' };
     res.status(200).json(response);
   } catch (error) {
-    // No userId to record: a rejected token is by definition not tied to a
-    // known account. The code says which way it failed, and there is only one.
+    /**
+     * No userId is recorded: every rejection answers identically, and looking
+     * one up here only for the audit row would mean the handler behaving
+     * differently depending on whether the account exists — which is the thing
+     * this endpoint must not do.
+     *
+     * `exhausted` is the one distinction worth keeping, and it is kept **only
+     * here**: five wrong codes against one reset is either someone who cannot
+     * read their message or someone guessing. The code itself is never
+     * recorded, and the audit scrubber would drop it anyway.
+     */
     await writeAudit({
-      action: AUDIT_ACTIONS.PASSWORD_RESET_REJECTED,
+      action: wasExhausted(error)
+        ? AUDIT_ACTIONS.PASSWORD_RESET_CODE_EXHAUSTED
+        : AUDIT_ACTIONS.PASSWORD_RESET_REJECTED,
       ...context,
       metadata: { code: error instanceof HttpError ? error.code : 'INTERNAL_ERROR' },
     });

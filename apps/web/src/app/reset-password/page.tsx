@@ -6,7 +6,7 @@ import { useSearchParams } from 'next/navigation';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import {
-  ERROR_CODES,
+  RESET_CODE_LENGTH,
   resetPasswordSchema,
   type PasswordResetResponse,
   type ResetPasswordInput,
@@ -16,21 +16,25 @@ import { ApiError } from '@/lib/apiError';
 import { AuthCard } from '@/components/ui/AuthCard';
 import { Button } from '@/components/ui/Button';
 import { FormError } from '@/components/ui/FormError';
+import { Input } from '@/components/ui/Input';
 import { PasswordInput } from '@/components/ui/PasswordInput';
 import { PasswordStrengthMeter } from '@/components/PasswordStrengthMeter';
 
 /**
- * `/reset-password?token=…` — sets a new password from a reset link.
+ * `/reset-password` — sets a new password from an 8-digit code.
  *
  * **Completing this does not sign anyone in.** The API returns no user and no
  * session cookie, and the page sends the visitor to `/login` to use the
- * password they just set. Holding a link proves control of a delivery channel,
+ * password they just set. Holding a code proves control of a delivery channel,
  * which is enough to set a password and not enough to be handed a live session
  * to a safe.
  *
- * Not wrapped in `GuestOnly`: someone *can* legitimately be signed in here (a
- * reset link opened in the browser they are already using), and the API has
- * just revoked their sessions anyway.
+ * The identifier is prefilled from the query when the user arrived from
+ * `/forgot-password`, and editable: it is not a secret — they typed it — and a
+ * wrong one must be fixable without starting over.
+ *
+ * Not wrapped in `GuestOnly`: someone can legitimately be signed in here, and
+ * the API revokes their sessions on success anyway.
  */
 export default function ResetPasswordPage() {
   return (
@@ -50,11 +54,9 @@ export default function ResetPasswordPage() {
 }
 
 function ResetPasswordForm() {
-  const token = useSearchParams().get('token') ?? '';
+  const params = useSearchParams();
   const [done, setDone] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-  /** True once the server has called the link dead — retrying cannot help. */
-  const [linkDead, setLinkDead] = useState(false);
 
   const {
     register,
@@ -64,7 +66,13 @@ function ResetPasswordForm() {
   } = useForm<ResetPasswordInput>({
     resolver: zodResolver(resetPasswordSchema),
     mode: 'onTouched',
-    defaultValues: { token, password: '', confirmPassword: '' },
+    defaultValues: {
+      identifier: params.get('identifier') ?? '',
+      // Prefilled only in mock mode, where /forgot-password can pass it along.
+      code: params.get('code') ?? '',
+      password: '',
+      confirmPassword: '',
+    },
   });
 
   const password = watch('password');
@@ -73,19 +81,21 @@ function ResetPasswordForm() {
     setFormError(null);
     try {
       await api.post<PasswordResetResponse>('/auth/password/reset', {
-        token: values.token,
+        identifier: values.identifier,
+        code: values.code,
         password: values.password,
       });
       setDone(true);
     } catch (error) {
-      if (error instanceof ApiError && error.code === ERROR_CODES.RESET_TOKEN_INVALID) {
-        setLinkDead(true);
-        setFormError(error.message);
-      } else if (error instanceof ApiError) {
-        setFormError(error.message);
-      } else {
-        setFormError('Something went wrong. Please try again.');
-      }
+      /**
+       * Every failure answers identically — wrong code, expired, already used,
+       * attempts exhausted, no such account — so there is one message to show
+       * and nothing to branch on. That is the point: the server will not say
+       * which it was, and neither can this page.
+       */
+      setFormError(
+        error instanceof ApiError ? error.message : 'Something went wrong. Please try again.',
+      );
     }
   });
 
@@ -97,32 +107,6 @@ function ResetPasswordForm() {
       Sign in
     </Link>
   );
-
-  const requestAnother = (
-    <Link
-      href="/forgot-password"
-      className="font-semibold text-brand-700 underline underline-offset-2 hover:text-brand-800 dark:text-brand-300 dark:hover:text-brand-200"
-    >
-      Request a new link
-    </Link>
-  );
-
-  // A link with no token at all: say so plainly rather than showing a form
-  // that cannot succeed.
-  if (!token) {
-    return (
-      <AuthCard
-        title="That link is incomplete"
-        subtitle="The reset link is missing its token."
-        footer={<p>{requestAnother}</p>}
-      >
-        <p className="text-sm text-slate-600 dark:text-slate-400">
-          Open the most recent link you were sent, or request a new one. Links can be used
-          once and expire after 30 minutes.
-        </p>
-      </AuthCard>
-    );
-  }
 
   if (done) {
     return (
@@ -147,32 +131,56 @@ function ResetPasswordForm() {
     );
   }
 
-  if (linkDead) {
-    return (
-      <AuthCard
-        title="That link has expired"
-        subtitle="Reset links can be used once, within 30 minutes."
-        footer={<p>{requestAnother}</p>}
-      >
-        <p role="alert" className="text-sm text-slate-600 dark:text-slate-400">
-          {formError}
-        </p>
-      </AuthCard>
-    );
-  }
-
   return (
     <AuthCard
       title="Set a new password"
-      subtitle="Choose a password you haven't used here before."
-      footer={<p>Remembered it? {signInLink}</p>}
+      subtitle={`Enter the ${RESET_CODE_LENGTH}-digit code we sent on WhatsApp.`}
+      footer={
+        <p>
+          No code?{' '}
+          <Link
+            href="/forgot-password"
+            className="font-semibold text-brand-700 underline underline-offset-2 hover:text-brand-800 dark:text-brand-300 dark:hover:text-brand-200"
+          >
+            Request one
+          </Link>
+        </p>
+      }
     >
       <form onSubmit={onSubmit} noValidate className="flex flex-col gap-4">
         <FormError variant="banner" message={formError ?? undefined} />
 
-        {/* The token travels in the form rather than being re-read on submit,
-            so a navigation mid-flow cannot swap it underneath the request. */}
-        <input type="hidden" {...register('token')} />
+        <Input
+          label="Email or phone number"
+          type="text"
+          inputMode="email"
+          autoComplete="username"
+          autoCapitalize="none"
+          spellCheck={false}
+          placeholder="you@example.com or 9876543210"
+          error={errors.identifier?.message}
+          {...register('identifier')}
+        />
+
+        {/*
+          A single field rather than eight boxes: the OtpInput component is
+          built around a 6-digit code and a one-field entry is what people
+          expect for something they are reading off another app. inputMode
+          brings up the numeric keypad; autoComplete lets the platform offer
+          the code straight from the notification.
+        */}
+        <Input
+          label={`${RESET_CODE_LENGTH}-digit code`}
+          type="text"
+          inputMode="numeric"
+          autoComplete="one-time-code"
+          maxLength={RESET_CODE_LENGTH + 2}
+          placeholder="40318725"
+          hint="Valid for 15 minutes, and usable once."
+          error={errors.code?.message}
+          inputClassName="font-mono tracking-[0.3em]"
+          {...register('code')}
+        />
 
         <PasswordInput
           label="New password"

@@ -1,7 +1,7 @@
 import { logger } from '../lib/logger';
 import { disconnectPrisma } from '../lib/prisma';
 import { cleanupRefreshTokens } from '../modules/auth/refreshToken.service';
-import { cleanupPasswordResetTokens } from '../modules/auth/passwordReset.service';
+import { cleanupPasswordResetCodes } from '../modules/auth/passwordReset.service';
 
 /**
  * Deletes token rows that can no longer authorise anything.
@@ -22,7 +22,7 @@ import { cleanupPasswordResetTokens } from '../modules/auth/passwordReset.servic
 
 async function main(): Promise<void> {
   const refresh = await cleanupRefreshTokens();
-  const resets = await cleanupPasswordResetTokens();
+  const resets = await cleanupPasswordResetCodes();
 
   logger.info(
     { refreshDeleted: refresh.deleted, resetDeleted: resets.deleted },

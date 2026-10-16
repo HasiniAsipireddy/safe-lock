@@ -1,6 +1,10 @@
 import crypto from 'node:crypto';
 import rateLimit, { ipKeyGenerator, type Options, type Store } from 'express-rate-limit';
-import { ERROR_CODES, type ApiErrorBody } from '@safelock/shared';
+import {
+  ERROR_CODES,
+  RESET_CODE_RESEND_COOLDOWN_SECONDS,
+  type ApiErrorBody,
+} from '@safelock/shared';
 
 /**
  * Rate limiters, built from a factory so limits and stores are injectable.
@@ -36,8 +40,31 @@ export interface RateLimitConfig {
    * links. It also bounds mailbox spam at a few messages an hour.
    */
   passwordForgotIdentifier: LimitSpec;
+  /**
+   * Minimum gap between code requests for one account, as its own limb:
+   * 1 request per `RESET_CODE_RESEND_COOLDOWN_SECONDS`, keyed on the hashed
+   * identifier.
+   *
+   * Separate from `passwordForgotIdentifier` (3/hour) because they answer
+   * different questions — "not too many in a day" and "not two in a second" —
+   * and one bucket cannot express both. Server-side on purpose: a UI countdown
+   * is a courtesy, not a control. Runs **before any database lookup**, so its
+   * 429 is identical whether or not the account exists.
+   */
+  passwordForgotInterval: LimitSpec;
   /** Per-IP limiter on `POST /auth/password/reset`. */
   passwordReset: LimitSpec;
+  /**
+   * Per-identifier limb on `POST /auth/password/reset`, keyed on
+   * `sha256(lowercased identifier)`.
+   *
+   * The per-IP limb cannot see one account being guessed at from many
+   * addresses, which is exactly the attack an 8-digit code invites. The real
+   * defence is the per-account `attempts` counter on the challenge row — this
+   * bounds how often a fresh set of attempts can be cycled. Like the login
+   * identifier limb it runs before any lookup, so the 429 reveals nothing.
+   */
+  passwordResetIdentifier: LimitSpec;
   /** Per-user limiter on `POST /auth/password/change`. */
   passwordChange: LimitSpec;
   /** Per-user limiter on `PATCH /auth/profile`. */
@@ -101,9 +128,18 @@ export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
   // genuinely cannot find the first mail.
   passwordForgot: { windowMs: 15 * 60 * 1000, limit: 5 },
   passwordForgotIdentifier: { windowMs: 60 * 60 * 1000, limit: 3 },
-  // Guessing a 32-byte token is not a threat a rate limit defeats or needs to;
-  // this bounds a broken client retrying a dead link.
-  passwordReset: { windowMs: 15 * 60 * 1000, limit: 10 },
+  // The minimum interval. One request per 30 seconds per account, matching the
+  // UI's resend countdown — from the same shared constant, so they cannot
+  // drift apart.
+  passwordForgotInterval: {
+    windowMs: RESET_CODE_RESEND_COOLDOWN_SECONDS * 1000,
+    limit: 1,
+  },
+  // An 8-digit code is a threat a rate limit *does* matter to, so this is
+  // tighter than the old token-era limit. Per-account attempts (5, on the
+  // challenge row) remain the real defence.
+  passwordReset: { windowMs: 15 * 60 * 1000, limit: 20 },
+  passwordResetIdentifier: { windowMs: 15 * 60 * 1000, limit: 10 },
   // Each attempt costs an argon2 verify, and a wrong current password is a
   // 400 the limiter should not let anyone grind through.
   passwordChange: { windowMs: 15 * 60 * 1000, limit: 10 },
@@ -225,7 +261,9 @@ export interface Limiters {
   authIdentifier: ReturnType<typeof rateLimit>;
   passwordForgot: ReturnType<typeof rateLimit>;
   passwordForgotIdentifier: ReturnType<typeof rateLimit>;
+  passwordForgotInterval: ReturnType<typeof rateLimit>;
   passwordReset: ReturnType<typeof rateLimit>;
+  passwordResetIdentifier: ReturnType<typeof rateLimit>;
   passwordChange: ReturnType<typeof rateLimit>;
   profileUpdate: ReturnType<typeof rateLimit>;
   phoneVerify: ReturnType<typeof rateLimit>;
@@ -304,11 +342,42 @@ export function createLimiters(
       stores.passwordForgotIdentifier,
     ),
 
+    /**
+     * The minimum-interval limb. Keyed on the hashed identifier and evaluated
+     * before any lookup, so a caller cannot tell a real account's cooldown
+     * from a fake one's.
+     */
+    passwordForgotInterval: build(
+      config.passwordForgotInterval,
+      'Please wait a moment before requesting another code.',
+      {
+        keyGenerator: (req) => {
+          const identifier = extractIdentifier(req.body);
+          if (identifier) return `resetgap:${hashIdentifier(identifier)}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.passwordForgotInterval,
+    ),
+
     passwordReset: build(
       config.passwordReset,
       TOO_MANY_ATTEMPTS,
       { keyGenerator: (req) => (req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown') },
       stores.passwordReset,
+    ),
+
+    passwordResetIdentifier: build(
+      config.passwordResetIdentifier,
+      TOO_MANY_ATTEMPTS,
+      {
+        keyGenerator: (req) => {
+          const identifier = extractIdentifier(req.body);
+          if (identifier) return `resetconfirm:${hashIdentifier(identifier)}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.passwordResetIdentifier,
     ),
 
     passwordChange: build(

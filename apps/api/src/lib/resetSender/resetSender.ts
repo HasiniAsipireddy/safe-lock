@@ -26,8 +26,13 @@ export type ResetDeliveryOutcome =
 
 export interface ResetDelivery {
   userId: string;
-  /** The raw token. Never logged, never stored — see passwordReset.service.ts. */
-  token: string;
+  /**
+   * The raw 8-digit code.
+   *
+   * Never stored (only its HMAC is), never logged, never in a response. It
+   * exists in memory for the length of one request and in the message.
+   */
+  code: string;
   expiresAt: Date;
 }
 
@@ -35,7 +40,7 @@ export interface ResetSender {
   readonly name: string;
 
   /**
-   * Attempts to get a reset link to the user.
+   * Attempts to get a reset code to the user.
    *
    * **Must not throw for an ordinary failure.** A thrown error would change
    * the shape of `/auth/password/forgot`'s response, and that response has to

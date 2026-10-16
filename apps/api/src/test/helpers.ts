@@ -36,7 +36,9 @@ export function app(options: CreateAppOptions = {}): Express {
       authIdentifier: { windowMs: 60_000, limit: 1000 },
       passwordForgot: { windowMs: 60_000, limit: 1000 },
       passwordForgotIdentifier: { windowMs: 60_000, limit: 1000 },
+      passwordForgotInterval: { windowMs: 60_000, limit: 1000 },
       passwordReset: { windowMs: 60_000, limit: 1000 },
+      passwordResetIdentifier: { windowMs: 60_000, limit: 1000 },
       passwordChange: { windowMs: 60_000, limit: 1000 },
       profileUpdate: { windowMs: 60_000, limit: 1000 },
       phoneVerify: { windowMs: 60_000, limit: 1000 },
@@ -377,17 +379,17 @@ export async function withCapturedOtp<T>(
 }
 
 /**
- * Runs something that mints a password reset token and returns the token.
+ * Runs something that mints a password reset code and returns the code.
  *
  * Read back off the dev console line, exactly like {@link withCapturedOtp} and
- * for the same reasons: it exercises the **real** delivery path rather than
- * reaching into the service, nothing else can recover the value (only the
- * SHA-256 is stored), and a test fails loudly if the print is ever removed or
+ * for the same reasons: it exercises the **real** issue-and-deliver path rather
+ * than reaching into the service, nothing else can recover the value (only the
+ * HMAC is stored), and a test fails loudly if the print is ever removed or
  * accidentally gated off in the test environment.
  */
-export async function withCapturedResetToken<T>(
+export async function withCapturedResetCode<T>(
   run: () => Promise<T>,
-): Promise<{ result: T; token: string; lines: string[] }> {
+): Promise<{ result: T; code: string; lines: string[] }> {
   const lines: string[] = [];
   const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
     lines.push(args.map(String).join(' '));
@@ -400,12 +402,12 @@ export async function withCapturedResetToken<T>(
     spy.mockRestore();
   }
 
-  const match = lines.join('\n').match(/Password reset token: ([A-Za-z0-9_-]+)/);
+  const match = lines.join('\n').match(/Password reset code: (\d{8})/);
   if (!match?.[1]) {
-    throw new Error(`No reset token was printed. Console output:\n${lines.join('\n')}`);
+    throw new Error(`No reset code was printed. Console output:\n${lines.join('\n')}`);
   }
 
-  return { result, token: match[1], lines };
+  return { result, code: match[1], lines };
 }
 
 /**

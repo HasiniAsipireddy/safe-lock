@@ -67,13 +67,24 @@ export function createAuthRouter(limiters: Limiters): Router {
     '/password/forgot',
     limiters.passwordForgot,
     limiters.passwordForgotIdentifier,
+    // The minimum interval between codes for one account, enforced here rather
+    // than only as a UI countdown. Before any lookup, so its 429 says nothing
+    // about whether the account exists.
+    limiters.passwordForgotInterval,
     validateBody(forgotPasswordSchema),
     postForgotPassword,
   );
 
+  /**
+   * Redeeming a code. Two limbs again: per IP, and **per identifier** — the
+   * per-IP limb cannot see one account guessed at from many addresses, which
+   * is the attack an 8-digit code invites. Neither is the real defence; the
+   * per-account attempt counter on the challenge row is.
+   */
   router.post(
     '/password/reset',
     limiters.passwordReset,
+    limiters.passwordResetIdentifier,
     validateBody(resetPasswordBodySchema),
     postResetPassword,
   );

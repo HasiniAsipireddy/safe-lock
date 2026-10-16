@@ -25,7 +25,8 @@ import {
   PHONE_OTP_MAX_ATTEMPTS,
   PHONE_OTP_RESEND_COOLDOWN_SECONDS,
   PHONE_OTP_TTL_MS,
-  RESET_TOKEN_BYTES,
+  RESET_CODE_LENGTH,
+  RESET_CODE_MAX_ATTEMPTS,
   UNLOCK_FAILURE_LABELS,
   changePasswordBodySchema,
   classifyIdentifier,
@@ -526,40 +527,50 @@ function requireAccount(): MockAccount {
 // --- Password reset / account (mock) ----------------------------------------
 
 /**
- * The mock's in-memory reset token.
+ * The mock's in-memory reset code.
  *
- * Unlike the API this keeps the token in plaintext — it has to, because there
- * is nowhere to deliver it and the dev-only panel on `/forgot-password`
- * displays it. That is exactly why mock mode is refused in production builds
- * (`lib/env.ts`): this object would be a working account-takeover credential
- * sitting in browser memory.
+ * Holds the code in plaintext, as the unlock challenge does and for the same
+ * reason: there is nowhere to deliver it and the dev-only panel displays it.
+ * Which is exactly why mock mode is refused in production builds.
  */
-interface MockResetToken {
-  email: string;
-  token: string;
+interface MockResetCode {
+  /** The account it belongs to, by id — the identifier may be email or phone. */
+  userId: string;
+  code: string;
   expiresAt: number;
+  attempts: number;
   consumed: boolean;
 }
 
-let mockResetToken: MockResetToken | null = null;
+let mockResetCode: MockResetCode | null = null;
 
 /**
- * The reset token the mock just issued, for the dev-only hint on
- * `/forgot-password`. There is no equivalent in the real flow — the API never
- * returns a token, only a neutral `{ status: 'ok' }`.
+ * The reset code the mock just issued, for the dev-only hint.
  *
- * Guarded exactly like {@link peekMockUnlockCode}: callers gate on
- * `USE_MOCK_API`, which cannot be true in a production build.
+ * Guarded exactly like {@link peekMockUnlockCode} and
+ * {@link peekMockPhoneCode}: callers gate on `USE_MOCK_API`, which cannot be
+ * true in a production build. The real API never returns a code.
  */
-export function peekMockResetToken(): string | null {
-  if (!mockResetToken || mockResetToken.consumed) return null;
-  if (mockResetToken.expiresAt <= Date.now()) return null;
-  return mockResetToken.token;
+export function peekMockResetCode(): string | null {
+  if (!mockResetCode || mockResetCode.consumed) return null;
+  if (mockResetCode.expiresAt <= Date.now()) return null;
+  return mockResetCode.code;
+}
+
+/** Finds an account by email or 10-digit phone, like the API's lookup. */
+function findMockAccountByIdentifier(identifier: string): MockAccount | undefined {
+  const needle = identifier.trim();
+  const byPhone = classifyIdentifier(needle) === 'phone';
+
+  return accounts.find((candidate) =>
+    byPhone ? candidate.user.phone === needle : candidate.user.email === needle.toLowerCase(),
+  );
 }
 
 /**
- * Mirrors the API: the response is the same for a registered and an
- * unregistered address, and a new request supersedes any older live token.
+ * Mirrors the API: the response is identical for a registered and an
+ * unregistered identifier — email or phone — and a new request supersedes any
+ * older live code.
  */
 function handleMockForgotPassword(body: unknown): ForgotPasswordResponse {
   const parsed = forgotPasswordSchema.safeParse(body ?? {});
@@ -568,19 +579,20 @@ function handleMockForgotPassword(body: unknown): ForgotPasswordResponse {
     return fail(
       400,
       ERROR_CODES.VALIDATION_ERROR,
-      parsed.error.issues[0]?.message ?? 'Enter a valid email address',
+      parsed.error.issues[0]?.message ?? 'Enter a valid email address or mobile number',
     );
   }
 
-  const account = accounts.find((candidate) => candidate.user.email === parsed.data.email);
+  const account = findMockAccountByIdentifier(parsed.data.identifier);
 
-  // A token is only minted for a real account — but the answer below does not
+  // A code is only minted for a real account — but the answer below does not
   // depend on that, which is the whole point of the endpoint.
   if (account) {
-    mockResetToken = {
-      email: account.user.email,
-      token: mockRandomToken(),
+    mockResetCode = {
+      userId: account.user.id,
+      code: mockResetCodeDigits(),
       expiresAt: Date.now() + PASSWORD_RESET_TTL_MS,
+      attempts: 0,
       consumed: false,
     };
     recordAudit('auth.password.reset_requested', { userId: account.user.id });
@@ -591,17 +603,17 @@ function handleMockForgotPassword(body: unknown): ForgotPasswordResponse {
   return { status: 'ok' };
 }
 
-/** 32 bytes of base64url, the same shape the API issues. */
-function mockRandomToken(): string {
-  const bytes = new Uint8Array(RESET_TOKEN_BYTES);
-  crypto.getRandomValues(bytes);
-  return btoa(String.fromCharCode(...bytes))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
+/** An 8-digit code, the same shape the API issues. */
+function mockResetCodeDigits(): string {
+  const digits = new Uint32Array(1);
+  crypto.getRandomValues(digits);
+  return String(digits[0]! % 10 ** RESET_CODE_LENGTH).padStart(RESET_CODE_LENGTH, '0');
 }
 
-/** Mirrors the API, including that a successful reset does **not** sign in. */
+/**
+ * Mirrors the API, including that a successful reset does **not** sign in, and
+ * that every failure answers identically.
+ */
 function handleMockResetPassword(body: unknown): PasswordResetResponse {
   const parsed = resetPasswordBodySchema.safeParse(body ?? {});
 
@@ -613,29 +625,35 @@ function handleMockResetPassword(body: unknown): PasswordResetResponse {
     );
   }
 
-  const live = mockResetToken;
-  const usable =
-    live !== null &&
-    !live.consumed &&
-    live.expiresAt > Date.now() &&
-    live.token === parsed.data.token;
-
-  // Unknown, expired and already-used all answer identically.
-  if (!live || !usable) {
-    return fail(
+  const invalid = () =>
+    fail(
       400,
-      ERROR_CODES.RESET_TOKEN_INVALID,
-      'That reset link is invalid or has expired. Please request a new one.',
+      ERROR_CODES.RESET_CODE_INVALID,
+      'That code is invalid or has expired. Please request a new one.',
     );
+
+  const account = findMockAccountByIdentifier(parsed.data.identifier);
+  const live = mockResetCode;
+
+  // Unknown identifier, no code, wrong code, expired and used all answer the
+  // same — an unauthenticated endpoint must not say which.
+  if (!account || !live || live.consumed || live.userId !== account.user.id) return invalid();
+  if (live.expiresAt <= Date.now()) {
+    live.consumed = true;
+    return invalid();
   }
 
-  const account = accounts.find((candidate) => candidate.user.email === live.email);
-  if (!account) {
-    return fail(
-      400,
-      ERROR_CODES.RESET_TOKEN_INVALID,
-      'That reset link is invalid or has expired. Please request a new one.',
-    );
+  // The attempt is spent before the comparison, as on the server, so the
+  // correct code also fails once the attempts are gone.
+  if (live.attempts >= RESET_CODE_MAX_ATTEMPTS) {
+    live.consumed = true;
+    return invalid();
+  }
+  live.attempts += 1;
+
+  if (parsed.data.code !== live.code) {
+    if (live.attempts >= RESET_CODE_MAX_ATTEMPTS) live.consumed = true;
+    return invalid();
   }
 
   live.consumed = true;

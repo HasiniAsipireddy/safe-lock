@@ -189,7 +189,7 @@ model User {
   payments            Payment[]
   auditLogs           AuditLog[]
   refreshTokens       RefreshToken[]
-  passwordResetTokens PasswordResetToken[]
+  passwordResetCodes  PasswordResetCode[]
   outboundMessages    OutboundMessage[]
   phoneVerifications  PhoneVerification[]
   deviceEvents      DeviceEvent[]
@@ -478,38 +478,49 @@ model OutboundMessage {
   @@index([userId, createdAt])
 }
 
-/// One outstanding password reset.
+/// An outstanding password reset code.
 ///
-/// Only `sha256(token)` is stored, exactly as for `RefreshToken` — and for the
-/// same reason, not a weaker one. The token is 32 random bytes, so there is no
-/// guess space to brute-force and nothing a keyed hash would protect that the
-/// entropy does not already. (`UnlockChallenge.otpHash` is an HMAC precisely
-/// because a 6-digit code has only 10^6 values. See docs/decisions.md.)
+/// Replaces the long-token link of step 3. The token was 32 random bytes in a
+/// URL, which nothing could deliver: the WhatsApp message deliberately carries
+/// no token (a chat message is persistent and forwardable), and there is no
+/// email sender. An undeliverable credential is unreachable auth surface, so
+/// it is gone. See docs/decisions.md.
 ///
-/// The raw token exists in one message and one URL. It is never stored, never
-/// logged, and cannot be recovered from this row.
-model PasswordResetToken {
+/// `codeHash` is `HMAC-SHA256("pwreset:v1:" + code, OTP_HMAC_SECRET)`. **Keyed,
+/// unlike the token it replaces** — and for the reason the step 3 entry gave
+/// for *not* keying it: an unkeyed hash is reversible exactly when the input
+/// space is small enough to enumerate, and 10^8 is. The `pwreset:v1:` prefix
+/// is domain separation, so a reset digest can never equal an unlock digest for
+/// the same digits even though both use the same secret.
+///
+/// There is no unique index on `codeHash`: codes are looked up by `userId`
+/// (resolved from the submitted identifier), and two users may legitimately
+/// hold the same 8 digits.
+model PasswordResetCode {
   id     String @id @default(cuid())
   userId String
 
-  /// SHA-256 hex of the opaque token. Unique so one secret can never have two
-  /// live rows.
-  tokenHash String @unique
+  /// HMAC of the code. The code itself exists only in memory and in the
+  /// message — never stored, never logged, never in a response.
+  codeHash String
 
   expiresAt DateTime
-  /// Set when the token was redeemed, **or** when a newer request superseded
-  /// it. Either way it can never be used again — one live link at a time, the
-  /// same discipline `UnlockChallenge` follows.
+  /// Wrong guesses so far. **Load-bearing**: an 8-digit code is only safe
+  /// because this is enforced atomically, in the `where` of the incrementing
+  /// update. See passwordReset.service.ts.
+  attempts  Int       @default(0)
+  /// Set on success, when the attempt limit is burned, or when a newer request
+  /// superseded this one. Either way it can never be used again.
   consumedAt DateTime?
 
-  /// Captured at request time to make an audit trail useful, never for auth.
+  /// Captured at request time for the audit trail, never for auth.
   requestedIp String?
   userAgent   String?
   createdAt   DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  /// Finding and superseding a user's outstanding tokens.
+  /// Finding a user's one open code.
   @@index([userId, consumedAt])
   @@index([expiresAt])
 }

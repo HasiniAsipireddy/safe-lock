@@ -46,8 +46,17 @@ export const AUDIT_ACTIONS = {
   PASSWORD_RESET_REQUESTED_UNKNOWN: 'auth.password.reset_requested_unknown',
   /** A reset token was redeemed: the password changed and all sessions ended. */
   PASSWORD_RESET_COMPLETED: 'auth.password.reset_completed',
-  /** A reset token that was unknown, expired or already used. */
+  /** A reset code that was unknown, wrong, expired or already used. */
   PASSWORD_RESET_REJECTED: 'auth.password.reset_rejected',
+  /**
+   * A reset code burned all five attempts.
+   *
+   * Audited separately because it is the one reset failure that is a signal
+   * rather than noise — somebody guessing, or a user who cannot read their
+   * message. The HTTP response is identical to any other failure; this row is
+   * the only place the difference exists.
+   */
+  PASSWORD_RESET_CODE_EXHAUSTED: 'auth.password.reset_code_exhausted',
   /** A signed-in user changed their own password. */
   PASSWORD_CHANGED: 'auth.password.changed',
   /** A change-password attempt that failed — usually a wrong current password. */

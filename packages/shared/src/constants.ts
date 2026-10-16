@@ -47,14 +47,16 @@ export const ERROR_CODES = {
 
   // --- Account / password ---------------------------------------------------
   /**
-   * A password reset token that was unknown, expired or already used.
+   * A password reset code that could not be redeemed.
    *
-   * **One code for all three on purpose.** Telling the holder of a token which
-   * of those it is tells them whether it ever existed, and a reset link is
-   * exactly the kind of thing that ends up in a forwarded email or a shared
-   * browser history.
+   * **One code for every reason, on purpose.** Unknown identifier, no
+   * outstanding code, wrong code, expired code, already-used code and
+   * attempts-exhausted all answer with this and an identical message. Telling
+   * the caller which it was would say whether the account exists — and this
+   * endpoint is unauthenticated, so that is an enumeration oracle for who owns
+   * a safe.
    */
-  RESET_TOKEN_INVALID: 'RESET_TOKEN_INVALID',
+  RESET_CODE_INVALID: 'RESET_CODE_INVALID',
   /**
    * The `currentPassword` supplied to `POST /auth/password/change` was wrong.
    *
