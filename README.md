@@ -828,6 +828,34 @@ asserting no hash, token or credential field appears in any admin response.
 **Concurrency is tested against real Postgres**, not a mock — the constraints
 are the behaviour under test, and a mock cannot have them.
 
+### The HTTP verification script
+
+```bash
+npm run dev:api                      # in another terminal
+npm --workspace apps/api run db:seed # needs an ADMIN account
+bash scripts/verify-rental-http.sh
+```
+
+119 checks over real HTTP against a running server: signup, quote, hold,
+activation by webhook, the clock starting at payment, overstay accrual, the
+unlock/lock asymmetry, collect refused while a fee is owed, an expired quote
+flagged rather than settled, collect, re-booking, the admin overrides, the
+removed endpoints, CSRF, and the sweeper.
+
+It is **not** a replacement for the test suite — it shares a database with your
+dev environment and resets the device table to one safe. It exists because it
+found a sweeper defect the suite could not: see `docs/decisions.md`.
+
+Two things it cannot cover, both stated in the script:
+
+- **Razorpay order creation**, if your `.env` has placeholder keys. The script
+  asserts the clean 502 and then seeds the `Payment` row the order endpoint
+  would have written, so everything downstream runs for real. With live test
+  keys those steps return 200 instead.
+- **The browser.** Every page is checked to compile and serve, but nothing
+  clicks through the UI. Mock mode (`NEXT_PUBLIC_USE_MOCK_API=true`) is the
+  place to do that by hand.
+
 Rate limiters are **not** disabled in tests. The shared `app()` helper builds a
 fresh app per request (so limiter counters reset and unrelated tests don't
 exhaust each other's quota); a test that exercises a limit holds one app
