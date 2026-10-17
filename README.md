@@ -1,8 +1,9 @@
 # Safe Lock
 
-A mobile-first web platform for locking and unlocking a physical smart safe
-remotely. See [`CLAUDE.md`](./CLAUDE.md) for the architecture and
-[`docs/decisions.md`](./docs/decisions.md) for why things are the way they are.
+A mobile-first web platform for **renting** a physical smart safe by the hour
+and locking or unlocking it remotely. See [`CLAUDE.md`](./CLAUDE.md) for the
+architecture and [`docs/decisions.md`](./docs/decisions.md) for why things are
+the way they are.
 
 ```
 apps/web        Next.js frontend (App Router, Tailwind)
@@ -10,19 +11,22 @@ apps/api        Express + Prisma backend, REST under /api/v1
 packages/shared Types, zod schemas and constants used by both
 ```
 
-**Built so far:** auth (signup / login / rotating sessions), the one-time
-Razorpay payment flow, the legal pages, device inventory + manual allocation
-with an admin panel, and **remote lock / unlock with a one-time code** against
-a mock device.
+**Built so far:** auth (signup / login / rotating sessions, password reset by
+one-time code), **hourly rental bookings** — hold, pay, extend, overstay fees,
+collect — paid through Razorpay, **remote lock / unlock with a one-time code**
+against a mock device, WhatsApp delivery with phone verification, the
+`/history` activity feed with in-app notifications, an admin panel (bookings,
+device inventory, users, payments, audit), and the legal pages.
 
-Also built: the **`/history` activity feed** and **in-app unlock
-notifications** (a header bell with an unread count).
+**Not built yet:** real hardware. The device gateway is a mock that always
+acks, which means a booking completion commands the safe locked on a
+best-effort basis — see step 9 in `CLAUDE.md`.
 
-**Not built yet:** real hardware (the gateway is a mock that always acks),
-phone verification, and **OTP delivery** — codes are printed to the API
-console in development and are *not* sent anywhere in production. Pick a
-channel before launch; see `docs/decisions.md`. Notifications are in-app only;
-WhatsApp plugs into the existing `Notifier` seam.
+**Before production:** WhatsApp needs **five Meta-approved templates** and the
+four `WHATSAPP_*` credentials; until then `WHATSAPP_PROVIDER=fake` is the only
+legal value and the env schema refuses `fake` in production. A user with no
+verified phone still has no password-reset channel — the one real gap, tracked
+in `CLAUDE.md`.
 
 ---
 
@@ -32,6 +36,17 @@ WhatsApp plugs into the existing `Notifier` seam.
   warning — see `docs/decisions.md`.
 - **Docker** — the dev database runs in a container.
 - npm 10+ (this repo uses npm workspaces, not pnpm).
+- **PostgreSQL with the `btree_gist` extension available.** The booking
+  migration runs `CREATE EXTENSION IF NOT EXISTS btree_gist` itself, which the
+  Docker image allows. It is needed for the exclusion constraint that stops two
+  bookings occupying one safe (mixing `=` on `deviceId` with `&&` on a time
+  range in one constraint requires it).
+
+  **If you deploy to managed Postgres, check that extension is permitted
+  first.** `btree_gist` is a standard contrib module and is allowed on RDS,
+  Cloud SQL, Azure, Supabase and Neon — but it is the one thing in this design
+  a provider can simply refuse, and without it the migration fails at deploy
+  time rather than at runtime.
 
 ## First run
 
@@ -72,7 +87,13 @@ npm run dev:web    # http://localhost:3000
 
 `apps/web/.env.local` ships with `NEXT_PUBLIC_USE_MOCK_API=true`, which routes
 every API call to an in-browser fake. The whole payment flow works in mock
-mode: `/pay` shows a **Simulate payment** button instead of Razorpay Checkout.
+mode: every payment step shows a **Simulate payment** button instead of
+Razorpay Checkout, so booking, extending, paying an overstay fee and collecting
+can all be walked end to end with no backend and no Razorpay account.
+
+What mock mode **cannot** show is that concurrent booking is safe — there is no
+exclusion constraint in a browser tab. That guarantee is tested against real
+Postgres in the API suite, where it belongs.
 
 Demo account: `demo@example.com` / `Demo1234`.
 
@@ -186,16 +207,36 @@ so a user can quote it in a support request.
    ```
 
 The key secret stays on the server. Only the key id is ever sent to the
-browser, as part of the `POST /payments/order` response.
+browser, as part of a booking order response.
 
-### 2. Set the price
+### 2. Set the rates
 
 ```
-SAFE_PRICE_PAISE=99900    # paise, so 99900 = ₹999
+RENTAL_HOURLY_RATE_PAISE=10000   # paise/hour, so 10000 = ₹100/hour
+RENTAL_MIN_HOURS=1
+RENTAL_MAX_HOURS=24
+
+OVERSTAY_MULTIPLIER_BPS=15000    # basis points: 15000 = 1.5x the hourly rate
+OVERSTAY_GRACE_MINUTES=15        # free minutes after a booking ends
+OVERSTAY_CAP_HOURS=24            # most hours of overstay ever charged
+COLLECTION_WINDOW_MINUTES=30     # time to collect after the fee is settled
+
+BOOKING_HOLD_MINUTES=10          # how long an unpaid booking holds its safe
+OVERSTAY_QUOTE_TTL_MINUTES=15    # how long an overstay quote is binding
 ```
 
-The price is read from this variable on every order. The client never sends an
-amount, and a request body that tries to is rejected.
+Every amount is computed server-side from these on every order. The client
+never sends an amount, and a request body that tries to is rejected by a
+`.strict()` schema.
+
+**These five are snapshotted onto each booking at creation**
+(`hourlyRatePaise`, `overstayMultiplierBps`, `graceMinutes`, `capHours`,
+`collectionWindowMinutes`), so changing any of them never re-prices a booking
+that is already running. The multiplier is basis points rather than a decimal
+because money must never touch a float.
+
+All of these are **provisional placeholders**, not business decisions — see the
+open questions in `CLAUDE.md`.
 
 ### 3. Set up the webhook with ngrok
 
@@ -247,20 +288,61 @@ force a failure).
 ### 5. Walking the flow
 
 1. Sign up at `http://localhost:3000/signup`.
-2. You land on `/pay`. It shows the price from the API.
-3. Click **Pay now** → Razorpay Checkout opens with your name, email and phone
+2. You land on `/dashboard`, which says you have no safe booked.
+3. Click **Book a safe** → `/book`. Pick a duration; the price for each comes
+   from the server's quote, and the overstay rule is stated with its real
+   figures *before* you commit to anything.
+4. Click **Continue to payment**. A safe is now **held** for
+   `BOOKING_HOLD_MINUTES` — the booking is `PENDING_PAYMENT` and no money has
+   moved. Your rental hours have **not** started yet.
+5. Click **Pay** → Razorpay Checkout opens with your name, email and phone
    prefilled.
-4. Pay with a test card. Checkout calls back, the browser posts to
+6. Pay with a test card. Checkout calls back, the browser posts to
    `/payments/verify`, and the server checks the HMAC signature before marking
-   the payment `PAID`.
-5. Separately, Razorpay delivers `payment.captured` to your webhook. **The
-   webhook is the source of truth** — if you close the tab before step 4, the
-   webhook still activates the account.
-6. `/dashboard` drops the "Complete payment" banner.
+   the payment `PAID` **and activating the booking in the same transaction**.
+   `endsAt` is set from *now*, so a slow checkout did not cost you time.
+7. Separately, Razorpay delivers `payment.captured` to your webhook. **The
+   webhook is the source of truth** — if you close the tab before step 6, the
+   webhook still activates the booking.
+8. `/dashboard` now shows the safe with working Lock / Unlock controls, the
+   time left, and buttons to **extend** or **collect**.
+
+**Extending:** pick extra hours on the dashboard and pay. Allowed while running
+and during the grace period, refused once a fee is actually owed.
+
+**Collecting:** "I've collected my items" ends the booking and returns the safe
+to the pool. This is an explicit user action because the safe cannot tell
+whether it is empty.
+
+**Seeing an overstay** without waiting an hour — edit the row directly:
+
+```bash
+npm --workspace apps/api run prisma:studio
+```
+
+Set the booking's `endsAt` to about 90 minutes ago (which is past the
+15-minute grace period, so one hour has accrued). Reload `/dashboard`:
+
+- the booking reads **Overstaying** with a fee, computed from the clock —
+  **before the sweeper has run**, which is the whole point of deriving status
+  on every read;
+- **Unlock is disabled** with the reason shown, and **Lock still works**;
+- **Collect is disabled** too, and the API refuses it with 402
+  `OVERSTAY_PAYMENT_REQUIRED` if called directly;
+- paying the fee opens a collection window and re-enables both.
+
+**A payment that cannot be applied.** Let a hold lapse (set `holdExpiresAt`
+into the past), have a second account book the same safe, then deliver a
+`payment.captured` for the first order. The payment stays `PAID`, gets
+`reviewReason: BOOKING_EXPIRED_DEVICE_TAKEN`, appears under **Admin →
+Payments → Needs a refund**, and `/payments/verify` answers
+`needsReview: true` — which the UI renders as "your payment went through but
+we could not apply it", never as success.
 
 To test a refund: find the payment in the Dashboard, issue a refund, and watch
-`refund.processed` arrive. The payment flips to `REFUNDED` and the account
-stops counting as paid.
+`refund.processed` arrive. The payment flips to `REFUNDED` and any review flag
+is cleared. **It does not end the booking** — a safe someone is physically
+using cannot be reclaimed by a webhook.
 
 ### Checking what happened
 
@@ -268,9 +350,10 @@ stops counting as paid.
 npm --workspace apps/api run prisma:studio
 ```
 
-`Payment` holds the order and its status, `WebhookEvent` is the idempotency
-ledger (one row per delivered event id), and `AuditLog` records every order,
-verification, signature failure and webhook.
+`Booking` holds the rental and its rate snapshot, `Payment` holds the order,
+its `purpose` and any `reviewReason`, `WebhookEvent` is the idempotency ledger
+(one row per delivered event id), and `AuditLog` records every booking action,
+order, verification, signature failure and webhook.
 
 ---
 
@@ -283,33 +366,52 @@ verification, signature failure and webhook.
 | `POST` | `/api/v1/auth/login` | none | Email-or-phone + password |
 | `POST` | `/api/v1/auth/refresh` | refresh cookie | Rotate the session |
 | `POST` | `/api/v1/auth/logout` | optional | Revoke the refresh token, clear cookies |
-| `GET` | `/api/v1/auth/me` | access cookie | Current user, incl. `hasPaid` and `deviceAllocated` |
-| `GET` | `/api/v1/devices/mine` | cookie + paid | The caller's device, or `null` while awaiting allocation |
+| `GET` | `/api/v1/auth/me` | access cookie | Current user. **No payment or device flags** — ask `/bookings/current`. |
+| `GET` | `/api/v1/bookings/current` | cookie | The caller's live booking (or `null`) **plus a quote** for a new one |
+| `GET` | `/api/v1/bookings/:id` | cookie | One of the caller's bookings. 404 for anyone else's. |
+| `POST` | `/api/v1/bookings` | cookie | `{ hours }` — holds a safe, `PENDING_PAYMENT`. No amount in the body. |
+| `POST` | `/api/v1/bookings/:id/order` | cookie | Razorpay order for the booking, priced server-side |
+| `POST` | `/api/v1/bookings/:id/extend/order` | cookie | `{ hours }` — order for an extension, at the booking's snapshotted rate |
+| `POST` | `/api/v1/bookings/:id/overstay/order` | cookie | Order for the outstanding fee. Quote binding for a TTL. |
+| `POST` | `/api/v1/bookings/:id/collect` | cookie | "I've got my things" — ends it. `402` while a fee is owed. |
+| `POST` | `/api/v1/bookings/:id/cancel` | cookie | Cancel an **unpaid** booking and release the safe |
+| `GET` | `/api/v1/devices/mine` | cookie | The safe the caller's paid booking holds, or `null` |
 | `POST` | `/api/v1/devices/lock` | cookie | Lock the safe. Idempotent — an already-locked safe is a 200. |
 | `POST` | `/api/v1/devices/unlock/request` | cookie | Send a one-time code. Returns no code. |
 | `POST` | `/api/v1/devices/unlock/confirm` | cookie | `{ otp }`; only this opens the safe. |
 | `GET` | `/api/v1/devices/history` | cookie | The caller's activity, newest first. `?cursor=&limit=` (max 50). |
 | `GET` | `/api/v1/notifications` | cookie | Unread first, plus the total unread count. `?limit=` |
 | `POST` | `/api/v1/notifications/read` | cookie | `{ ids? }` — mark read. Idempotent; omit `ids` for all. |
-| `GET` | `/api/v1/admin/devices` | ADMIN | Inventory, with `status`, `q`, `page` |
+| `GET` | `/api/v1/admin/bookings` | ADMIN | Bookings, with `status`, `flagged`, `q`, `page` |
+| `POST` | `/api/v1/admin/bookings/:id/force-complete` | ADMIN | `{ reason, needsInspection? }` — end it by hand |
+| `POST` | `/api/v1/admin/bookings/:id/waive-overstay` | ADMIN | `{ reason }` — write the fee off |
+| `GET` | `/api/v1/admin/devices` | ADMIN | Inventory, with `status`, `occupied`, `q`, `page` |
 | `POST` | `/api/v1/admin/devices` · `/devices/bulk` | ADMIN | Add one, or up to 500 with per-row results |
-| `POST` | `/api/v1/admin/devices/:id/allocate` · `/allocate-next` | ADMIN | Allocate a specific or the next device |
-| `POST` | `/api/v1/admin/devices/:id/unassign` · `/retire` | ADMIN | Return to stock, or take out of service |
+| `POST` | `/api/v1/admin/devices/:id/clear-inspection` | ADMIN | `{ note }` — return an inspected safe to the pool |
+| `POST` | `/api/v1/admin/devices/:id/retire` | ADMIN | Take out of service. Refused if it has a live booking. |
+| `POST` | `/api/v1/admin/payments/:id/clear-review` | ADMIN | `{ note }` — record that flagged money was refunded by hand |
 | `GET` | `/api/v1/admin/users` · `/payments` · `/audit` | ADMIN | Paginated admin listings |
-| `POST` | `/api/v1/payments/order` | cookie | Create a Razorpay order at the server price. `409` if already paid. |
-| `POST` | `/api/v1/payments/verify` | cookie | Verify the Checkout signature and mark `PAID`. Idempotent. |
+| `POST` | `/api/v1/payments/verify` | cookie | Verify the Checkout signature, mark `PAID` and apply it. Idempotent. |
 | `POST` | `/api/v1/payments/webhook` | HMAC | Razorpay's callback. Raw body, signature-verified, deduped by event id. |
-| `GET` | `/api/v1/payments/me` | cookie | `hasPaid` plus the latest payment summary and the current price. |
 
-`requirePaid` (`apps/api/src/middleware/requirePaid.ts`) returns `402` for a
-user without a verified payment; `requireAdmin` returns `403` for non-admins
-and is applied to the whole `/admin` router.
+**Gone with the purchase model:** `POST /payments/order`, `GET /payments/me`,
+`/admin/devices/:id/allocate`, `/admin/allocate-next`,
+`/admin/devices/:id/unassign`, and the `requirePaid` middleware. Orders are
+created from the booking routes, where the amount comes from a booking's
+snapshotted rates. `requireAdmin` returns `403` for non-admins and is applied
+to the whole `/admin` router.
 
-`/devices/history` and the notification routes carry **`requireAuth` only** —
-no payment or allocation gate. They serve the caller's own record, so a user
-awaiting allocation and a refunded user both get an empty list rather than an
+**No booking request carries an amount, a start time or an end time.** The
+duration in hours is the only thing a client chooses; every other figure is the
+server's, and the schemas are `.strict()` so a body supplying one is a 400
+rather than a silent ignore.
+
+`/devices/mine`, `/devices/history` and the notification routes carry
+**`requireAuth` only** — no eligibility gate. They serve the caller's own
+record, so a user between bookings gets `null` or an empty list rather than an
 error. The lock/unlock routes are the opposite: they go through
-`assertCanOperate`, which requires a settled payment *and* an assigned device.
+`assertCanOperate`, which requires a verified phone, a live booking, and (for
+unlock) no outstanding fee.
 
 ---
 
@@ -326,6 +428,28 @@ Sign in as that account and an **Admin** link appears in the header. The link
 is only rendered for admins, but that is cosmetic — every `/admin/*` endpoint
 is behind `requireAdmin` on the server, so typing the URL achieves nothing.
 
+### Bookings — the work queue
+
+**Admin → Bookings** opens on **Needs attention**, and that default is the
+point. Two situations will otherwise sit unnoticed forever:
+
+- an **unpaid overstay**, which nothing completes automatically. The fee is
+  capped, the safe stays reserved, and the sweeper deliberately leaves the row
+  alone — because quietly releasing a safe that may still hold somebody's
+  belongings is the one outcome worth avoiding at any cost;
+- a booking whose safe came back with **unknown contents** and is sitting in
+  `NEEDS_INSPECTION`.
+
+Two actions, both requiring a reason that is recorded on the booking and in the
+audit log:
+
+- **Force complete** ends a booking by hand. The **"hold this safe for a staff
+  check"** box is **on by default** — leave it on unless you have opened the
+  safe yourself and know it is empty, because the next renter would be able to
+  unlock whatever is inside.
+- **Waive fee** writes an overstay off. The renter can then unlock and collect.
+  It records zero collected, so a write-off never looks like revenue.
+
 ### Adding devices to the inventory
 
 **Admin → Devices.** Two ways:
@@ -340,61 +464,76 @@ Serials must match `SAFE-` followed by 4–12 digits or capitals (e.g.
 `safe-0001` and `SAFE-0001` are the same device and cannot be added twice. The
 format is **provisional** — see `docs/decisions.md` before ordering hardware.
 
-### Allocating a safe
+### There is no allocation
 
-A user who has paid shows up under **Admin → Users** as *Awaiting allocation*;
-that filter is the work queue. Click **Allocate** and choose:
+Paying for a booking is what gets a safe, and which safe is decided by the
+booking service under `FOR UPDATE SKIP LOCKED`, with a Postgres exclusion
+constraint as the actual guarantee. The Devices tab shows who currently has
+each safe and until when; the Users tab shows the same thing from the other
+side.
 
-- **Next available** — takes the oldest device in stock. The right default: it
-  uses a row lock, so two admins allocating at the same moment get different
-  devices rather than colliding.
-- **A specific device** — when the physical unit in hand must match the record.
+### Clearing an inspection, and retiring
 
-The user's dashboard switches from the waiting timeline to their safe card on
-their next load. Allocation requires a `PAID` payment; an attempt for an unpaid
-user is refused with `402 NOT_PAID` and the failure is audited.
-
-### Unassigning and retiring
-
-- **Unassign** returns a device to stock and revokes the user's access. Its
-  lock state resets to `UNKNOWN` — the state of a safe nobody owns is not
-  something we know.
+- **Clear inspection** returns a `NEEDS_INSPECTION` safe to the bookable pool.
+  It **requires a note**, and the note is the point: it is the only record that
+  a human looked inside. Audited.
 - **Retire** takes a device permanently out of service. It is **refused while
-  the device is assigned** (`DEVICE_STILL_ASSIGNED`): unassign first, so
-  hardware is never retired out of someone's hands.
+  the device has a live booking** (`DEVICE_HAS_LIVE_BOOKING`): force-complete
+  first, so hardware is never retired out of a renter's hands.
 
-Both ask for confirmation.
+### Payments that need a refund
+
+**Admin → Payments → Needs a refund** lists money we captured and could not
+apply. Those rows stay `PAID` — we never rewrite a payment to pretend it did
+not happen — so this filter is the only way to find them.
+
+**The refund itself happens in the Razorpay dashboard.** There is no refund
+call anywhere in this codebase: the dashboard is the only place with the
+authority and its own ledger. Issue the refund there, then click **Mark
+refunded** here with a note (a Razorpay refund id is ideal). That records it
+without touching the payment's status — a payment is `PAID` until Razorpay says
+otherwise, and the `refund.processed` webhook is what says so. When that webhook
+arrives it clears the flag by itself, so the manual step covers the cases where
+it never does.
 
 ## Locking and unlocking
 
-Once a safe is allocated, its owner gets working controls on `/dashboard`.
+Once a booking is paid, the renter gets working controls on `/dashboard`.
 
 **Lock** is one tap plus a confirmation. It is idempotent — locking an
-already-locked safe is a success that sends no command, not a 409.
+already-locked safe is a success that sends no command, not a 409. It stays
+available during an unpaid overstay, and for an unverified phone: refusing to
+let someone secure a safe they are standing at would punish them in the one
+direction that creates risk.
 
 **Unlock** always costs a one-time code:
 
 1. Tap **Unlock**. The API creates a challenge and generates a 6-digit code.
-2. In development the code is **printed to the API terminal**:
+2. The code is sent over **WhatsApp** to the verified number. In development it
+   is also **printed to the API terminal**:
    ```
    [dev] Unlock code for SAFE-0001: 418290  (expires 2026-10-16T05:12:44.901Z)
    ```
    In mock mode (no backend) it is shown in an amber panel in the dialog
-   instead. In production nothing is sent yet — pick a delivery channel first.
+   instead.
 3. Type or paste it. 5 minutes, single use, 5 wrong attempts before the
    challenge dies. Requesting a new code kills the old one.
+
+Eligibility is re-checked **inside the confirm transaction with the device row
+locked**, not only when the code was requested — a booking can end between the
+two. Completing a booking also consumes every open challenge for it.
 
 Both routes refuse anyone who is not entitled, with a code the UI can act on:
 
 | Code | Status | Meaning |
 | --- | --- | --- |
-| `NOT_PAID` | 402 | No settled payment. Paying fixes it. |
-| `REFUNDED_CONTACT_SUPPORT` | 403 | Refunded but still holding the safe. Paying does **not** fix it. |
-| `NO_DEVICE` | 409 | Paid, waiting for an admin to allocate. |
+| `NO_ACTIVE_BOOKING` | 409 | No live, paid booking. Booking one fixes it. |
+| `OVERSTAY_PAYMENT_REQUIRED` | 402 | A fee is owed. **Unlock and collect are refused; lock is not.** |
+| `PHONE_NOT_VERIFIED` | 403 | Unlock only — the one-time code has nowhere to go. |
 | `DEVICE_STATE_UNKNOWN` | 409 | The safe is not reporting a state. Should be unreachable. |
 | `OTP_INVALID` / `OTP_EXPIRED` / `OTP_TOO_MANY_ATTEMPTS` / `OTP_NOT_FOUND` | 400 | Code problems. |
 
-Every state change writes a `DeviceEvent` (the owner's activity feed, which
+Every state change writes a `DeviceEvent` (the renter's activity feed, which
 `/history` reads) **and** an `AuditLog` row. Failed code attempts are written
 to both as well — a run of them against one account is worth seeing, and the
 event carries a `failureReason` from a fixed enum. Neither ever contains the
@@ -405,30 +544,32 @@ code.
 **`/history`** shows every lock and unlock on the caller's safe, grouped by
 local day, newest first, with a **Load more** button (cursor-paginated — see
 `docs/decisions.md` for why not an offset). Reachable from the nav and the
-dashboard, and readable by any signed-in user including one with no safe yet.
+dashboard, and readable by any signed-in user including one with no booking.
 
 An **unlock writes a `Notification` in the same transaction as the event**, so
-there is no unlock the owner was not told about and no notification about an
+there is no unlock the renter was not told about and no notification about an
 unlock that rolled back. The header **bell** shows the unread count and polls
 every 60 seconds while the tab is visible (pausing when hidden, refetching
 immediately on return). Opening it marks the loaded notifications read.
 
 Only two things notify: a **confirmed unlock**, and an unlock attempt that
 **burns all 5 code attempts** — a possible tampering signal. A single mistyped
-digit does not, and neither does locking. Adding WhatsApp (step 4) means a new
-implementation of `Notifier` and no change to the unlock service.
+digit does not, and neither does locking.
 
 The device layer behind all of this is one interface, `DeviceGateway`, with a
 mock implementation that always acks after a short delay. Swapping in the real
 MQTT gateway touches no route. See `docs/decisions.md`.
 
-### Refunded users who still hold a safe
+### A refund does not end a booking
 
-A refund sets `hasPaid` false but **does not** reclaim the device — that stays
-a human decision. Those users appear at the top of **Admin → Users**,
-highlighted and labelled *"Refunded — device still assigned"*, with
-**Unassign** on the row. Their dashboard shows an explicit "payment was
-refunded, contact support" state with no safe card and no controls.
+A refund marks the money returned and nothing else. A safe someone is
+physically using cannot be reclaimed by a webhook, and a booking already used
+has nothing left to revoke — so `refund.processed` flips the `Payment` row to
+`REFUNDED` and leaves the `Booking` alone.
+
+If a refunded booking should also end, that is a deliberate admin action:
+**Admin → Bookings → Force complete**, with a reason. Whether it *should* is
+part of the still-open refund policy.
 
 ### Audit
 
@@ -644,25 +785,48 @@ HMAC signature in the tests is computed for real.
 npm --workspace apps/api test
 ```
 
-Covered: payment order/verify/webhook and idempotency, `requirePaid`, refresh
-rotation, reuse detection (including that a post-window replay kills grace
-siblings), the 10-second grace window, cookie `Path` attributes, the Origin
-allowlist, both rate-limit limbs and 429 response parity, `/health` degraded,
-and seed idempotency.
+Covered: payment verify/webhook and idempotency, refresh rotation, reuse
+detection (including that a post-window replay kills grace siblings), the
+10-second grace window, cookie `Path` attributes, the Origin allowlist, both
+rate-limit limbs and 429 response parity, `/health` degraded, and seed
+idempotency.
 
-Device and admin coverage: allocation preconditions, next-available ordering,
-`NO_DEVICES_IN_STOCK`, unassign/retire rules, bulk per-row reporting and serial
-normalisation, cross-user device isolation, `requireAdmin` on **every** admin
-route (table-driven, so an unprotected new route shows up as a missing entry),
-a SQL-injection-shaped search term treated as literal text, and a recursive
-scan asserting no hash, token or credential field appears in any admin
-response.
+**Booking coverage** — the rental model's rules, each tested as the rule rather
+than as a code path:
 
-**Concurrency is tested against real Postgres**, not a mock — the row locking
-is the behaviour under test. Ten simultaneous allocations land on ten distinct
-devices; one device and two users yields exactly one winner and one clean
-`NO_DEVICES_IN_STOCK`; two simultaneous allocations for one user yield exactly
-one device.
+- **The exclusion constraint, against Postgres directly.** These tests bypass
+  the service and insert rows, because the claim is about the database: if the
+  constraint were dropped by a future migration, every service-level test would
+  still pass and only these would fail. Overlap rejected, unpaid holds counted
+  as occupying, `[)` bounds letting back-to-back rentals through, terminal rows
+  leaving the constraint, and one-live-booking-per-user across devices.
+- **The clock starts at payment**, so a booking created an hour before it is
+  paid for still gets its full duration.
+- **Collect during an unpaid overstay** is refused *and* the safe stays
+  reserved — asserted by having the next renter try to book it and be refused.
+- **Late payment, both branches**: safe still free → re-activated with a fresh
+  clock; safe taken → payment stays `PAID`, flagged, on the admin refund queue,
+  and the second renter keeps their booking.
+- **The overstay quote TTL**: growth inside the window absorbed; an expired
+  quote whose fee outgrew it refused, flagged, and leaving the fee outstanding
+  so unlock and collect are still refused; an expired quote that still covers
+  the fee honoured.
+- **A code outlives nothing**: an OTP requested while `ACTIVE` then confirmed
+  after collection, after an overstay begins, or after a force-complete all
+  fail, and the bolt does not move.
+- **The sweeper never completes an unpaid overstay**, across repeated passes,
+  however long it has run — and only `COLLECTED` returns a safe to the pool.
+
+Device and admin coverage: retire preconditions, clear-inspection requiring a
+note, a flagged safe staying out of the booking pool until cleared, the
+`flagged` work queue, waive-not-revenue, bulk per-row reporting and serial
+normalisation, cross-user isolation, `requireAdmin` on **every** admin route
+(table-driven, so an unprotected new route shows up as a missing entry), a
+SQL-injection-shaped search term treated as literal text, and a recursive scan
+asserting no hash, token or credential field appears in any admin response.
+
+**Concurrency is tested against real Postgres**, not a mock — the constraints
+are the behaviour under test, and a mock cannot have them.
 
 Rate limiters are **not** disabled in tests. The shared `app()` helper builds a
 fresh app per request (so limiter counters reset and unrelated tests don't

@@ -1686,3 +1686,328 @@ stale tab gets a plain 401 rather than a false theft cascade.
 **Still open:** a user with no verified phone has no channel, so reset remains
 unreachable for them. That is the email-provider question in CLAUDE.md, and the
 reason the dashboard nags unverified users.
+
+---
+
+## 2026-10-17 — Rentals replace the one-time purchase (step 8)
+
+The product is a **rental**: a user books a safe by the hour, pays, uses it,
+and collects their belongings. The one-time ₹999 activation, permanent device
+ownership and admin allocation are all gone. This is the largest model change
+the codebase has had, so the reasoning is recorded at length.
+
+### Nobody owns a device
+
+`Device.ownerId` is deleted. Occupancy is a property of a `Booking`, not a
+column on the device, which means the question "who has this safe" has an
+answer with a *duration* attached. Everything that used to be derived from
+ownership — `/devices/mine`, `assertCanOperate`, the admin device row — now
+resolves through the caller's live booking instead.
+
+### Two constraints, not two service checks
+
+The purchase model's one correctness guarantee was a unique index on
+`Device.ownerId`: the allocation service also checked, but a check is a read
+followed by a write and two concurrent allocations can both pass the read. The
+rental model needs the same guarantee for a harder shape, and gets it the same
+way:
+
+- `Booking_device_no_overlap` — `EXCLUDE USING gist (deviceId WITH =,
+  tsrange(startsAt, reservedUntil, '[)') WITH &&)`, restricted by a `WHERE` to
+  the three occupying statuses. Terminal rows leave the constraint entirely,
+  which is what frees a safe.
+- `Booking_one_live_per_user` — a partial unique index. This is what closes the
+  obvious abuse of holding a safe before paying: without it anyone could open
+  unpaid bookings until the pool was empty.
+
+Both live in a raw-SQL migration because Prisma models neither. The service
+still checks, and the checks still matter — they produce a decent error message
+instead of a 500 — but the constraint is what is *true* under concurrency.
+
+**`tsrange`, not `tstzrange`.** Prisma maps `DateTime` to `timestamp(3)`
+*without* time zone and the driver writes every value as UTC. Casting to
+`timestamptz` depends on the session `TimeZone`, which is therefore not
+`IMMUTABLE`, and Postgres refuses a non-immutable expression in an index. A
+`tsrange` over the stored UTC values is immutable and compares exactly the
+instants we mean. The column types were checked against the live database, not
+assumed.
+
+**`[)` bounds**, so a booking reserved until 12:45 does not collide with one
+starting at 12:45 — without which every back-to-back rental would be rejected.
+
+The migration creates `btree_gist` itself (needed to mix `=` with `&&` in one
+exclusion constraint). **Managed Postgres must allow that extension** — noted
+in the README, because it is the one thing in this design that a hosting
+provider can simply refuse.
+
+There is a test that inserts overlapping rows directly, bypassing the service.
+If the constraint were dropped by a future migration, every service-level test
+would still pass and only that one would fail.
+
+### The device is held from creation; the clock starts at payment
+
+A `PENDING_PAYMENT` booking reserves a safe for `BOOKING_HOLD_MINUTES`, so a
+user who pays is never told "sorry, gone". Two consequences had to be handled:
+
+- **`endsAt` is null while pending** and set to `paidAt + hours` at activation.
+  A slow checkout must not eat into purchased time. But the hold still has to
+  reserve the *whole intended window* — otherwise another booking could be sold
+  into it and the payment would have nowhere to land — so `reservedUntil` is
+  computed from a provisional end of `now + hours`.
+- **`reservedUntil` covers grace plus the collection window**, not just
+  `endsAt`. The safe may still physically contain somebody's belongings for all
+  of it, so a back-to-back booking must not be sold into the turnaround.
+
+For a pending booking, then: `startsAt` = now, `endsAt` = null,
+`holdExpiresAt` = now + hold, `reservedUntil` = provisional end + grace +
+collection window. All four are set at creation, and the exclusion constraint
+covers the hold from the first instant.
+
+### Status is derived from the clock on every read
+
+`effectiveBookingStatus` is the function every read asks, and the stored
+`status` column is explicitly allowed to lag. The sweeper is a **reconciler**,
+not an authority: it moves rows, releases safes and pushes `reservedUntil` out,
+but it decides nothing. A sweeper that is late, wedged or has never run cannot
+make a safe unlockable — that is the property which makes a 60-second loop safe
+to operate, and nothing in the sweeper may ever become the only thing enforcing
+a transition.
+
+Clients must branch on `effectiveStatus`, never `status`, and the type's
+documentation says so. The mock API derives it with the same shared function,
+since it has no sweeper at all.
+
+### Only `COLLECTED` returns a safe to the pool
+
+This is the decision with the sharpest safety argument, and it overrode the
+first draft of the plan, which released the device when a collection window
+lapsed.
+
+A booking can end three ways, recorded in `completionReason`:
+
+| Reason | What happens to the safe |
+|---|---|
+| `COLLECTED` — the user said they have their things | back to `AVAILABLE` |
+| `COLLECTION_WINDOW_LAPSED` | `NEEDS_INSPECTION` |
+| `ADMIN_FORCE_COMPLETED` | the admin chooses, defaulting to `NEEDS_INSPECTION` |
+
+The safe cannot tell whether it is empty. If a booking ends without the renter
+confirming collection, the contents are **unknown**, and releasing it would
+hand the next renter a safe containing someone else's property *along with the
+ability to unlock it*. That is strictly worse than a safe sitting idle, so a
+`NEEDS_INSPECTION` device leaves the bookable pool until an admin clears it
+with a required, audited note.
+
+`DeviceStatus` gains `NEEDS_INSPECTION` now. `MAINTENANCE` can wait for
+hardware; there is nothing to maintain yet.
+
+**An admin force-completing chooses**, defaulting to inspection. Making it
+unconditional would leave an admin who has just looked inside unable to say so,
+which pushes them towards clearing the flag immediately afterwards without
+looking — the same two clicks with the check skipped. Defaulting the other way
+would release a possibly-occupied safe on a careless click.
+
+### An unpaid overstay is never completed, by design
+
+If a renter overstays and never pays, the booking stays `OVERSTAY` forever:
+the fee is capped (`OVERSTAY_CAP_HOURS`), the safe stays reserved (the sweeper
+pushes `reservedUntil` out in hourly steps), and the row appears in the admin
+flagged list. Nothing automatic releases it. The alternative — timing out and
+releasing — is the same failure as above with a timer attached.
+
+**Open question: the abandoned-items process.** What an operator actually does
+with a safe whose renter never returns — how long to hold it, how to contact
+them, what disposal is lawful — is a policy and probably legal question, not a
+software one. The software's job is to refuse to make the decision silently,
+which it now does.
+
+### Collect is refused while a fee is outstanding
+
+`OVERSTAY_PAYMENT_REQUIRED`, 402. Collect is allowed from `ACTIVE`, and from
+`OVERSTAY` only once the fee is settled or waived. The fee is the only leverage
+the product has, and letting someone take their belongings while owing it would
+discard it. There is a test that collect during an unpaid overstay fails *and*
+the device stays reserved — asserted by having the next renter try to book it
+and be refused.
+
+**Unlock is refused too; lock is not.** Refusing to let someone secure a safe
+they are standing at would punish them in the one direction that creates risk
+rather than recovering money. The same asymmetry the phone-verification gate
+already had.
+
+### Eligibility is re-checked inside the unlock transaction
+
+A one-time code lives for five minutes and knows nothing about bookings, so a
+code requested while a booking was live would otherwise still open the safe
+afterwards. Two independent guards:
+
+1. `confirmUnlock` re-runs `assertCanOperate` **inside the transaction, with
+   the device row locked**. That is the load-bearing check; the one before the
+   transaction exists to fail fast with a good message. A throw there rolls back
+   the challenge claim too, so a refusal that is not the user's fault does not
+   burn their code.
+2. Completing a booking consumes every open `UnlockChallenge` for it.
+
+Tested both ways: a code requested while `ACTIVE` then confirmed after
+collection, after an overstay begins, and after an admin force-complete all
+fail, and the bolt does not move.
+
+### Extensions are allowed during the grace period
+
+Someone five minutes over who wants another hour should be able to buy one
+rather than be pushed into an overstay fee. Refused once a fee is actually
+owed: the hour being extended has already been charged at the overstay rate, so
+that money is refundable rather than applicable, and the answer to an overstay
+is to pay it. Also refused if a later booking would collide — a limitation
+worth naming, since the person who booked after you has the better claim.
+
+Extensions are priced from the booking's **snapshot**, never the live config.
+
+### Rates are snapshotted onto every booking
+
+`hourlyRatePaise`, `overstayMultiplierBps`, `graceMinutes`, `capHours` and
+`collectionWindowMinutes` are copied onto the row at creation and read from
+there forever after. Changing an env var must never re-price a booking that is
+already running. The multiplier is **basis points** (15000 = 1.5x) because
+money must never touch a float and a fractional paisa cannot be charged.
+
+Overstay is billed per **started** hour with `Math.ceil`, so five minutes over
+costs an hour. That is stated on `/book` before anyone pays, which is the only
+thing that makes it defensible.
+
+### Money that cannot be applied stays PAID and gets flagged
+
+Three ways a captured payment can arrive with nowhere to go, each with its own
+`PaymentReviewReason`:
+
+- `BOOKING_EXPIRED_DEVICE_TAKEN` — the hold lapsed and the safe went to someone
+  else.
+- `OVERSTAY_QUOTE_EXPIRED` — see below.
+- `BOOKING_NO_LONGER_PAYABLE` — cancelled or completed before the money landed.
+
+In every case the `Payment` row **stays `PAID`**. We do not rewrite a payment
+to pretend it did not happen; that would put a lie in the one table that must
+not contain one. The row gets a `reviewReason`, appears in the admin
+needs-refund queue, and the user is told plainly — `VerifyPaymentResponse`
+carries `needsReview`, and the UI renders it as a red panel saying the money
+arrived, could not be applied, is logged for a refund, and do not pay again.
+
+**Refunds are manual.** There is no refund call anywhere in this codebase. An
+admin refunds in the Razorpay dashboard — the only place with the authority and
+its own ledger — and then records it here with a required, audited note
+(`POST /admin/payments/:id/clear-review`), which never touches `status`. The
+`refund.processed` webhook flips the row to `REFUNDED` and clears the flag by
+itself when it arrives, so the manual action covers the cases where it never
+does. Leaving a refunded row on the queue is wrong in the direction that gets a
+second refund issued.
+
+### A late payment re-activates when it can
+
+If a payment lands after the hold lapsed and the safe is **still free**, the
+booking is re-activated with a full fresh clock — the exclusion constraint
+re-checks the write, so this is safe. If the safe has been **taken**, nothing
+is forced: taking it back from a paying renter to give it to an earlier one
+would only move the problem, so the money is flagged.
+
+The Razorpay order's `expire_by` is set to the hold, so the gateway refuses
+most late attempts before they reach us — the cheapest place to stop them.
+That makes this window small rather than routine. Both branches are tested.
+
+### The overstay quote is binding for a bounded window
+
+A fee grows while the user is at the checkout, so the quoted amount is honoured
+for `OVERSTAY_QUOTE_TTL_MINUTES` (default 15) and the Razorpay order carries
+the same `expire_by`. Three cases:
+
+- **Within the window**, however much the fee has grown: settle it, and absorb
+  the difference. The alternative — settling partially and leaving a residue —
+  creates a loop in which the user can never finish paying, which is worse than
+  giving away at most one started hour. The audit row records what was absorbed
+  so the giveaway is visible.
+- **Past the window, amount still covers the fee**: settle it. The TTL exists
+  to stop us accepting too little, not to punish lateness.
+- **Past the window, fee has outgrown it**: **do not settle.** Flag it
+  `OVERSTAY_QUOTE_EXPIRED` for a manual refund. Settling would quietly accept
+  less than is owed and open the collection window on a part payment. The fee
+  stays outstanding, so unlock and collect are still refused and the user can
+  request a fresh quote — which is the behaviour the tests assert end to end.
+
+### The lock command is sent after the commit
+
+Every booking completion commands the safe locked, and the gateway call happens
+**after** the transaction, never inside it — the same rule the WhatsApp outbox
+follows, for the same reason: a network round trip cannot join a transaction,
+and a transaction cannot un-send one. It is best effort and logged loudly on
+failure, because a booking that has ended has ended whether or not the bolt
+moved, and failing the request would leave the database and the user's view
+disagreeing.
+
+**Real hardware must confirm this (step 9).** `lockState` only moves on an ack,
+so an unacked command leaves the stored state alone — which is correct but
+means a safe can be recorded as closed while physically open. With MQTT this
+becomes a `Command` row with a nonce and a 15-second timeout, and a completion
+whose lock is never acked will need to raise an operational alert rather than
+just a log line.
+
+### A refund no longer withdraws access
+
+Under the purchase model, `hasPaid: false` with `deviceAllocated: true` was a
+real state with its own dashboard screen. It is gone: what grants access is a
+booking you paid for, and a refund does not un-rent the hours you have already
+used. A safe somebody is physically holding cannot be reclaimed by a webhook
+either. Whether a refunded booking should be force-completed is a policy
+question, and the answer today is that an admin decides — which is exactly what
+the Bookings tab is for.
+
+### The destructive migration
+
+`Payment.purpose` is NOT NULL and every existing `Payment` row is an artefact
+of a model that no longer exists, with no honest purpose to assign it, so the
+rows are deleted. `Device.status` goes through `text` to be remapped, because
+Prisma's generated cast cannot work when no old enum value exists in the new
+enum: `UNASSIGNED` becomes `AVAILABLE`, `ASSIGNED` becomes `NEEDS_INSPECTION`
+(it was in somebody's hands, so a human should look), `RETIRED` stays.
+Consistent with the no-grandfathering decisions before it: no deployment, no
+live users.
+
+Removed outright rather than deprecated: `requirePaid` (middleware and test),
+`allocateDevice`, `unassignDevice`, `GET /payments/me`, `POST /payments/order`,
+`/admin/devices/:id/allocate`, `/admin/allocate-next`,
+`/admin/devices/:id/unassign`, `PublicUser.hasPaid`,
+`PublicUser.deviceAllocated`, and the error codes `NOT_PAID`, `NO_DEVICE`,
+`REFUNDED_CONTACT_SUPPORT`, `ALREADY_PAID`, `ALREADY_HAS_DEVICE`,
+`NO_DEVICES_IN_STOCK`, `PAYMENT_REQUIRED`. `DEVICE_STILL_ASSIGNED` became
+`DEVICE_HAS_LIVE_BOOKING`, since nothing is assigned to anybody any more but
+retiring an occupied safe is still refused. Dead auth surface is where bugs
+live.
+
+Two tests pin absences rather than behaviour: `/auth/me` no longer carrying
+the purchase flags (a client still reading `hasPaid` would get `undefined` and
+treat every user as unpaid), and `/payments/me` answering 404 (so the route
+cannot quietly return carrying a price the booking rules no longer agree with).
+
+### A correctness fix the test suite found
+
+`effectiveBookingStatus` treated a stored `OVERSTAY` row as overstaying
+forever, ignoring `endsAt`. An extension bought during the grace period moves
+`endsAt` forward, so the user would have been told they were overstaying time
+they had just paid for — and the sweeper's own "pull it back to ACTIVE" branch
+was unreachable. It now returns `ACTIVE` when the end is back in the future and
+nothing has been settled or waived (an extension is refused once either has
+happened, so the ordering is safe).
+
+### Still open
+
+- **The abandoned-items process** — above.
+- **Future-dated bookings and overstay collisions.** Bookings are "from now"
+  only. If future-dated booking is added, an overstay will be able to collide
+  with a reservation that was legitimately sold — the current design handles it
+  by refusing the extension and leaving the overstayer in place, which is right
+  for back-to-back today but would need a real policy (bump? compensate?
+  substitute safe?) once someone can book next Tuesday.
+- **The hourly rate is provisional**, exactly like the ₹999 before it. 10000
+  paise/hour is a development placeholder, and the 1.5x multiplier, 15-minute
+  grace, 24-hour cap and 30-minute collection window are all guesses that look
+  plausible rather than decisions anybody has made.
+- **Retention** is still undecided, and `Booking` rows now join `DeviceEvent`
+  and `AuditLog` in having no retention policy.
