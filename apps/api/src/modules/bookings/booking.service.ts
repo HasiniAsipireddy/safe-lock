@@ -20,6 +20,7 @@ import {
   toBookingSummary,
   type BookingRow,
 } from './booking.mapper';
+import { cancelDeadlineMessages, cancelPending, scheduleFor } from './booking.messages';
 
 /**
  * Rental bookings.
@@ -390,6 +391,15 @@ export async function activateBooking(
       select: BOOKING_SELECT,
     })) as BookingRow;
 
+    /**
+     * The booking's whole message schedule, written in this transaction.
+     *
+     * Atomic with activation, so there is no state in which a booking is
+     * running and nobody will be reminded about it — and none in which a
+     * rollback leaves reminders for a booking that never started.
+     */
+    await scheduleFor(tx, updated, { phase: 'ACTIVATION' }, now);
+
     return { kind: 'activated', booking: updated };
   };
 
@@ -500,7 +510,7 @@ export async function applyExtension(
     const snapshot = snapshotOf(row);
     const newEndsAt = new Date(row.endsAt.getTime() + hours * 60 * 60 * 1000);
 
-    return (await tx.booking.update({
+    const updated = (await tx.booking.update({
       where: { id: row.id },
       data: {
         hours: row.hours + hours,
@@ -512,6 +522,21 @@ export async function applyExtension(
       },
       select: BOOKING_SELECT,
     })) as BookingRow;
+
+    /**
+     * Every deadline just moved, so every deadline message is wrong.
+     *
+     * Cancelled first and re-created from the new `endsAt`, in that order and
+     * in this transaction. The old rows do not block the new ones: the keys
+     * carry their due times, which have all shifted by whole hours. The
+     * confirmation is re-sent rather than cancelled — "yours until 11pm" is
+     * exactly the sentence an extension needs, and it was true when it was
+     * sent the first time.
+     */
+    await cancelDeadlineMessages(tx, updated.id);
+    await scheduleFor(tx, updated, { phase: 'EXTENSION' });
+
+    return updated;
   };
 
   return client ? run(client) : prisma.$transaction(run);
@@ -523,12 +548,24 @@ export async function applyExtension(
 export async function settleOverstay(
   bookingId: string,
   paidPaise: number,
-  options: { now?: Date; client?: PrismaTransaction } = {},
+  options: {
+    now?: Date;
+    client?: PrismaTransaction;
+    /**
+     * The payment that settled it, which keys the receipt message.
+     *
+     * Required for the message to be scheduled at all: settlement runs from
+     * both the verified callback and the webhook, and the payment id is the
+     * only discriminator both of them agree about. Omitting it schedules no
+     * receipt rather than risking two.
+     */
+    paymentRowId?: string;
+  } = {},
 ): Promise<BookingRow> {
   const now = options.now ?? new Date();
 
-  const run = async (tx: PrismaTransaction): Promise<BookingRow> =>
-    (await tx.booking.update({
+  const run = async (tx: PrismaTransaction): Promise<BookingRow> => {
+    const updated = (await tx.booking.update({
       where: { id: bookingId },
       data: {
         status: 'OVERSTAY',
@@ -545,6 +582,27 @@ export async function settleOverstay(
       },
       select: BOOKING_SELECT,
     })) as BookingRow;
+
+    /**
+     * The fee is dealt with, so the reminders about it are wrong.
+     *
+     * Cancel the deadline messages — an `OVERSTAY_STARTED` still queued would
+     * tell someone who has just paid that a fee has started — then send a
+     * receipt and schedule the collection reminder.
+     */
+    await cancelDeadlineMessages(tx, updated.id);
+
+    if (options.paymentRowId) {
+      await scheduleFor(
+        tx,
+        updated,
+        { phase: 'OVERSTAY_SETTLED', paymentRowId: options.paymentRowId, settledAt: now },
+        now,
+      );
+    }
+
+    return updated;
+  };
 
   return options.client ? run(options.client) : prisma.$transaction(run);
 }
@@ -632,6 +690,16 @@ export async function completeBooking(input: {
       where: { userId: row.userId, deviceId: row.deviceId, consumedAt: null },
       data: { consumedAt: now },
     });
+
+    /**
+     * A booking that is over has nothing left to say.
+     *
+     * All three completion reasons, including a force-complete: telling
+     * somebody their booking ends in ten minutes, after an admin ended it, is
+     * worse than silence. Re-validation would refuse these anyway — this is
+     * the tidy path, and the two are independent on purpose.
+     */
+    await cancelPending(tx, row.id);
 
     return { booking: updated, needsInspection };
   };
@@ -743,11 +811,26 @@ export async function cancelBooking(input: {
     throw stateInvalid('Only an unpaid booking can be cancelled.');
   }
 
-  const updated = (await prisma.booking.update({
-    where: { id: row.id },
-    data: { status: 'CANCELLED', completedAt: now, reservedUntil: now },
-    select: BOOKING_SELECT,
-  })) as BookingRow;
+  /**
+   * A transaction now, for the message cancellation.
+   *
+   * An unpaid booking has nothing scheduled — the schedule starts at
+   * activation — so this cancels nothing today. It is here because the
+   * alternative is a rule that holds by coincidence: if cancellation ever
+   * becomes reachable from a paid state (the refund policy is still open),
+   * the cancel would quietly stop happening.
+   */
+  const updated = await prisma.$transaction(async (tx) => {
+    const next = (await tx.booking.update({
+      where: { id: row.id },
+      data: { status: 'CANCELLED', completedAt: now, reservedUntil: now },
+      select: BOOKING_SELECT,
+    })) as BookingRow;
+
+    await cancelPending(tx, next.id);
+
+    return next;
+  });
 
   return toBookingSummary(updated, now);
 }
@@ -841,15 +924,31 @@ export async function adminWaiveOverstay(input: {
     );
   }
 
-  const updated = (await prisma.booking.update({
-    where: { id: row.id },
-    data: {
-      status: 'OVERSTAY',
-      overstayWaivedAt: now,
-      adminNote: input.reason,
-    },
-    select: BOOKING_SELECT,
-  })) as BookingRow;
+  const updated = await prisma.$transaction(async (tx) => {
+    const next = (await tx.booking.update({
+      where: { id: row.id },
+      data: {
+        status: 'OVERSTAY',
+        overstayWaivedAt: now,
+        adminNote: input.reason,
+      },
+      select: BOOKING_SELECT,
+    })) as BookingRow;
+
+    /**
+     * A waiver sends **no receipt**, only the collection reminder.
+     *
+     * Wording a write-off as a payment would be a lie about money, and a
+     * sixth approved template to say "nothing is owed" buys one sentence. The
+     * consequence is real and accepted: a waived user gets no immediate
+     * message, so the admin who waived is expected to tell them. Recorded in
+     * docs/decisions.md.
+     */
+    await cancelDeadlineMessages(tx, next.id);
+    await scheduleFor(tx, next, { phase: 'OVERSTAY_WAIVED', waivedAt: now }, now);
+
+    return next;
+  });
 
   return {
     booking: toBookingSummary(updated, now),

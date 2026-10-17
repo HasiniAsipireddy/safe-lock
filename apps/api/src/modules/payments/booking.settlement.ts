@@ -221,7 +221,13 @@ async function applyOverstayPurchase(
     return flagForReview(input, 'OVERSTAY_QUOTE_EXPIRED');
   }
 
-  await settleOverstay(booking.id, input.amountPaise, { now, client: input.tx });
+  // The payment id keys the receipt message, so a webhook and a verified
+  // callback settling the same payment produce one message, not two.
+  await settleOverstay(booking.id, input.amountPaise, {
+    now,
+    client: input.tx,
+    paymentRowId: input.paymentRowId,
+  });
 
   await writeAudit({
     action: AUDIT_ACTIONS.BOOKING_OVERSTAY_SETTLED,

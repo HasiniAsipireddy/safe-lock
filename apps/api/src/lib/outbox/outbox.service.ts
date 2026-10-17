@@ -3,11 +3,13 @@ import { logger } from '../logger';
 import { prisma, type PrismaTransaction } from '../prisma';
 import { isRetryable } from '../whatsapp';
 import {
+  isBookingMessageKind,
   loadRecipient,
   sendWhatsApp,
   type MessageKind,
   type SkipReason,
 } from '../whatsapp/send';
+import { revalidate } from './bookingMessages';
 import { buildParams } from './params';
 
 /**
@@ -267,15 +269,49 @@ export async function processPending(
       continue;
     }
 
-    const params = await buildParams(message.kind, {
-      userId: message.userId,
-      deviceEventId: message.deviceEventId,
-    });
+    /**
+     * A booking message earns its send here, every time.
+     *
+     * The booking is re-read and the parameters come out of that same read, so
+     * there is no window in which a message could be sent with text built from
+     * one state and a decision made from another. A refusal is `SKIPPED`, not a
+     * failure: nothing was attempted and nothing should be retried.
+     */
+    let params: readonly string[];
+    let urlButtonSuffix: string | undefined;
+
+    if (message.bookingId && isBookingMessageKind(message.kind)) {
+      const check = await revalidate(message.kind, message.bookingId, now);
+
+      if (!check.ok) {
+        await markSkipped(prisma, message.id, 'NOT_APPLICABLE');
+        result.skipped += 1;
+        logger.info(
+          {
+            outboundMessageId: message.id,
+            kind: message.kind,
+            bookingId: message.bookingId,
+            reason: check.reason,
+          },
+          'Scheduled message no longer applies; not sent',
+        );
+        continue;
+      }
+
+      params = check.params;
+      urlButtonSuffix = check.urlButtonSuffix;
+    } else {
+      params = await buildParams(message.kind, {
+        userId: message.userId,
+        deviceEventId: message.deviceEventId,
+      });
+    }
 
     const outcome = await sendWhatsApp({
       recipient,
       kind: message.kind,
       params,
+      ...(urlButtonSuffix === undefined ? {} : { urlButtonSuffix }),
     });
 
     if (outcome.status === 'SENT') {
