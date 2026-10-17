@@ -144,7 +144,8 @@ middleware/    # auth, rateLimit, validate, errorHandler
   receiving codes until the new one is proved. Same HMAC, TTL and attempt
   limit as `UnlockChallenge`; a new request supersedes the old one.
 - **OutboundMessage**: id, userId, kind, status (`PENDING` | `SENT` | `FAILED` |
-  `SKIPPED`), attempts, failureCategory, nextAttemptAt, providerMessageId
+  `SKIPPED`), attempts, failureCategory, nextAttemptAt, **sendAt**,
+  **bookingId**, **dedupeKey** (unique), providerMessageId
   (unique), deliveryStatus, deliveryUpdatedAt, deviceEventId, timestamps
   — the WhatsApp outbox. Written **inside** the unlock transaction by
   `WhatsAppNotifier` (a local insert, so still atomic) and sent by a poll
@@ -152,6 +153,16 @@ middleware/    # auth, rateLimit, validate, errorHandler
   opening. **Holds no message text and no template parameters** — they are
   rebuilt at send time, which is why a one-time code can never be queued.
   `SKIPPED` is terminal and distinct from `FAILED`: nothing was attempted.
+  — **`sendAt` is a due time and never moves**; `nextAttemptAt` is retry
+  backoff and only moves forward. The claim query requires both to have
+  elapsed, so a backoff can never pull a message earlier than its due time.
+  — a row with a `bookingId` is **re-validated against the live booking before
+  it is sent**, and `dedupeKey` (`<bookingId>:<kind>:<discriminator>`) makes
+  scheduling idempotent without a prior read — the discriminator is `endsAt`,
+  a payment id or the due time, deliberately never `now`.
+  — skip reasons `CANCELLED` (a state change withdrew it), `NOT_APPLICABLE`
+  (re-validation refused it) and `STALE` (claimed too late to be true) are
+  kept distinct: which guard fired is the diagnostic.
 - ~~**Command**~~ — **deferred to the MQTT gateway.** The mock acks synchronously, so
   there is nothing in flight to track and nothing to time out. Command ids/nonces and the
   15s timeout land with it. See `docs/decisions.md`.
@@ -216,6 +227,17 @@ middleware/    # auth, rateLimit, validate, errorHandler
   appearing in the admin needs-refund queue. We never rewrite a payment to
   pretend it did not happen. Refunds are **manual**, in the Razorpay dashboard,
   recorded here with an audited note.
+- **A scheduled message is checked twice: when the booking changes, and again
+  before it is sent.** A state change cancels pending rows; the worker
+  re-reads the live booking and the *same read* produces the template
+  parameters. Either guard alone would nearly do; both are kept because a
+  forgotten cancellation must be harmless rather than a false claim about a
+  safe holding someone's property. A deadline message claimed more than
+  `REMINDER_MAX_LATENESS_MINUTES` late is dropped, not sent — late is false.
+- **WhatsApp is never the source of truth for a booking.** It is a nudge
+  toward the dashboard, which derives everything from the server clock on
+  every read. Booking events write **no** in-app `Notification` rows — see
+  `docs/decisions.md`.
 - **Locking** requires an authenticated session plus a live booking. Allowed
   during an unpaid overstay, and not phone-gated.
 - **Unlocking** ALWAYS requires a valid OTP, on top of a live booking, no
@@ -411,7 +433,9 @@ interface DeviceGateway {
   not the page's) and `POST /api/v1/notifications/read` `{ ids? }` — idempotent;
   ids that are not the caller's are ignored, never 403'd.
 - **What notifies:** `UNLOCK_CONFIRMED`, and `UNLOCK_FAILED` only once the
-  attempt limit is burned. **Not** a single wrong code, not `UNLOCK_REQUESTED`,
+  attempt limit is burned. **Booking events notify nobody in-app** — the
+  dashboard renders their deadlines live from the server clock, which is
+  better than a record of a moment, and WhatsApp carries the nudge. **Not** a single wrong code, not `UNLOCK_REQUESTED`,
   not `LOCK`. Rationale in `docs/decisions.md` — a notification per typo trains
   people to ignore the bell.
 - Notifications go through `Notifier` (`apps/api/src/lib/notifier/`), whose
@@ -437,6 +461,32 @@ interface DeviceGateway {
 - **Nothing is sent from inside a transaction.** `WhatsAppNotifier` writes an
   outbox row through the transaction client; the worker sends after the commit.
   The in-app notification keeps step 2's atomic-and-blocking contract.
+- **Rental lifecycle messages are scheduled, not immediate.** Five kinds
+  (`BOOKING_CONFIRMED`, `BOOKING_ENDING_SOON` ×2, `OVERSTAY_STARTED`,
+  `OVERSTAY_SETTLED`, `COLLECTION_CLOSING`) are written with a future `sendAt`
+  inside the transaction that justified them — `booking.messages.ts` plans and
+  cancels, `lib/outbox/bookingMessages.ts` re-validates and builds the
+  parameters. Lead times are `BOOKING_REMINDER_LEAD_MINUTES` and
+  `COLLECTION_REMINDER_LEAD_MINUTES` in `@safelock/shared`, **not** env, since
+  they appear in approved template copy *and* in UI text promising them.
+- **The overstay notice is due at `endsAt + grace + 60s`**, never at the
+  boundary: the fee is exactly zero at `endsAt + grace`, and re-validation
+  requires an outstanding fee, so a notice due at that instant would be
+  refused on every poll until it went stale.
+- **Two send budgets.** `WHATSAPP_DAILY_SEND_CAP` counts user-triggered kinds
+  (`PHONE_OTP`, `PASSWORD_RESET`, `UNLOCK_ALERT`, `FAILED_ATTEMPTS_ALERT`);
+  `WHATSAPP_BOOKING_SEND_CAP` counts the five above, and only rows actually
+  `SENT`, so extensions re-creating reminders cost nothing. `UNLOCK_OTP` still
+  ignores the cap. A dropped booking message is `SKIPPED`/`CAP_REACHED` and
+  **counted on the admin Bookings row** — a renter never told about a fee must
+  not be invisible.
+- **A waived overstay sends no receipt**, only the collection reminder: a
+  write-off worded as a payment would be a lie about money. The admin who
+  waives is expected to tell the renter. See `docs/decisions.md`.
+- **`urlButtonSuffix` is the only dynamic part of a link.** Meta fixes the
+  base in the approved template, so it cannot point off-site, and every caller
+  builds it from a booking id plus a fixed segment. `PUBLIC_WEB_URL` is the
+  canonical base and is deliberately not `WEB_ORIGIN`.
 - Phone numbers are normalised to **E.164** by `toE164` in
   `@safelock/shared`; `maskPhone` (`+91 98****10`) is the **only** phone
   representation allowed in a log line or audit row, and is allowlisted in
@@ -494,6 +544,12 @@ interface DeviceGateway {
   payment (pay or cancel, with the hold counting down), paid (time left,
   extend, collect — and during an overstay the fee and paying it, then a
   collection countdown). The four purchase states are gone with their flags.
+- `/bookings/[id]/extend` — where a reminder links. The booking is **named in
+  the URL** because a message is written at one moment and read at another, so
+  it cannot link to "whatever is current". Durations and prices come from the
+  server's `extension` block; refusals name the remedy. `?next=` anywhere is
+  validated by `safeInternalPath`, which resolves the value against the
+  current origin and refuses anything that escapes.
 - `/dashboard/unlock` — OTP entry (6 input boxes, resend timer 30s)
 - `/history` — activity log, grouped by local day, "Load more" (not infinite
   scroll — an endless list has no end for a keyboard or screen reader user).
@@ -543,6 +599,15 @@ COLLECTION_WINDOW_MINUTES=30     # time to collect after an overstay is settled
 BOOKING_HOLD_MINUTES=10          # how long an unpaid booking holds its safe;
                                  # the Razorpay order expiry matches it
 OVERSTAY_QUOTE_TTL_MINUTES=15    # how long an overstay quote is binding
+PUBLIC_WEB_URL=                  # the ONE canonical base for links in messages.
+                                 # Optional outside production (defaults to
+                                 # http://localhost:3000); REQUIRED in
+                                 # production, where it must be https, not
+                                 # loopback and free of placeholders. NOT
+                                 # WEB_ORIGIN, which is a list.
+REMINDER_MAX_LATENESS_MINUTES=5  # past this a scheduled booking message is
+                                 # SKIPPED/STALE. Keep well above
+                                 # OUTBOX_POLL_INTERVAL_MS (5s).
 BOOKING_SWEEP_INTERVAL_MS=60000  # reconciler only; correctness never depends
                                  # on it, because every read derives status
                                  # from the clock
@@ -560,9 +625,11 @@ WHATSAPP_PROVIDER=fake        # fake | cloud. `fake` is REFUSED in production.
 # WHATSAPP_PHONE_NUMBER_ID=   # not the phone number itself
 # WHATSAPP_APP_SECRET=        # keys the webhook HMAC
 # WHATSAPP_WEBHOOK_VERIFY_TOKEN=   # a random string you choose
-# WHATSAPP_TEMPLATE_* (five names), WHATSAPP_LANGUAGE, WHATSAPP_API_VERSION,
-# WHATSAPP_TIMEOUT_MS, WHATSAPP_DAILY_SEND_CAP (default 10, rolling 24h),
-# OUTBOX_POLL_INTERVAL_MS, OUTBOX_MAX_ATTEMPTS — see apps/api/.env.example
+# WHATSAPP_TEMPLATE_* (ten names), WHATSAPP_LANGUAGE, WHATSAPP_API_VERSION,
+# WHATSAPP_TIMEOUT_MS, OUTBOX_POLL_INTERVAL_MS, OUTBOX_MAX_ATTEMPTS, and the
+# TWO send budgets — WHATSAPP_DAILY_SEND_CAP (default 10, user-triggered
+# kinds) and WHATSAPP_BOOKING_SEND_CAP (default 20, rental lifecycle) — see
+# apps/api/.env.example
 # Not yet used — added with the MQTT gateway:
 # MQTT_URL=mqtts://broker.example.com
 # MQTT_USERNAME=
@@ -616,8 +683,10 @@ portable to PowerShell, so use two terminals.
   — all four are plausible guesses, not decisions anybody has made.
 - ~~OTP channel~~ → **decided: WhatsApp (Meta Cloud API).** Unlock codes,
   verification codes and alerts are delivered through the `WhatsAppClient` seam.
-  Working in production **once five templates are approved by Meta and the four
-  `WHATSAPP_*` credentials are set** — see README. Until then
+  Working in production **once ten templates are approved by Meta and the four
+  `WHATSAPP_*` credentials are set** — see README. **Two of the five rental
+  templates cannot be submitted until the production domain is decided**: their
+  dynamic URL button bakes in a base URL, which must match `PUBLIC_WEB_URL`. Until then
   `WHATSAPP_PROVIDER=fake` is the only legal value, and the env schema refuses
   `fake` in production so a half-configured deploy fails at boot rather than
   silently sending nothing.
@@ -679,6 +748,16 @@ portable to PowerShell, so use two terminals.
 - Number of safes per user at once? **One**, enforced by the
   `Booking_one_live_per_user` partial unique index. Confirm that is the intent
   for real customers.
+- **Does a waived overstay need an immediate message?** A waiver deliberately
+  sends no receipt — wording a write-off as a payment would be a lie about
+  money — so the renter gets only the collection reminder and the admin who
+  waived is expected to tell them. A sixth template would fix it. Nobody has
+  said whether waivers will be common enough to matter.
+- **The reminder lead times** (30 and 10 minutes before the end, 10 before the
+  collection deadline) and `WHATSAPP_BOOKING_SEND_CAP=20` are plausible
+  numbers, not measured ones. They live in `@safelock/shared` rather than the
+  environment because they appear in approved template copy *and* in UI text
+  promising them, so changing them is a code change plus a template review.
 - Business details for the legal pages: `[BUSINESS NAME]`, `[ADDRESS]`, `[EMAIL]`,
   `[PHONE]`, GSTIN, support hours, grievance officer.
 
@@ -724,6 +803,14 @@ portable to PowerShell, so use two terminals.
    rewritten dashboard and an admin Bookings tab. `Device.ownerId`,
    allocation, `requirePaid`, `hasPaid` and `deviceAllocated` are all gone.
    See `docs/decisions.md`.
+8b. ✅ **Rental reminders** (2026-10-17) — five scheduled WhatsApp templates
+   across a booking's life, `sendAt` on the outbox with a staleness floor,
+   cancellation at the state change plus re-validation at send, two send
+   budgets, dropped messages surfaced to admins, `extensionAvailability` as the
+   one answer to "can this be extended?", the `/bookings/:id/extend` page a
+   reminder links to, and `safeInternalPath` for `?next=`. Also fixed a live
+   bug: the unlock-code template was being sent two parameters where Meta
+   permits one, so no code would have been delivered in production.
 9. Real hardware via MQTT — also brings the `Command` table, command nonces and
    the 15s ack timeout, all deliberately deferred until there is a transport
    that can lose a message. **It also owes the lock-after-completion path a

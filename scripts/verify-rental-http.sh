@@ -382,6 +382,191 @@ else
   echo "  SKIP  sweep-failure log check (set API_LOG to the API's log file)"
 fi
 
+
+note "30. Scheduled reminders: what activation queued"
+# Deliberately reuses the sessions already established. Signup and login share
+# a per-IP limiter (10 per 15 minutes) and this script is already close to it —
+# two more accounts here would 429, and every assertion below would then fail
+# for a reason that has nothing to do with reminders.
+#
+# So the main user books again, which first needs their overstayed booking from
+# step 29 ended. An admin force-complete is the realistic way out of an unpaid
+# overstay, and it exercises the cancellation path on the way.
+post "$ADMIN_JAR" /admin/bookings/$BID/force-complete '{"reason":"Verification run: clearing an unpaid overstay"}' > /dev/null
+check "the overstayed booking is force-completed" "COMPLETED" "$(psql "SELECT status FROM \"Booking\" WHERE id='$BID'")"
+
+RPHONE=$(psql "SELECT phone FROM \"User\" WHERE email='$EMAIL'")
+
+# A fresh safe, since force-completing sent the last one for inspection.
+RDEV="dev_r${STAMP}"
+psql "INSERT INTO \"Device\" (id, \"serialNumber\", status, \"lockState\", online, \"createdAt\", \"updatedAt\") VALUES ('$RDEV', 'SAFE-R${STAMP: -6}', 'AVAILABLE', 'LOCKED', false, now(), now())" > /dev/null
+
+RBOOK=$(post "$JAR" /bookings '{"hours":3}')
+RBID=$(echo "$RBOOK" | jqv "['booking']['id']")
+check "a booking to remind about" "True" "$([ -n "$RBID" ] && echo True || echo False)"
+
+# Nothing is scheduled before the money lands: the schedule starts at
+# activation, because endsAt does not exist until then.
+check "nothing scheduled while pending" "0" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID'")"
+
+# Activate it the way a webhook does. The order endpoint needs live Razorpay
+# keys, so seed the Payment row it would have written — the same approach the
+# earlier steps take — then let the real settlement path run.
+RORDER="order_rem_${STAMP}"
+psql "INSERT INTO \"Payment\" (id,\"userId\",\"bookingId\",purpose,\"razorpayOrderId\",amount,currency,status,\"createdAt\",\"updatedAt\") SELECT 'pm_rem${STAMP}', \"userId\", id, 'BOOKING', '$RORDER', \"pricePaise\", currency, 'CREATED', now(), now() FROM \"Booking\" WHERE id='$RBID'" > /dev/null
+
+WSECRET=$(grep -E '^RAZORPAY_WEBHOOK_SECRET=' apps/api/.env | cut -d= -f2-)
+settle() { # settle <orderId> <amountPaise> <eventSuffix>
+  local body sig
+  body="{\"event\":\"payment.captured\",\"payload\":{\"payment\":{\"entity\":{\"id\":\"pay_rzp_$3\",\"order_id\":\"$1\",\"amount\":$2,\"currency\":\"INR\",\"status\":\"captured\"}}}}"
+  sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$WSECRET" -hex | sed 's/^.*= //')
+  curl -s -o /dev/null -X POST "$API/payments/webhook" \
+    -H 'Content-Type: application/json' \
+    -H "X-Razorpay-Signature: $sig" \
+    -H "X-Razorpay-Event-Id: evt_$3" \
+    -d "$body"
+}
+
+settle "$RORDER" 30000 "rem${STAMP}"
+
+check "booking is ACTIVE" "ACTIVE" "$(psql "SELECT status FROM \"Booking\" WHERE id='$RBID'")"
+check "four messages scheduled" "4" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID'")"
+check "one confirmation" "1" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='BOOKING_CONFIRMED'")"
+check "two reminders" "2" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='BOOKING_ENDING_SOON'")"
+check "one overstay notice" "1" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='OVERSTAY_STARTED'")"
+
+# The reminders sit exactly 30 and 10 minutes before the end.
+check "reminder leads are 30 and 10 minutes" "30|10" "$(psql "SELECT string_agg(round(extract(epoch from (b.\"endsAt\" - m.\"sendAt\"))/60)::int::text, '|' ORDER BY m.\"sendAt\") FROM \"OutboundMessage\" m JOIN \"Booking\" b ON b.id = m.\"bookingId\" WHERE m.\"bookingId\"='$RBID' AND m.kind='BOOKING_ENDING_SOON'")"
+
+# The overstay notice is a minute past the grace boundary, never on it: the fee
+# is exactly zero at the boundary, and re-validation requires a fee to name.
+check "overstay notice is grace + 60s" "60" "$(psql "SELECT round(extract(epoch from (m.\"sendAt\" - (b.\"endsAt\" + make_interval(mins => b.\"graceMinutes\")))))::int FROM \"OutboundMessage\" m JOIN \"Booking\" b ON b.id = m.\"bookingId\" WHERE m.\"bookingId\"='$RBID' AND m.kind='OVERSTAY_STARTED'")"
+
+# The confirmation was due immediately, so the worker picks it up within a poll
+# or two (5s by default).
+for _ in 1 2 3 4 5; do
+  [ "$(psql "SELECT status FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='BOOKING_CONFIRMED'")" != "PENDING" ] && break
+  sleep 3
+done
+check "the confirmation was sent" "SENT" "$(psql "SELECT status FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='BOOKING_CONFIRMED'")"
+check "the outbox has no column that could hold message text" "" "$(psql "SELECT coalesce(string_agg(column_name, ','), '') FROM information_schema.columns WHERE table_name='OutboundMessage' AND column_name IN ('params','body','text','message')")"
+
+note "31. The extension block on GET /bookings/:id"
+RDETAIL=$(get "$JAR" "/bookings/$RBID")
+check "extension is offered" "True" "$(echo "$RDETAIL" | jqv "['extension']['allowed']")"
+check "options are priced by the server" "10000" "$(echo "$RDETAIL" | jqv "['extension']['options'][0]['pricePaise']")"
+check "and the client is told the maximum" "True" "$(echo "$RDETAIL" | jqv "['extension']['maxHours'] > 0")"
+check "/bookings/current carries it too" "True" "$(get "$JAR" /bookings/current | jqv "['extension']['allowed']")"
+
+note "32. Someone else's booking is a plain not-found"
+# The admin's own session, used here as "another signed-in user".
+# /bookings/:id is not an admin route, so this is exactly the forwarded-link
+# case: the reply must not distinguish "not yours" from "does not exist".
+check "status" "404" "$(getstatus "$ADMIN_JAR" "/bookings/$RBID")"
+check "code" "BOOKING_NOT_FOUND" "$(get "$ADMIN_JAR" "/bookings/$RBID" | jqv "['error']['code']")"
+check "same code for an id that does not exist" "BOOKING_NOT_FOUND" "$(get "$ADMIN_JAR" "/bookings/clx_nope_$STAMP" | jqv "['error']['code']")"
+MSG_MINE=$(get "$ADMIN_JAR" "/bookings/$RBID" | jqv "['error']['message']")
+MSG_NONE=$(get "$ADMIN_JAR" "/bookings/clx_nope_$STAMP" | jqv "['error']['message']")
+check "same message, too" "True" "$([ "$MSG_MINE" = "$MSG_NONE" ] && echo True || echo False)"
+
+note "33. An extension cancels the deadline messages and re-creates them"
+OLD_KEYS=$(psql "SELECT coalesce(string_agg(\"dedupeKey\", '|' ORDER BY \"dedupeKey\"), '') FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind <> 'BOOKING_CONFIRMED'")
+REXT="order_remext_${STAMP}"
+psql "INSERT INTO \"Payment\" (id,\"userId\",\"bookingId\",purpose,\"razorpayOrderId\",amount,currency,status,\"createdAt\",\"updatedAt\") SELECT 'pm_remext${STAMP}', \"userId\", id, 'EXTENSION', '$REXT', 20000, currency, 'CREATED', now(), now() FROM \"Booking\" WHERE id='$RBID'" > /dev/null
+settle "$REXT" 20000 "remext${STAMP}"
+
+check "the booking gained hours" "5" "$(psql "SELECT hours FROM \"Booking\" WHERE id='$RBID'")"
+check "old deadline rows are CANCELLED" "3" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND status='SKIPPED' AND \"failureCategory\"='CANCELLED'")"
+check "deadline rows were re-created" "3" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind <> 'BOOKING_CONFIRMED' AND status='PENDING'")"
+# The assumption the dedupe keys rest on: a re-created key never equals a
+# cancelled one, or skipDuplicates would drop the new row silently.
+NEW_KEYS=$(psql "SELECT coalesce(string_agg(\"dedupeKey\", '|' ORDER BY \"dedupeKey\"), '') FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind <> 'BOOKING_CONFIRMED' AND status='PENDING'")
+check "no re-created key collides with a cancelled one" "False" "$([ "$OLD_KEYS" = "$NEW_KEYS" ] && echo True || echo False)"
+check "every dedupeKey is still unique" "0" "$(psql "SELECT count(*) FROM (SELECT \"dedupeKey\" FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' GROUP BY \"dedupeKey\" HAVING count(*) > 1) d")"
+check "a second confirmation was queued" "2" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='BOOKING_CONFIRMED'")"
+
+note "34. Re-validation refuses a message whose booking moved on"
+# Make one reminder due now, then end the booking with a direct row edit so no
+# cancellation runs — which is what a forgotten cancellation path would look
+# like. The reminder must still not be sent.
+TARGET=$(psql "SELECT id FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='BOOKING_ENDING_SOON' AND status='PENDING' ORDER BY \"sendAt\" DESC LIMIT 1")
+# The booking is ended FIRST, and the message made due second. The other order
+# leaves a window — up to one poll interval — in which the row is due and the
+# booking is still perfectly valid, so the worker sends it and is right to.
+# That ordering cost two failures on the first run of this section.
+psql "UPDATE \"Booking\" SET \"endsAt\"=now() - interval '1 minute' WHERE id='$RBID'" > /dev/null
+psql "UPDATE \"OutboundMessage\" SET \"sendAt\"=now(), \"nextAttemptAt\"=now() WHERE id='$TARGET'" > /dev/null
+
+for _ in 1 2 3 4 5; do
+  [ "$(psql "SELECT status FROM \"OutboundMessage\" WHERE id='$TARGET'")" != "PENDING" ] && break
+  sleep 3
+done
+check "the reminder was not sent" "SKIPPED" "$(psql "SELECT status FROM \"OutboundMessage\" WHERE id='$TARGET'")"
+check "and re-validation is recorded as the reason" "NOT_APPLICABLE" "$(psql "SELECT \"failureCategory\" FROM \"OutboundMessage\" WHERE id='$TARGET'")"
+
+note "35. A message claimed too late is dropped as STALE"
+LATE=$(psql "SELECT id FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='BOOKING_ENDING_SOON' AND status='PENDING' LIMIT 1")
+if [ -n "$LATE" ]; then
+  # Due well beyond REMINDER_MAX_LATENESS_MINUTES (5 by default).
+  psql "UPDATE \"OutboundMessage\" SET \"sendAt\"=now() - interval '45 minutes', \"nextAttemptAt\"=now() - interval '45 minutes' WHERE id='$LATE'" > /dev/null
+
+  for _ in 1 2 3 4 5; do
+    [ "$(psql "SELECT status FROM \"OutboundMessage\" WHERE id='$LATE'")" != "PENDING" ] && break
+    sleep 3
+  done
+  check "status" "SKIPPED" "$(psql "SELECT status FROM \"OutboundMessage\" WHERE id='$LATE'")"
+  check "dropped as stale, not sent late" "STALE" "$(psql "SELECT \"failureCategory\" FROM \"OutboundMessage\" WHERE id='$LATE'")"
+else
+  echo "  SKIP  staleness (no pending reminder left on this booking)"
+fi
+
+note "36. Settling an overstay fee: receipt queued, fee notices withdrawn"
+# Push the booking into a real overstay, then settle through the webhook so the
+# whole settlement path runs.
+psql "UPDATE \"Booking\" SET status='OVERSTAY', \"endsAt\"=now() - make_interval(mins => \"graceMinutes\" + 61) WHERE id='$RBID'" > /dev/null
+FEE=$(psql "SELECT (\"hourlyRatePaise\" * \"overstayMultiplierBps\" / 10000)::int FROM \"Booking\" WHERE id='$RBID'")
+check "a fee is outstanding" "True" "$([ -n "$FEE" ] && [ "$FEE" -gt 0 ] && echo True || echo False)"
+ROVER="order_remover_${STAMP}"
+psql "INSERT INTO \"Payment\" (id,\"userId\",\"bookingId\",purpose,\"razorpayOrderId\",amount,currency,status,\"quoteExpiresAt\",\"createdAt\",\"updatedAt\") SELECT 'pm_remover${STAMP}', \"userId\", id, 'OVERSTAY', '$ROVER', $FEE, currency, 'CREATED', now() + interval '15 minutes', now(), now() FROM \"Booking\" WHERE id='$RBID'" > /dev/null
+settle "$ROVER" "$FEE" "remover${STAMP}"
+
+check "the fee is settled" "t" "$(psql "SELECT (\"overstaySettledAt\" IS NOT NULL) FROM \"Booking\" WHERE id='$RBID'")"
+check "a receipt was queued" "1" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='OVERSTAY_SETTLED'")"
+check "the collection reminder was scheduled" "1" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='COLLECTION_CLOSING'")"
+check "no overstay notice is still pending" "0" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='OVERSTAY_STARTED' AND status='PENDING'")"
+check "the collection reminder is 10 minutes before the deadline" "10" "$(psql "SELECT round(extract(epoch from ((b.\"overstaySettledAt\" + make_interval(mins => b.\"collectionWindowMinutes\")) - m.\"sendAt\"))/60)::int FROM \"OutboundMessage\" m JOIN \"Booking\" b ON b.id = m.\"bookingId\" WHERE m.\"bookingId\"='$RBID' AND m.kind='COLLECTION_CLOSING'")"
+
+# Settling the same payment twice must not produce a second receipt. A verified
+# Checkout callback and a webhook are two deliveries of one payment, which is
+# why the receipt is keyed on the payment rather than on the time.
+settle "$ROVER" "$FEE" "remover2_${STAMP}"
+check "a replayed capture queues no second receipt" "1" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND kind='OVERSTAY_SETTLED'")"
+
+note "37. Collecting cancels everything still outstanding"
+check "collect succeeds once the fee is paid" "200" "$(poststatus "$JAR" "/bookings/$RBID/collect" '{}')"
+check "nothing is left pending" "0" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND status='PENDING'")"
+
+note "38. Booking messages are scoped out of the user budget"
+# Carrying a bookingId is what moves a row onto the booking budget, so these
+# two assertions are the structural half of the two-budget rule.
+check "every lifecycle row belongs to a booking" "0" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE kind IN ('BOOKING_CONFIRMED','BOOKING_ENDING_SOON','OVERSTAY_STARTED','OVERSTAY_SETTLED','COLLECTION_CLOSING') AND \"bookingId\" IS NULL")"
+check "and no booking row claims a device event" "0" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\" IS NOT NULL AND \"deviceEventId\" IS NOT NULL")"
+
+note "39. A dropped message is visible to an admin"
+DROPPED=$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"bookingId\"='$RBID' AND status='SKIPPED' AND \"failureCategory\" IN ('CAP_REACHED','STALE')")
+ADMIN_ROW=$(get "$ADMIN_JAR" "/admin/bookings?pageSize=100" | python -c "
+import sys, json
+rows = json.load(sys.stdin)['items']
+row = next((r for r in rows if r['id'] == '$RBID'), None)
+print(row['undeliveredMessages'] if row else 'missing')
+" 2>/dev/null)
+check "the admin row counts the dropped ones" "$DROPPED" "$ADMIN_ROW"
+check "and that is more than none" "True" "$([ "${DROPPED:-0}" -gt 0 ] && echo True || echo False)"
+
+note "40. No one-time code can reach the outbox, scheduled or not"
+check "no six-digit run in any dedupeKey" "0" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"dedupeKey\" ~ ':[0-9]{6}$'")"
+check "no phone number in any row" "0" "$(psql "SELECT count(*) FROM \"OutboundMessage\" WHERE \"dedupeKey\" LIKE '%${RPHONE}%'")"
+
 echo ""
 echo "================================="
 echo "  PASS: $pass    FAIL: $fail"

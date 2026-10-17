@@ -15,18 +15,22 @@ packages/shared Types, zod schemas and constants used by both
 one-time code), **hourly rental bookings** — hold, pay, extend, overstay fees,
 collect — paid through Razorpay, **remote lock / unlock with a one-time code**
 against a mock device, WhatsApp delivery with phone verification, the
-`/history` activity feed with in-app notifications, an admin panel (bookings,
-device inventory, users, payments, audit), and the legal pages.
+`/history` activity feed with in-app notifications, **scheduled WhatsApp
+reminders** across a booking's life, an admin panel (bookings, device
+inventory, users, payments, audit), and the legal pages.
 
 **Not built yet:** real hardware. The device gateway is a mock that always
 acks, which means a booking completion commands the safe locked on a
 best-effort basis — see step 9 in `CLAUDE.md`.
 
-**Before production:** WhatsApp needs **five Meta-approved templates** and the
-four `WHATSAPP_*` credentials; until then `WHATSAPP_PROVIDER=fake` is the only
-legal value and the env schema refuses `fake` in production. A user with no
-verified phone still has no password-reset channel — the one real gap, tracked
-in `CLAUDE.md`.
+**Before production:** WhatsApp needs **ten Meta-approved templates** (five for
+auth and alerts, five for the rental lifecycle) and the four `WHATSAPP_*`
+credentials; until then `WHATSAPP_PROVIDER=fake` is the only legal value and
+the env schema refuses `fake` in production. **Two of the rental templates
+cannot be submitted until the production domain is decided** — their URL button
+bakes in a base URL, which must match `PUBLIC_WEB_URL`. A user with no verified
+phone still has no password-reset channel — the one real gap, tracked in
+`CLAUDE.md`.
 
 ---
 
@@ -633,7 +637,7 @@ The signature is verified over the raw body with the app secret before the body
 is parsed, so a request without a valid `X-Hub-Signature-256` is a 401 and
 never reaches the database.
 
-### The five templates to submit to Meta
+### The five auth and alert templates to submit to Meta
 
 Create these under WhatsApp → Manage templates. **Category matters**: the three
 code-carrying templates must be `AUTHENTICATION`, which is what allows delivery
@@ -706,6 +710,129 @@ differs.
 If Meta approves a template under a different name, set the matching
 `WHATSAPP_TEMPLATE_*` variable — nothing in the code assumes a name.
 
+### The five rental templates to submit to Meta
+
+All **UTILITY**, language `en`, and every body is purely informational. That is
+deliberate: a body that urges an upsell risks Meta reclassifying the template
+as MARKETING, which users can mute — and a muted overstay notice is a fee
+nobody was told about. No body starts or ends with a variable, which Meta
+rejects.
+
+> **Two of these depend on your production domain**:
+> `safelock_booking_ending_soon` and `safelock_overstay_started` carry a
+> dynamic URL button whose **base is fixed in the approved template**. Decide
+> the host before submitting them, and set the same value in `PUBLIC_WEB_URL`.
+> The other three have no button and can be submitted now.
+
+---
+
+**6. `safelock_booking_confirmed`** — category **UTILITY**, language `en`
+
+- Body: `Your Safe Lock booking is confirmed. Safe {{1}} is yours until {{2}}. You can extend or collect from your dashboard.`
+- Parameters: `{{1}}` = serial number, `{{2}}` = local end time
+- Sample: `SAFE-0001`, `17 Oct 2026, 9:30 pm`
+- No button.
+
+Sent at activation **and again after an extension** — the same sentence is
+exactly what an extension needs, which is why there is no separate
+"booking extended" template.
+
+---
+
+**7. `safelock_booking_ending_soon`** — category **UTILITY**, language `en`
+
+- Body: `Your Safe Lock booking for safe {{1}} ends at {{2}}. Please collect your items before then.`
+- Button: **Visit website**, dynamic URL, base `https://<your-host>/bookings/`, suffix `{{1}}`
+- Button label: `Manage booking`
+- Parameters: body `SAFE-0001`, `9:30 pm`; button `clx123abc/extend`
+- Sent twice per booking: 30 minutes and 10 minutes before the end.
+
+---
+
+**8. `safelock_overstay_started`** — category **UTILITY**, language `en`
+
+- Body: `Your Safe Lock booking for safe {{1}} has ended and an overstay fee has started. The fee is {{2}} per hour and the safe will not open until it is paid. Locking still works.`
+- Button: **Visit website**, dynamic URL, base `https://<your-host>/bookings/`, suffix `{{1}}`
+- Button label: `Manage booking`
+- Parameters: body `SAFE-0001`, `₹150`; button `clx123abc/extend`
+- Sent one minute after the grace period ends — see `docs/decisions.md` for why
+  not at the boundary itself.
+
+---
+
+**9. `safelock_overstay_settled`** — category **UTILITY**, language `en`
+
+- Body: `We received your overstay payment of {{1}} for safe {{2}}. Please collect your items by {{3}}.`
+- Parameters: `₹150`, `SAFE-0001`, `10:15 pm`
+- No button.
+- **Never sent for a waived fee.** A write-off worded as a receipt would be a
+  lie about money, so a waived renter gets the collection reminder only.
+
+---
+
+**10. `safelock_collection_closing`** — category **UTILITY**, language `en`
+
+- Body: `Your collection window for Safe Lock safe {{1}} closes at {{2}}. If it closes before you collect, the safe will be held for inspection and you will need to contact support.`
+- Parameters: `SAFE-0001`, `10:15 pm`
+- No button.
+- Sent 10 minutes before the deadline, and not created at all when the
+  collection window is shorter than that.
+
+---
+
+### What a rental sends, and when
+
+| Message | Scheduled at | Due |
+| --- | --- | --- |
+| `safelock_booking_confirmed` | activation, and each extension | immediately |
+| `safelock_booking_ending_soon` | activation, re-created on extension | `endsAt − 30m`, `endsAt − 10m` |
+| `safelock_overstay_started` | activation, re-created on extension | `endsAt + grace + 60s` |
+| `safelock_overstay_settled` | fee captured | immediately |
+| `safelock_collection_closing` | fee captured or waived | `collectBy − 10m` |
+
+Lead times live in `@safelock/shared`
+(`BOOKING_REMINDER_LEAD_MINUTES`, `COLLECTION_REMINDER_LEAD_MINUTES`), not the
+environment: they appear in the approved copy above *and* in UI text promising
+them, and two copies of a promise drift.
+
+Every scheduled message is **re-checked against the live booking immediately
+before it is sent**, so one whose booking was collected, cancelled, extended or
+settled in the meantime is dropped rather than sent. A message claimed more
+than `REMINDER_MAX_LATENESS_MINUTES` (5) after its due time is dropped too — a
+deadline reminder arriving after the deadline is not late, it is false.
+
+### Watching reminders locally
+
+Nothing to configure: `WHATSAPP_PROVIDER=fake` records sends in memory, and
+`PUBLIC_WEB_URL` defaults to `http://localhost:3000`.
+
+The poll worker runs only under `npm run dev:api` (never in tests). To see the
+whole lifecycle without waiting hours, move a booking's clock with a direct row
+edit and let the worker pick the messages up:
+
+```bash
+# Bring a booking's end time forward so its reminders are due now.
+docker compose exec -T postgres psql -U safelock -d safelock -c \
+  'UPDATE "Booking" SET "endsAt" = now() + interval ''9 minutes'' WHERE status = ''ACTIVE'';'
+
+# The scheduled rows keep their original sendAt, so move those too.
+docker compose exec -T postgres psql -U safelock -d safelock -c \
+  'UPDATE "OutboundMessage" SET "sendAt" = now(), "nextAttemptAt" = now() WHERE status = ''PENDING'' AND "bookingId" IS NOT NULL;'
+```
+
+Then read what happened:
+
+```bash
+docker compose exec -T postgres psql -U safelock -d safelock -c \
+  'SELECT kind, status, "failureCategory", "sendAt", "sentAt" FROM "OutboundMessage" WHERE "bookingId" IS NOT NULL ORDER BY "sendAt" DESC LIMIT 20;'
+```
+
+`SKIPPED` with `CANCELLED` means a state change withdrew it; with
+`NOT_APPLICABLE` that re-validation refused it at send time; with `STALE` that
+it was claimed too late; with `CAP_REACHED` that the booking send budget was
+spent. The last two are counted on the admin Bookings row and flag it as
+needing attention — a dropped overstay notice must not be silent.
+
 ### Phone verification
 
 Every account starts **unverified** and must verify before it can unlock; there
@@ -758,9 +885,20 @@ visible.
 
 ### Send caps
 
-`WHATSAPP_DAILY_SEND_CAP` (default 10) messages per user per rolling 24 hours.
-Unlock codes are exempt: a messaging quota must never lock an owner out of
-their own safe. Verification answers `429 WHATSAPP_SEND_CAP_REACHED` with a
+There are **two** budgets, per user per rolling 24 hours, and a message's kind
+decides which it draws on.
+
+`WHATSAPP_DAILY_SEND_CAP` (default 10) covers everything a user's own action
+produces: verification codes, password resets, unlock alerts and
+failed-attempt alerts. Unlock codes are exempt: a messaging quota must never
+lock an owner out of their own safe.
+
+`WHATSAPP_BOOKING_SEND_CAP` (default 20) covers the five rental lifecycle
+messages. Separate so a chatty rental — repeated extensions — cannot spend the
+allowance a verification code needs. It counts only messages actually *sent*,
+so reminders cancelled and re-created by an extension cost nothing. A booking
+message dropped by this cap is recorded `SKIPPED`/`CAP_REACHED` and counted on
+the admin Bookings row rather than disappearing. Verification answers `429 WHATSAPP_SEND_CAP_REACHED` with a
 retry time; `/auth/password/forgot` stays byte-identical and silently skips the
 send, because any observable difference there would be an account-enumeration
 oracle.
@@ -837,11 +975,27 @@ npm --workspace apps/api run db:seed # needs an ADMIN account
 bash scripts/verify-rental-http.sh
 ```
 
-119 checks over real HTTP against a running server: signup, quote, hold,
+164 checks over real HTTP against a running server: signup, quote, hold,
 activation by webhook, the clock starting at payment, overstay accrual, the
 unlock/lock asymmetry, collect refused while a fee is owed, an expired quote
 flagged rather than settled, collect, re-booking, the admin overrides, the
-removed endpoints, CSRF, and the sweeper.
+removed endpoints, CSRF, the sweeper — and the whole reminder lifecycle:
+what activation schedules and at exactly what times, the extension block on
+`GET /bookings/:id`, a forwarded link to someone else's booking answering a
+plain not-found, an extension cancelling and re-creating its deadline
+messages with non-colliding keys, re-validation refusing a message whose
+booking moved on, a late one dropped as `STALE`, a settled fee queueing one
+receipt even when the capture is delivered twice, and a dropped message
+surfacing on the admin row.
+
+The reminder section drives the real poll worker and moves the clock with
+direct row edits, so it covers the parts no unit test can: the worker's own
+timing, and the ordering between a booking changing and a message coming due.
+**It reuses the sessions the earlier steps established** — signup and login
+share a per-IP limiter of 10 per 15 minutes, and two more accounts would 429
+and fail every assertion below for an unrelated reason. If you see a wall of
+`UNAUTHENTICATED`, that is the limiter: restart the API (the counters are in
+process memory) and run it again.
 
 It is **not** a replacement for the test suite — it shares a database with your
 dev environment and resets the device table to one safe. It exists because it

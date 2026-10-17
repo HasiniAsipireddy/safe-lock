@@ -2069,3 +2069,245 @@ The HTTP verification earned its place in the checklist on this alone.
   plausible rather than decisions anybody has made.
 - **Retention** is still undecided, and `Booking` rows now join `DeviceEvent`
   and `AuditLog` in having no retention policy.
+
+## 2026-10-17 — Rental reminders: scheduled messages (step 8b)
+
+A booking has deadlines, and until now the only thing that knew about them was
+a page the renter had to think to open. Five WhatsApp messages now follow a
+rental: confirmed, ending soon (twice), overstay started, fee settled,
+collection closing. The decisions worth recording are mostly about what the
+feature deliberately does *not* do.
+
+### Scheduling is a due time on an outbox row, not a job queue
+
+`OutboundMessage` gains `sendAt`, and the claim query requires both
+`sendAt <= now` and `nextAttemptAt <= now`. The two columns are kept apart on
+purpose: `sendAt` is the moment the message is *about* and never moves once the
+row exists, while `nextAttemptAt` is retry backoff and only ever moves forward.
+Requiring both means a backoff can push a message later but never pull one
+earlier — and "your booking ends in 30 minutes", delivered an hour early, is
+the one direction a scheduled message must never move.
+
+No new table, no broker, no scheduler. The upgrade seam is the same one the
+outbox already documented.
+
+### Two guards, independent, exactly like unlock eligibility
+
+A state change cancels a booking's pending messages (`SKIPPED`/`CANCELLED`),
+**and** every row carrying a `bookingId` is re-read against the live booking
+before it is sent (`SKIPPED`/`NOT_APPLICABLE` if it no longer applies). Either
+alone would be nearly enough. Both are kept because:
+
+- cancellation can be forgotten in a future change — a new completion path, a
+  new admin action — and re-validation makes that harmless rather than a false
+  statement about a safe holding someone's property;
+- re-validation alone would leave dead rows to be claimed and refused one by
+  one, and would lose the record that we *meant* to tell someone something.
+
+Keeping two **reasons** matters as much as keeping two guards: a pile of
+`NOT_APPLICABLE` is the signal that a state change is failing to cancel what it
+should. Collapsing them into one reason would hide precisely that.
+
+Re-validation also **produces the template parameters from the same read** that
+decides whether to send. Splitting "should we send?" from "what does it say?"
+would let the two disagree, and the shape of that disagreement is a confident
+lie about somebody's belongings.
+
+### The overstay notice is scheduled a minute late, deliberately
+
+The fee is exactly zero at `endsAt + grace` — accrual is `Math.ceil` per
+started hour, so the boundary itself charges nothing. Re-validation requires an
+outstanding fee. A notice due at that precise instant would therefore be
+refused on every poll until it went stale, and the message that matters most
+would be the only one that never arrived. `OVERSTAY_NOTICE_DELAY_SECONDS = 60`
+moves it one minute past the boundary, where there is always a fee to name.
+
+This is the kind of bug that is invisible in review and obvious in a test, so
+there are tests from both sides of the boundary and a sweep of offsets across
+it.
+
+### Dedupe keys are built from stable identifiers, never from `now`
+
+Settlement runs from **both** the verified Checkout callback and the webhook. A
+key containing the current time would make the second run a different row and
+send a second message. So: a confirmation is keyed on `endsAt`, a receipt on
+the payment id, the deadline kinds on their own due time — facts two racing
+transactions agree about. Scheduling is then
+`createMany({ skipDuplicates: true })` with no prior read, which is the only
+shape that is correct under concurrency.
+
+**The known sharp edge.** A cancelled row keeps its key, so re-creating that
+exact key is silently dropped — a reminder that never arrives, with no error
+anywhere. It is unreachable today only because an extension adds whole hours
+while the reminder leads are 30 and 10 minutes apart, so no new key can equal
+an old one. That is an assumption about configuration, not a property of the
+code, so a test asserts every re-created key differs from every cancelled one.
+Changing the leads or the minimum extension fails there rather than in
+production.
+
+### Staleness: a late deadline message is a false one
+
+`REMINDER_MAX_LATENESS_MINUTES` (default **5**) against
+`OUTBOX_POLL_INTERVAL_MS` (default **5 seconds**) — sixty polls of headroom, so
+a restart or a slow deploy discards nothing and only a real outage does. Past
+the tolerance a booking message is `SKIPPED`/`STALE` and never sent: "your
+booking ends in 10 minutes", arriving forty minutes after it ended, does not
+inform anybody, it misinforms them about a safe holding their things.
+
+A **retried** message past the tolerance is skipped too. That is intended for
+reminders: the deadline it describes is gone either way.
+
+Immediate kinds are exempt. A message about something that already happened —
+an unlock alert, a receipt — has no deadline to miss and should go out however
+late.
+
+### Two send budgets, and which kind draws on which
+
+`WHATSAPP_DAILY_SEND_CAP` (10) is now explicitly the **user-triggered**
+budget: `PHONE_OTP`, `PASSWORD_RESET`, `UNLOCK_ALERT` and
+`FAILED_ATTEMPTS_ALERT`. The last two are worth stating — they follow an action
+somebody took, so they are user traffic and must not drift into the booking
+budget or out of a budget altogether. `UNLOCK_OTP` alone skips the check, as it
+always has, because a quota that can stop someone opening a safe they are
+standing at does more harm than the abuse it prevents.
+
+Booking traffic gets `WHATSAPP_BOOKING_SEND_CAP` (20). Not an exemption: a day
+of two dozen extensions is still bounded, and nothing a client can call creates
+one of these rows. The split exists so a chatty rental cannot drop the renter's
+own verification code — and narrowing what the user budget counts makes that
+protection sharper, not weaker.
+
+The booking budget counts only rows actually **SENT**, unlike the user budget,
+which counts `PENDING` too. Reminders are cancelled and re-created on every
+extension, and a user who extends four times should not lose their overstay
+notice to the ghosts of messages that were never delivered.
+
+### A dropped message is visible, not silent
+
+Two reasons drop a message rather than withdraw it: the booking budget is spent
+(`CAP_REACHED`) or it was claimed too late (`STALE`). Both now appear as
+`undeliveredMessages` on the admin Bookings row and flag it as needing
+attention. A dropped overstay notice is a renter who was never told a fee had
+started, and the first anyone would otherwise hear of it is the renter disputing
+the fee.
+
+On the booking rather than in a message log of its own: the question an admin
+has is "is anything wrong with this booking?", and a fee the renter was never
+warned about is wrong with the booking.
+
+### No in-app notification rows for booking events
+
+Asked and decided: **no**. The dashboard already renders the end time,
+countdown, fee and collection deadline derived from the server clock on every
+read, which is strictly better than a notification row — it is current rather
+than a record of a moment. Bell rows would mean new `NotificationType` values
+and copy for information the card shows live, and the bell's value is that it
+still means something on the day it matters. WhatsApp is therefore never the
+source of truth here; it is a nudge toward a page that is.
+
+### A waived fee sends no receipt
+
+`OVERSTAY_SETTLED` is refused for a waiver, and re-validation enforces that
+independently of the scheduler: `overstayWaivedAt` leaves `overstayPaidPaise`
+at zero, and "we received your payment of zero" is a lie about money. A sixth
+approved template to say "no fee is outstanding" buys one sentence, so the
+waived renter gets the **collection reminder only**.
+
+**The accepted consequence:** a waived user receives no immediate message, so
+the admin who waives is expected to tell them. Recorded here rather than left
+as an accident. Worth revisiting if waivers turn out to be common.
+
+### An extension re-sends the confirmation
+
+No sixth template. "Safe X is yours until Y" is exactly the sentence an
+extension needs, and the key is `endsAt`, so the new one is genuinely a
+different message while a double settlement still produces one. The old
+confirmation is not cancelled — it was true when it was sent.
+
+### One function decides whether an extension is possible
+
+`extensionAvailability(row, now)` is non-throwing and is what
+`assertExtendable` now calls; the extension page, the dashboard and the order
+endpoint all render its answer. Three implementations of one rule is three
+chances to offer a button that 409s, and the button that 409s here is the one
+somebody taps from a reminder with twenty minutes left.
+
+A following booking now shortens the offer instead of refusing outright — "two
+more hours but not five" is a better answer than "no", and it is the same
+query. The dashboard also stops multiplying an hourly rate by a number of hours
+in the browser, which it had been doing against the rule that the client does
+no money arithmetic.
+
+### `?next=` is validated by resolving it, not by pattern-matching it
+
+`safeInternalPath` parses the value against the current origin with `new URL`
+and requires the result to still be on that origin. Pattern-matching has to
+anticipate every bypass — `//evil.test`, `/\evil.test` (WHATWG treats a
+backslash as a slash for http(s)), `/%5Cevil.test`, `https:/evil.test` — and
+resolving anticipates all of them at once, including the ones nobody has thought
+of. The textual rules in front of the parse are shortcuts that cheaply refuse
+things no honest link contains: control characters (URL parsers *strip* tabs and
+newlines rather than rejecting them), colons, encoded separators, and anything
+over 200 characters.
+
+It lives in `@safelock/shared` as a pure function of a value and an origin,
+which is what makes it testable: the web workspace has no test runner, so the
+one-line browser wrapper reads `window.location.origin` and everything worth
+asserting is asserted in the API suite. `@safelock/shared` is now in that
+suite's `include` for the same reason.
+
+The route guards read `window.location` inside their effects rather than using
+`useSearchParams`, which opts a page out of static prerendering unless every
+use sits in a Suspense boundary — it broke the production build of `/book` and
+`/login`, and the build is what caught it.
+
+### `PUBLIC_WEB_URL`, separate from `WEB_ORIGIN`
+
+`WEB_ORIGIN` is a comma-separated CSRF and CORS allowlist that may legitimately
+hold several origins. A deep link needs exactly one base, and taking the first
+entry of a list would make what a message says depend on the order someone
+typed an unrelated setting. It defaults to `http://localhost:3000` outside
+production so a fresh clone needs no configuration, and production refuses to
+boot unless it is set, `https:`, not a loopback host, and free of placeholder
+text — a message carrying a link to `localhost` strands the reader, and the
+whole point of these messages is the page they point at.
+
+Meta fixes the URL base in the approved template and appends one variable at
+send time, so `urlButtonSuffix` **cannot** send anyone off-site whatever it
+contains. Every caller builds it from a booking id and a fixed path segment.
+
+### A live bug the template work found
+
+`deliverOtp` was passing `[code, serialNumber]` to `safelock_unlock_code`, an
+AUTHENTICATION template whose Meta-fixed layout permits exactly one body
+parameter. A second one is a `TEMPLATE` rejection — terminal, never retried —
+so the real outcome was no code delivered, a compensated challenge and a 502 at
+the moment somebody was standing at a safe trying to open it. Now `[code]`,
+asserted with `toEqual` so an extra parameter fails in the suite rather than in
+production. Nothing is lost: a user has one live booking, so the message is
+unambiguous, and the serial is in `safelock_unlock_alert` where a second
+parameter is allowed.
+
+### Times are rendered by the API, in IST
+
+A message is not a client render: there is no browser locale to read, no
+component to re-render, and the string sits in somebody's chat history. So
+`Asia/Kolkata` is written explicitly rather than taken from the server's
+timezone — a deployment in another region must not change what a message says.
+Money goes through the shared paise formatter, so a message and the UI cannot
+disagree and no call site divides by 100 itself. If the product ever leaves
+IST, `lib/outbox/messageFormat.ts` is the one place that changes.
+
+### Still open, from this step
+
+- **Whether a waived renter needs an immediate message.** Above.
+- **The reminder lead times** (30 and 10 minutes) and the collection lead (10)
+  live in `@safelock/shared` rather than the environment, because they appear
+  in Meta-approved copy *and* in UI text promising them. Changing them is a
+  code change plus a template review, which is the right amount of friction —
+  but nobody has confirmed the numbers themselves.
+- **`WHATSAPP_BOOKING_SEND_CAP = 20`** is a plausible bound, not a measured
+  one.
+- **Two of the five new templates depend on the production domain**, because
+  their dynamic URL button bakes in a base URL. They cannot be submitted to
+  Meta until the host is decided. See README.
