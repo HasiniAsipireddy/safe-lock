@@ -190,6 +190,63 @@ export async function verifyPayment(params: {
   };
 }
 
+// --- Admin review clearing ---------------------------------------------------
+
+/**
+ * An admin marking a flagged payment dealt with.
+ *
+ * **Refunds are manual, and this is the record of one.** There is no refund
+ * call to Razorpay anywhere in this codebase: an admin refunds in the Razorpay
+ * dashboard, which is the only place with the authority and the audit trail
+ * that a payment processor's own ledger provides, and then clears the flag here
+ * with a required note. The `refund.processed` webhook flips the row to
+ * `REFUNDED` and clears the flag by itself when it arrives, so this exists for
+ * the cases where it does not — a refund issued outside the window Razorpay
+ * will webhook for, or money returned by some other route entirely.
+ *
+ * It never touches `status`. A payment is `PAID` until Razorpay says otherwise;
+ * claiming a refund happened because an admin ticked a box would put a lie in
+ * the ledger.
+ *
+ * The admin's note lives in the audit log, written by the caller — there is no
+ * column for it, because a free-text field on a payment row is a place for
+ * someone to paste a card number.
+ */
+export async function clearPaymentReview(input: {
+  paymentRowId: string;
+}): Promise<PaymentSummary> {
+  const row = await prisma.payment.findUnique({
+    where: { id: input.paymentRowId },
+    select: { id: true, reviewReason: true, reviewClearedAt: true },
+  });
+
+  if (!row) throw notFound('No payment with that id.');
+
+  if (!row.reviewReason) {
+    throw new HttpError({
+      status: 409,
+      code: ERROR_CODES.BOOKING_STATE_INVALID,
+      message: 'That payment is not flagged for review.',
+    });
+  }
+
+  if (row.reviewClearedAt) {
+    throw new HttpError({
+      status: 409,
+      code: ERROR_CODES.BOOKING_STATE_INVALID,
+      message: 'That payment has already been cleared.',
+    });
+  }
+
+  const updated = await prisma.payment.update({
+    where: { id: row.id },
+    data: { reviewClearedAt: new Date() },
+    select: SUMMARY_SELECT,
+  });
+
+  return toPaymentSummary(updated);
+}
+
 // --- Webhook application -----------------------------------------------------
 
 export type WebhookOutcome =

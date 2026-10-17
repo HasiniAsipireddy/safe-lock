@@ -9,7 +9,7 @@ import {
   type RateSnapshot,
 } from '@safelock/shared';
 import { env } from '../../config/env';
-import { HttpError, conflict, notFound } from '../../lib/httpError';
+import { HttpError, conflict } from '../../lib/httpError';
 import { logger } from '../../lib/logger';
 import { prisma, type PrismaTransaction } from '../../lib/prisma';
 import { deviceGateway } from '../../lib/deviceGateway';
@@ -750,6 +750,112 @@ export async function cancelBooking(input: {
   })) as BookingRow;
 
   return toBookingSummary(updated, now);
+}
+
+// --- Admin actions -----------------------------------------------------------
+
+/**
+ * An admin ending a booking by hand.
+ *
+ * **`needsInspection` defaults to true and the admin chooses.** Defaulting the
+ * other way would send a possibly-occupied safe back into the pool on a
+ * careless click; making it unconditional would leave an admin who *has* just
+ * looked inside unable to say so, and would push them towards clearing the
+ * inspection flag immediately afterwards without looking — which is worse,
+ * because it is the same two clicks with the check skipped.
+ *
+ * The reason is required by the schema and recorded on the booking and in the
+ * audit log.
+ */
+export async function adminForceComplete(input: {
+  bookingId: string;
+  reason: string;
+  needsInspection: boolean;
+  now?: Date;
+}): Promise<{ booking: BookingSummary; needsInspection: boolean; deviceId: string }> {
+  const now = input.now ?? new Date();
+
+  const row = (await prisma.booking.findUnique({
+    where: { id: input.bookingId },
+    select: BOOKING_SELECT,
+  })) as BookingRow | null;
+
+  if (!row) throw bookingNotFound();
+
+  if (row.status !== 'PENDING_PAYMENT' && row.status !== 'ACTIVE' && row.status !== 'OVERSTAY') {
+    throw stateInvalid('That booking has already ended.');
+  }
+
+  const result = await completeBooking({
+    bookingId: row.id,
+    reason: 'ADMIN_FORCE_COMPLETED',
+    adminNote: input.reason,
+    needsInspection: input.needsInspection,
+    now,
+  });
+
+  // After the commit, deliberately.
+  await lockAfterCompletion(row.deviceId);
+
+  return {
+    booking: toBookingSummary(result.booking, now),
+    needsInspection: result.needsInspection,
+    deviceId: row.deviceId,
+  };
+}
+
+/**
+ * An admin writing off an overstay fee.
+ *
+ * Sets `overstayWaivedAt`, which the fee arithmetic treats exactly like a
+ * settlement — so the user can unlock and collect — but records **zero
+ * collected**, because nothing was. Keeping the two timestamps separate is
+ * what stops a waive looking like revenue in `overstayPaidPaise`.
+ *
+ * It does not complete the booking: the user still has to collect, and the
+ * collection window starts from the waive just as it would from a payment.
+ */
+export async function adminWaiveOverstay(input: {
+  bookingId: string;
+  reason: string;
+  now?: Date;
+}): Promise<{ booking: BookingSummary; deviceId: string; waivedPaise: number }> {
+  const now = input.now ?? new Date();
+
+  const row = (await prisma.booking.findUnique({
+    where: { id: input.bookingId },
+    select: BOOKING_SELECT,
+  })) as BookingRow | null;
+
+  if (!row) throw bookingNotFound();
+
+  if (row.overstaySettledAt || row.overstayWaivedAt) {
+    throw stateInvalid('That overstay has already been settled or waived.');
+  }
+
+  const waivedPaise = outstandingFeePaise(row, now);
+  if (waivedPaise <= 0) {
+    throw conflict(
+      ERROR_CODES.NOTHING_TO_PAY,
+      'There is no overstay fee outstanding on that booking.',
+    );
+  }
+
+  const updated = (await prisma.booking.update({
+    where: { id: row.id },
+    data: {
+      status: 'OVERSTAY',
+      overstayWaivedAt: now,
+      adminNote: input.reason,
+    },
+    select: BOOKING_SELECT,
+  })) as BookingRow;
+
+  return {
+    booking: toBookingSummary(updated, now),
+    deviceId: row.deviceId,
+    waivedPaise,
+  };
 }
 
 export { bookingNotFound, noDevices, overstayDue, stateInvalid, isOverlapViolation };
