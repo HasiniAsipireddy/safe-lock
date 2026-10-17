@@ -31,7 +31,10 @@ export const verifyPaymentSchema = z.object({
 export type VerifyPaymentInput = z.infer<typeof verifyPaymentSchema>;
 
 /**
- * `POST /payments/order` takes no input at all. Declared explicitly so the
- * validate middleware can reject a body that tries to smuggle in an amount.
+ * `POST /payments/order` is gone, and so is its schema.
+ *
+ * Orders are created from the booking routes now, where the amount comes from
+ * the booking's snapshotted rates. The "reject a body that smuggles in an
+ * amount" job moved with it — see `emptyBookingBodySchema` in
+ * `schemas/bookings.ts`, which every booking order endpoint uses.
  */
-export const createOrderSchema = z.object({}).strict();

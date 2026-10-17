@@ -116,7 +116,8 @@ describe('originCheck', () => {
       data: {
         userId: user.id,
         razorpayOrderId: 'order_TESTorigin',
-        amount: env.SAFE_PRICE_PAISE,
+        purpose: 'BOOKING',
+        amount: env.RENTAL_HOURLY_RATE_PAISE,
         status: 'CREATED',
       },
     });
@@ -128,7 +129,7 @@ describe('originCheck', () => {
           entity: {
             id: 'pay_TESTorigin',
             order_id: 'order_TESTorigin',
-            amount: env.SAFE_PRICE_PAISE,
+            amount: env.RENTAL_HOURLY_RATE_PAISE,
           },
         },
       },

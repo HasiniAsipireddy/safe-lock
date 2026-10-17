@@ -230,6 +230,26 @@ export function effectiveBookingStatus(input: EffectiveStatusInput): BookingStat
   if (input.overstaySettledAt) {
     const deadline = collectByFrom(input.snapshot, input.overstaySettledAt);
     if (now.getTime() > deadline.getTime()) return 'COMPLETED';
+
+    return 'OVERSTAY';
+  }
+
+  /**
+   * An unsettled overstay whose end is now in the future is **back to ACTIVE**.
+   *
+   * That happens when an extension bought during the grace period moved
+   * `endsAt` forward. Returning `OVERSTAY` regardless would be a one-way door:
+   * the stored status would never read back as active again, the user would be
+   * told they are overstaying for time they have just paid for, and the
+   * sweeper's own "pull it back to ACTIVE" branch would be unreachable.
+   *
+   * Only reachable when nothing has been settled or waived — an extension is
+   * refused once either has happened — which is why it sits after that check
+   * rather than before it.
+   */
+  if (input.endsAt) {
+    const overstayFrom = overstayStartsAt(input.snapshot, input.endsAt);
+    if (now.getTime() <= overstayFrom.getTime()) return 'ACTIVE';
   }
 
   return 'OVERSTAY';

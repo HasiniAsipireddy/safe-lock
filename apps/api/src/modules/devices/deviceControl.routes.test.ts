@@ -7,11 +7,11 @@ import {
   app,
   createTestUser,
   createUserWithDevice,
-  givePaidPayment,
+  pushIntoOverstay,
+  seedBooking,
   seedDevice,
   withCapturedOtp,
 } from '../../test/helpers';
-import { allocateDevice } from './device.service';
 
 const LOCK_URL = '/api/v1/devices/lock';
 const REQUEST_URL = '/api/v1/devices/unlock/request';
@@ -44,47 +44,77 @@ describe('lock/unlock eligibility', () => {
     expect(confirm.status).toBe(401);
   });
 
-  it('refuses a user who has never paid with NOT_PAID', async () => {
+  it('refuses a user with no booking with NO_ACTIVE_BOOKING', async () => {
     const user = await createTestUser();
-
-    const response = await post(LOCK_URL, user.cookie).send({});
-
-    expect(response.status).toBe(402);
-    expect(response.body.error.code).toBe('NOT_PAID');
-  });
-
-  it('refuses a paid user with no device allocated with NO_DEVICE', async () => {
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
 
     const response = await post(LOCK_URL, user.cookie).send({});
 
     expect(response.status).toBe(409);
-    expect(response.body.error.code).toBe('NO_DEVICE');
+    expect(response.body.error.code).toBe('NO_ACTIVE_BOOKING');
   });
 
-  it('refuses a refunded user still holding hardware with REFUNDED_CONTACT_SUPPORT', async () => {
-    // The state docs/decisions.md calls out: hasPaid false, device still
-    // assigned. It must NOT be flattened into "you have not paid" — paying
-    // again is not the remedy, and the user needs to be told to call support.
+  it('refuses a booking that is still awaiting payment', async () => {
+    // A held safe is not an operable safe. Only a verified payment makes a
+    // booking ACTIVE, and only ACTIVE (or a settled overstay) operates.
     const user = await createTestUser();
-    const payment = await givePaidPayment(user.id);
     const device = await seedDevice();
-    await allocateDevice(user.id, device.id);
-    await prisma.payment.update({ where: { id: payment.id }, data: { status: 'REFUNDED' } });
+    await seedBooking({ userId: user.id, deviceId: device.id, status: 'PENDING_PAYMENT' });
 
     const response = await post(LOCK_URL, user.cookie).send({});
 
-    expect(response.status).toBe(403);
-    expect(response.body.error.code).toBe('REFUNDED_CONTACT_SUPPORT');
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('NO_ACTIVE_BOOKING');
+  });
 
-    // And the same for the unlock routes — neither is a way around it.
-    expect((await post(REQUEST_URL, user.cookie).send({})).body.error.code).toBe(
-      'REFUNDED_CONTACT_SUPPORT',
-    );
-    expect((await post(CONFIRM_URL, user.cookie).send({ otp: '123456' })).body.error.code).toBe(
-      'REFUNDED_CONTACT_SUPPORT',
-    );
+  /**
+   * The asymmetry that matters: an unpaid overstay refuses to **open** but
+   * still agrees to **close**.
+   *
+   * Refusing to let someone secure a safe they are standing at would punish
+   * them in the one direction that creates risk rather than recovering money.
+   */
+  it('refuses unlock but allows lock during an unpaid overstay', async () => {
+    const { user, bookingId } = await createUserWithDevice();
+    await pushIntoOverstay(bookingId, 1);
+
+    const unlockRequest = await post(REQUEST_URL, user.cookie).send({});
+    expect(unlockRequest.status).toBe(402);
+    expect(unlockRequest.body.error.code).toBe('OVERSTAY_PAYMENT_REQUIRED');
+
+    const confirm = await post(CONFIRM_URL, user.cookie).send({ otp: '123456' });
+    expect(confirm.status).toBe(402);
+    expect(confirm.body.error.code).toBe('OVERSTAY_PAYMENT_REQUIRED');
+
+    // Lock is allowed, and is a 200 whether or not it had to move the bolt.
+    const lock = await post(LOCK_URL, user.cookie).send({});
+    expect(lock.status).toBe(200);
+  });
+
+  /** Paying the fee is what opens the collection window — and the safe. */
+  it('allows unlock during an overstay once the fee is settled', async () => {
+    const { user, bookingId } = await createUserWithDevice();
+    await pushIntoOverstay(bookingId, 1);
+    await prisma.booking.update({
+      where: { id: bookingId },
+      data: { status: 'OVERSTAY', overstaySettledAt: new Date() },
+    });
+
+    const response = await post(REQUEST_URL, user.cookie).send({});
+
+    expect(response.status).toBe(200);
+  });
+
+  it('refuses a completed booking', async () => {
+    const { user, bookingId } = await createUserWithDevice();
+    await prisma.booking.update({
+      where: { id: bookingId },
+      data: { status: 'COMPLETED', completedAt: new Date(), completionReason: 'COLLECTED' },
+    });
+
+    const response = await post(LOCK_URL, user.cookie).send({});
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('NO_ACTIVE_BOOKING');
   });
 
   it('refuses to operate a device whose state is UNKNOWN', async () => {
@@ -99,18 +129,17 @@ describe('lock/unlock eligibility', () => {
 
   it("never lets one user operate another user's safe", async () => {
     // There is no device id in any of these requests — the device is resolved
-    // from the session — so this is really asserting that the resolution is
-    // by ownerId and cannot be influenced by the body.
+    // from the caller's own booking — so this is really asserting that the
+    // resolution cannot be influenced by the body.
     const owner = await createUserWithDevice();
     const other = await createTestUser();
-    await givePaidPayment(other.id);
 
     const response = await post(LOCK_URL, other.cookie).send({
       deviceId: owner.deviceId,
     });
 
     expect(response.status).toBe(409);
-    expect(response.body.error.code).toBe('NO_DEVICE');
+    expect(response.body.error.code).toBe('NO_ACTIVE_BOOKING');
 
     const row = await prisma.device.findUnique({ where: { id: owner.deviceId } });
     expect(row?.lockState).toBe('LOCKED');
@@ -125,7 +154,7 @@ describe('lock/unlock eligibility', () => {
       where: { userId: user.id, action: 'device.operation.denied' },
     });
     expect(audit).not.toBeNull();
-    expect((audit?.metadata as { code?: string })?.code).toBe('NOT_PAID');
+    expect((audit?.metadata as { code?: string })?.code).toBe('NO_ACTIVE_BOOKING');
   });
 });
 

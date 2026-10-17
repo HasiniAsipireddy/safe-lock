@@ -549,13 +549,24 @@ describe('PHONE_NOT_VERIFIED gates unlock only', () => {
     expect(response.status).toBe(200);
   });
 
-  it('is checked after payment state, so an unpaid user hears about paying first', async () => {
+  /**
+   * The check order reversed with the rental model, deliberately.
+   *
+   * Under the purchase model this had to come *after* payment state, because
+   * "you have not paid" was the more actionable answer. Now the opposite is
+   * true: verifying a phone is the one thing a user can do at any moment —
+   * including before they have booked anything — and it is a prerequisite they
+   * should discover from the dashboard nag rather than while standing at a
+   * safe. So an unbooked, unverified caller is told about verification, which
+   * is the step they can actually take now.
+   */
+  it('is checked before the booking, so an unverified user hears about verifying first', async () => {
     const user = await createTestUser();
 
     const response = await post(UNLOCK_REQUEST_URL, user.cookie).send({});
 
-    expect(response.status).toBe(402);
-    expect(response.body.error.code).toBe('NOT_PAID');
+    expect(response.status).toBe(403);
+    expect(response.body.error.code).toBe('PHONE_NOT_VERIFIED');
   });
 });
 

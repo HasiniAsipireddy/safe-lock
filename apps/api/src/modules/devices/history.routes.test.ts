@@ -6,12 +6,10 @@ import {
   app,
   createTestUser,
   createUserWithDevice,
-  givePaidPayment,
   seedDevice,
   seedDeviceEvent,
   seedDeviceEvents,
 } from '../../test/helpers';
-import { allocateDevice } from './device.service';
 import { encodeCursor } from './history.service';
 
 const HISTORY_URL = '/api/v1/devices/history';
@@ -116,18 +114,8 @@ describe('GET /devices/history — access', () => {
 // --- Empty states ------------------------------------------------------------
 
 describe('GET /devices/history — empty states', () => {
-  it('returns an empty list, not an error, for a user with no device', async () => {
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
-
-    const response = await get(HISTORY_URL, user.cookie);
-
-    expect(response.status).toBe(200);
-    expect(response.body).toEqual({ items: [], nextCursor: null });
-  });
-
-  it('returns an empty list for a user who has never paid', async () => {
-    // No requirePaid on this route: it is the caller's own record, and an
+  it('returns an empty list, not an error, for a user who has never booked', async () => {
+    // No eligibility gate on this route: it is the caller's own record, and an
     // empty list is the honest answer rather than a 402.
     const user = await createTestUser();
 
@@ -137,19 +125,19 @@ describe('GET /devices/history — empty states', () => {
     expect(response.body).toEqual({ items: [], nextCursor: null });
   });
 
-  it('still serves history to a refunded user who holds a device', async () => {
-    const user = await createTestUser();
-    const payment = await givePaidPayment(user.id);
-    const device = await seedDevice();
-    await allocateDevice(user.id, device.id);
-    await seedDeviceEvents({ userId: user.id, deviceId: device.id, count: 2 });
-    await prisma.payment.update({ where: { id: payment.id }, data: { status: 'REFUNDED' } });
+  it('still serves history after the booking has ended', async () => {
+    const { user, deviceId, bookingId } = await createUserWithDevice();
+    await seedDeviceEvents({ userId: user.id, deviceId, count: 2 });
+    await prisma.booking.update({
+      where: { id: bookingId },
+      data: { status: 'COMPLETED', completedAt: new Date(), completionReason: 'COLLECTED' },
+    });
 
     const response = await get(HISTORY_URL, user.cookie);
     const body = response.body as HistoryResponse;
 
-    // Remote operation is withdrawn after a refund, but the record of what
-    // happened to their safe is still theirs to read.
+    // The booking is over, but the record of what happened to the safe they
+    // had is still theirs to read — it is a security log about them.
     expect(response.status).toBe(200);
     expect(body.items).toHaveLength(2);
   });

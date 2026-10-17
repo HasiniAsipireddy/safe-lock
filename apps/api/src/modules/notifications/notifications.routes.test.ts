@@ -13,6 +13,7 @@ import {
   app,
   createTestUser,
   createUserWithDevice,
+  deviceHeldBy,
   seedNotification,
   withCapturedOtp,
 } from '../../test/helpers';
@@ -162,7 +163,7 @@ describe('notification atomicity with UNLOCK_CONFIRMED', () => {
       await prisma.deviceEvent.count({ where: { userId: user.id, type: 'UNLOCK_CONFIRMED' } }),
     ).toBe(0);
 
-    const device = await prisma.device.findUniqueOrThrow({ where: { ownerId: user.id } });
+    const device = await deviceHeldBy(user.id);
     expect(device.lockState).toBe('LOCKED');
   });
 
@@ -178,7 +179,7 @@ describe('notification atomicity with UNLOCK_CONFIRMED', () => {
     const failed = await post(CONFIRM_URL, user.cookie).send({ otp: code });
     expect(failed.status).toBe(500);
 
-    const device = await prisma.device.findUniqueOrThrow({ where: { ownerId: user.id } });
+    const device = await deviceHeldBy(user.id);
     expect(device.lockState).toBe('LOCKED');
 
     const challenge = await prisma.unlockChallenge.findFirstOrThrow({

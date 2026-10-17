@@ -1,14 +1,23 @@
 import crypto from 'node:crypto';
 import { vi } from 'vitest';
 import type { Express } from 'express';
-import { WHATSAPP_CONSENT_VERSION } from '@safelock/shared';
+import {
+  WHATSAPP_CONSENT_VERSION,
+  bookingPricePaise,
+  reservedUntilFrom,
+} from '@safelock/shared';
 import { createApp, type CreateAppOptions } from '../app';
 import { env } from '../config/env';
 import { prisma } from '../lib/prisma';
 import { ACCESS_COOKIE, REFRESH_COOKIE, signAccessToken } from '../modules/auth/tokens';
 import { hashRefreshToken } from '../modules/auth/refreshToken.service';
 import { hashPassword } from '../modules/auth/password';
-import { allocateDevice } from '../modules/devices/device.service';
+import { currentRates } from '../modules/bookings/booking.service';
+import {
+  BOOKING_SELECT,
+  snapshotOf,
+  type BookingRow,
+} from '../modules/bookings/booking.mapper';
 
 /**
  * Shared test helpers.
@@ -44,6 +53,8 @@ export function app(options: CreateAppOptions = {}): Express {
       phoneVerify: { windowMs: 60_000, limit: 1000 },
       phoneVerifyIp: { windowMs: 60_000, limit: 1000 },
       phoneConfirm: { windowMs: 60_000, limit: 1000 },
+      bookingRead: { windowMs: 60_000, limit: 1000 },
+      bookingWrite: { windowMs: 60_000, limit: 1000 },
       createOrder: { windowMs: 60_000, limit: 1000 },
       verifyPayment: { windowMs: 60_000, limit: 1000 },
       adminWrite: { windowMs: 60_000, limit: 1000 },
@@ -176,7 +187,7 @@ export function createTestAdmin(): Promise<TestUser> {
 
 let deviceSequence = 0;
 
-/** Adds an UNASSIGNED device to the inventory. */
+/** Adds an AVAILABLE device to the inventory. */
 export async function seedDevice(
   overrides: { serialNumber?: string; createdAt?: Date } = {},
 ): Promise<{ id: string; serialNumber: string }> {
@@ -193,7 +204,7 @@ export async function seedDevice(
   });
 }
 
-/** Adds `count` devices, oldest first so allocation order is predictable. */
+/** Adds `count` devices, oldest first so the booking pick order is predictable. */
 export async function seedDevices(count: number): Promise<Array<{ id: string; serialNumber: string }>> {
   const devices: Array<{ id: string; serialNumber: string }> = [];
   const base = Date.now() - count * 1000;
@@ -224,29 +235,211 @@ export async function verifyUserPhone(userId: string): Promise<void> {
 }
 
 /**
- * A paid user with a verified phone, holding an allocated, locked safe — the
- * state every lock/unlock test starts from. Goes through the real
- * `allocateDevice`, so the lock-state transition it performs is exercised
- * rather than bypassed.
+ * A user with a verified phone holding an **ACTIVE booking** on a locked safe —
+ * the state every lock/unlock test starts from.
  *
- * The phone is verified here because unlocking requires it: the one-time code
- * has to have somewhere to go. Pass `{ phoneVerified: false }` to build the
- * state that must be refused.
+ * Goes through {@link seedBooking}, which writes the row the real flow would
+ * write, rate snapshot included. The phone is verified here because unlocking
+ * requires it: the one-time code has to have somewhere to go. Pass
+ * `{ phoneVerified: false }` to build the state that must be refused.
  */
 export async function createUserWithDevice(
-  options: { phoneVerified?: boolean } = {},
+  options: { phoneVerified?: boolean; hours?: number } = {},
 ): Promise<{
   user: TestUser;
   deviceId: string;
   serialNumber: string;
+  bookingId: string;
 }> {
   const user = await createTestUser();
-  await givePaidPayment(user.id);
   if (options.phoneVerified !== false) await verifyUserPhone(user.id);
   const device = await seedDevice();
-  await allocateDevice(user.id, device.id);
 
-  return { user, deviceId: device.id, serialNumber: device.serialNumber };
+  const booking = await seedBooking({
+    userId: user.id,
+    deviceId: device.id,
+    status: 'ACTIVE',
+    hours: options.hours ?? 2,
+  });
+
+  return {
+    user,
+    deviceId: device.id,
+    serialNumber: device.serialNumber,
+    bookingId: booking.id,
+  };
+}
+
+/**
+ * The device a user currently holds, read through their live booking.
+ *
+ * Replaces `findUniqueOrThrow({ where: { ownerId } })`, which no longer has a
+ * column to look at. Throws if they hold nothing, which is what a test
+ * asserting against "their safe" wants.
+ */
+export async function deviceHeldBy(userId: string): Promise<{
+  id: string;
+  serialNumber: string;
+  lockState: 'LOCKED' | 'UNLOCKED' | 'UNKNOWN';
+  lockStateUpdatedAt: Date | null;
+}> {
+  const booking = await prisma.booking.findFirstOrThrow({
+    where: { userId, completedAt: null },
+    orderBy: { createdAt: 'desc' },
+    select: { deviceId: true },
+  });
+
+  return prisma.device.findUniqueOrThrow({
+    where: { id: booking.deviceId },
+    select: { id: true, serialNumber: true, lockState: true, lockStateUpdatedAt: true },
+  });
+}
+
+// --- Booking helpers ---------------------------------------------------------
+
+const MS_PER_HOUR = 60 * 60 * 1000;
+const MS_PER_MINUTE = 60 * 1000;
+
+export type SeedBookingStatus =
+  | 'PENDING_PAYMENT'
+  | 'ACTIVE'
+  | 'OVERSTAY'
+  | 'COMPLETED'
+  | 'CANCELLED'
+  | 'EXPIRED_UNPAID';
+
+/**
+ * Inserts a `Booking` row in a chosen state at a chosen point in time.
+ *
+ * Every timestamp is settable, and that is the point: an overstay, a lapsed
+ * hold and a closed collection window are all **clock** states, and the suite
+ * has to construct them without sleeping. Where the real flow computes
+ * `endsAt` and `reservedUntil`, this runs the same shared helpers rather than
+ * hardcoding offsets — so a change to the turnaround rule reaches the fixtures
+ * too instead of silently diverging from them.
+ *
+ * The rate snapshot defaults to the live config, which is what a booking
+ * created right now would carry.
+ */
+export async function seedBooking(input: {
+  userId: string;
+  deviceId: string;
+  status?: SeedBookingStatus;
+  hours?: number;
+  /** When the booking started. Defaults to now. */
+  startsAt?: Date;
+  /** Overrides the computed `startsAt + hours`. */
+  endsAt?: Date | null;
+  holdExpiresAt?: Date | null;
+  reservedUntil?: Date;
+  overstaySettledAt?: Date | null;
+  overstayWaivedAt?: Date | null;
+  completedAt?: Date | null;
+  completionReason?: 'COLLECTED' | 'COLLECTION_WINDOW_LAPSED' | 'ADMIN_FORCE_COMPLETED' | null;
+  rates?: Partial<ReturnType<typeof currentRates>>;
+}): Promise<{ id: string; endsAt: Date | null; reservedUntil: Date }> {
+  const rates = { ...currentRates(), ...input.rates };
+  const status = input.status ?? 'ACTIVE';
+  const hours = input.hours ?? 2;
+  const startsAt = input.startsAt ?? new Date();
+
+  // `endsAt` is null until a payment lands, exactly as the service leaves it.
+  const paid = status !== 'PENDING_PAYMENT' && status !== 'EXPIRED_UNPAID';
+  const endsAt =
+    input.endsAt !== undefined
+      ? input.endsAt
+      : paid
+        ? new Date(startsAt.getTime() + hours * MS_PER_HOUR)
+        : null;
+
+  // Terminal rows leave the exclusion constraint, so their reservation
+  // collapses; live ones must still cover grace plus the collection window.
+  const terminal = status === 'COMPLETED' || status === 'CANCELLED' || status === 'EXPIRED_UNPAID';
+  const reservedUntil =
+    input.reservedUntil ??
+    (terminal
+      ? startsAt
+      : reservedUntilFrom(rates, endsAt ?? new Date(startsAt.getTime() + hours * MS_PER_HOUR)));
+
+  const holdExpiresAt =
+    input.holdExpiresAt !== undefined
+      ? input.holdExpiresAt
+      : status === 'PENDING_PAYMENT'
+        ? new Date(startsAt.getTime() + env.BOOKING_HOLD_MINUTES * MS_PER_MINUTE)
+        : null;
+
+  return prisma.booking.create({
+    data: {
+      userId: input.userId,
+      deviceId: input.deviceId,
+      status,
+      hours,
+      startsAt,
+      endsAt,
+      holdExpiresAt,
+      reservedUntil,
+      pricePaise: bookingPricePaise(rates, hours),
+      currency: rates.currency,
+      hourlyRatePaise: rates.hourlyRatePaise,
+      overstayMultiplierBps: rates.overstayMultiplierBps,
+      graceMinutes: rates.graceMinutes,
+      capHours: rates.capHours,
+      collectionWindowMinutes: rates.collectionWindowMinutes,
+      overstaySettledAt: input.overstaySettledAt ?? null,
+      overstayWaivedAt: input.overstayWaivedAt ?? null,
+      completedAt: input.completedAt ?? (terminal ? startsAt : null),
+      completionReason: input.completionReason ?? null,
+    },
+    select: { id: true, endsAt: true, reservedUntil: true },
+  });
+}
+
+/**
+ * Pushes a live booking into overstay by moving its window into the past.
+ *
+ * A **direct row edit**, deliberately. The alternative is faking the clock,
+ * and the services read the real time in several places that a partial fake
+ * would desynchronise — including Postgres, for the exclusion constraint.
+ * Moving `endsAt` back produces exactly the state the sweeper would observe an
+ * hour from now, without waiting an hour for it.
+ *
+ * `hoursOver` is the number of **chargeable hours accrued**, which is not the
+ * same as hours elapsed: overstay is billed per *started* hour, so one second
+ * past the grace period already costs an hour. Landing the clock exactly on a
+ * boundary would make every caller a coin flip between n and n+1, so this aims
+ * one minute into the `hoursOver`-th hour — `hoursOver = 2` means "two hours
+ * are owed", unambiguously.
+ *
+ * `reservedUntil` is pulled back with `endsAt`, because that is the state a
+ * real booking would be in: the reservation is derived from the end, and the
+ * sweeper pushing it back out is precisely the behaviour under test.
+ */
+export async function pushIntoOverstay(
+  bookingId: string,
+  hoursOver = 1,
+): Promise<{ endsAt: Date }> {
+  const row = await prisma.booking.findUniqueOrThrow({
+    where: { id: bookingId },
+    select: BOOKING_SELECT,
+  });
+
+  const booking = row as BookingRow;
+  const elapsedIntoOverstayMs = (hoursOver - 1) * MS_PER_HOUR + MS_PER_MINUTE;
+
+  const endsAt = new Date(
+    Date.now() - booking.graceMinutes * MS_PER_MINUTE - elapsedIntoOverstayMs,
+  );
+
+  await prisma.booking.update({
+    where: { id: bookingId },
+    data: {
+      endsAt,
+      startsAt: new Date(endsAt.getTime() - booking.hours * MS_PER_HOUR),
+      reservedUntil: reservedUntilFrom(snapshotOf(booking), endsAt),
+    },
+  });
+
+  return { endsAt };
 }
 
 // --- Device events / notifications -------------------------------------------
@@ -325,22 +518,49 @@ export async function seedNotification(input: {
   });
 }
 
-/** Marks a user's payment PAID the way a settled payment would look. */
-export async function givePaidPayment(userId: string): Promise<{ id: string; orderId: string }> {
-  const orderId = `order_PAID${crypto.randomBytes(6).toString('hex')}`;
-  const payment = await prisma.payment.create({
+/**
+ * Inserts a `Payment` row for a booking, in a chosen state.
+ *
+ * Every payment belongs to a booking now and `purpose` is NOT NULL, so there
+ * is no account-level "this user has paid" fixture to seed any more — which is
+ * the whole shape of the change: eligibility comes from a booking, not a flag.
+ */
+export async function seedPayment(input: {
+  userId: string;
+  bookingId?: string | null;
+  purpose?: 'BOOKING' | 'EXTENSION' | 'OVERSTAY';
+  amount: number;
+  status?: 'CREATED' | 'PAID' | 'FAILED' | 'REFUNDED';
+  quoteExpiresAt?: Date | null;
+  reviewReason?:
+    | 'BOOKING_EXPIRED_DEVICE_TAKEN'
+    | 'OVERSTAY_QUOTE_EXPIRED'
+    | 'BOOKING_NO_LONGER_PAYABLE'
+    | null;
+}): Promise<{ id: string; orderId: string; paymentId: string }> {
+  const orderId = `order_${crypto.randomBytes(8).toString('hex')}`;
+  const paymentId = `pay_${crypto.randomBytes(8).toString('hex')}`;
+  const status = input.status ?? 'CREATED';
+  const settled = status === 'PAID' || status === 'REFUNDED';
+
+  const row = await prisma.payment.create({
     data: {
-      userId,
+      userId: input.userId,
+      bookingId: input.bookingId ?? null,
+      purpose: input.purpose ?? 'BOOKING',
       razorpayOrderId: orderId,
-      razorpayPaymentId: `pay_PAID${crypto.randomBytes(6).toString('hex')}`,
-      amount: env.SAFE_PRICE_PAISE,
+      ...(settled ? { razorpayPaymentId: paymentId } : {}),
+      amount: input.amount,
       currency: 'INR',
-      status: 'PAID',
-      paidAt: new Date(),
+      status,
+      paidAt: settled ? new Date() : null,
+      quoteExpiresAt: input.quoteExpiresAt ?? null,
+      reviewReason: input.reviewReason ?? null,
     },
     select: { id: true },
   });
-  return { id: payment.id, orderId };
+
+  return { id: row.id, orderId, paymentId };
 }
 
 // --- OTP capture -------------------------------------------------------------

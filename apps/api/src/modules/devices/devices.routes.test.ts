@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { prisma } from '../../lib/prisma';
-import { app, createTestUser, givePaidPayment, seedDevice } from '../../test/helpers';
-import { allocateDevice } from './device.service';
+import {
+  app,
+  createTestUser,
+  createUserWithDevice,
+  seedBooking,
+  seedDevice,
+} from '../../test/helpers';
 
 const MINE_URL = '/api/v1/devices/mine';
 
@@ -14,18 +19,15 @@ describe('GET /api/v1/devices/mine', () => {
     expect(response.body.error.code).toBe('UNAUTHENTICATED');
   });
 
-  it('requires a verified payment', async () => {
+  /**
+   * No eligibility gate — `requirePaid` is gone with the purchase model.
+   *
+   * A user with no booking is not an error state: they are a user who has not
+   * booked yet, and the honest answer is null. The dashboard asks
+   * `GET /bookings/current` to find out what to offer them.
+   */
+  it('returns null for a user with no booking, not an error', async () => {
     const user = await createTestUser();
-
-    const response = await request(app()).get(MINE_URL).set('Cookie', user.cookie);
-
-    expect(response.status).toBe(402);
-    expect(response.body.error.code).toBe('PAYMENT_REQUIRED');
-  });
-
-  it('returns null while the user waits for allocation', async () => {
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
 
     const response = await request(app()).get(MINE_URL).set('Cookie', user.cookie);
 
@@ -33,46 +35,79 @@ describe('GET /api/v1/devices/mine', () => {
     expect(response.body).toEqual({ device: null });
   });
 
-  it('returns the allocated device', async () => {
+  /**
+   * A held safe is not yet an operable safe.
+   *
+   * `PENDING_PAYMENT` reserves the device, but showing it here would imply
+   * controls that `assertCanOperate` would refuse — so this stays null until
+   * the money lands.
+   */
+  it('returns null while a booking is still awaiting payment', async () => {
     const user = await createTestUser();
-    await givePaidPayment(user.id);
     const device = await seedDevice();
-    await allocateDevice(user.id, device.id);
+    await seedBooking({ userId: user.id, deviceId: device.id, status: 'PENDING_PAYMENT' });
 
     const response = await request(app()).get(MINE_URL).set('Cookie', user.cookie);
-
-    expect(response.status).toBe(200);
-    expect(response.body.device).toMatchObject({
-      id: device.id,
-      serialNumber: device.serialNumber,
-      lockState: 'LOCKED',
-      online: false,
-    });
-    expect(response.body.device.allocatedAt).not.toBeNull();
-  });
-
-  it("never exposes another user's device", async () => {
-    const owner = await createTestUser();
-    const other = await createTestUser();
-    await givePaidPayment(owner.id);
-    await givePaidPayment(other.id);
-    const device = await seedDevice();
-    await allocateDevice(owner.id, device.id);
-
-    const response = await request(app()).get(MINE_URL).set('Cookie', other.cookie);
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ device: null });
     expect(JSON.stringify(response.body)).not.toContain(device.serialNumber);
   });
 
+  it('returns the safe held by an active booking', async () => {
+    const { user, deviceId, serialNumber } = await createUserWithDevice();
+
+    const response = await request(app()).get(MINE_URL).set('Cookie', user.cookie);
+
+    expect(response.status).toBe(200);
+    expect(response.body.device).toMatchObject({
+      id: deviceId,
+      serialNumber,
+      lockState: 'LOCKED',
+      online: false,
+    });
+  });
+
+  /** An unpaid overstay still has the safe physically, so it still resolves. */
+  it('returns the safe during an overstay', async () => {
+    const { user, serialNumber, bookingId } = await createUserWithDevice();
+    await prisma.booking.update({ where: { id: bookingId }, data: { status: 'OVERSTAY' } });
+
+    const response = await request(app()).get(MINE_URL).set('Cookie', user.cookie);
+
+    expect(response.status).toBe(200);
+    expect(response.body.device).toMatchObject({ serialNumber });
+  });
+
+  it("never exposes another user's safe", async () => {
+    const { serialNumber } = await createUserWithDevice();
+    const other = await createTestUser();
+
+    const response = await request(app()).get(MINE_URL).set('Cookie', other.cookie);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ device: null });
+    expect(JSON.stringify(response.body)).not.toContain(serialNumber);
+  });
+
+  it('returns null once the booking has been completed', async () => {
+    const { user, bookingId, serialNumber } = await createUserWithDevice();
+    await prisma.booking.update({
+      where: { id: bookingId },
+      data: { status: 'COMPLETED', completedAt: new Date(), completionReason: 'COLLECTED' },
+    });
+
+    const response = await request(app()).get(MINE_URL).set('Cookie', user.cookie);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ device: null });
+    expect(JSON.stringify(response.body)).not.toContain(serialNumber);
+  });
+
   it('never exposes the reserved hardware credential', async () => {
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
-    const device = await seedDevice();
-    await allocateDevice(user.id, device.id);
+    const { user, deviceId } = await createUserWithDevice();
     await prisma.device.update({
-      where: { id: device.id },
+      where: { id: deviceId },
       data: { credentialHash: 'device-credential-must-not-leak' },
     });
 
@@ -82,57 +117,25 @@ describe('GET /api/v1/devices/mine', () => {
     expect(serialised).not.toContain('device-credential-must-not-leak');
     expect(serialised).not.toContain('credentialHash');
   });
-
-  it('still serves the device after a refund, so the UI can explain the state', async () => {
-    // hasPaid goes false, so requirePaid blocks /devices/mine with a 402. The
-    // dashboard relies on `deviceAllocated` from /auth/me for this state
-    // rather than on this endpoint — asserted here so the behaviour is pinned.
-    const user = await createTestUser();
-    const payment = await givePaidPayment(user.id);
-    const device = await seedDevice();
-    await allocateDevice(user.id, device.id);
-
-    await prisma.payment.update({
-      where: { id: payment.id },
-      data: { status: 'REFUNDED' },
-    });
-
-    const response = await request(app()).get(MINE_URL).set('Cookie', user.cookie);
-    expect(response.status).toBe(402);
-    expect(response.body.error.code).toBe('PAYMENT_REQUIRED');
-  });
 });
 
-describe('GET /api/v1/auth/me — deviceAllocated', () => {
-  it('is false before allocation and true after', async () => {
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
-
-    const before = await request(app()).get('/api/v1/auth/me').set('Cookie', user.cookie);
-    expect(before.body.user).toMatchObject({ hasPaid: true, deviceAllocated: false });
-
-    const device = await seedDevice();
-    await allocateDevice(user.id, device.id);
-
-    const after = await request(app()).get('/api/v1/auth/me').set('Cookie', user.cookie);
-    expect(after.body.user).toMatchObject({ hasPaid: true, deviceAllocated: true });
-  });
-
-  it('reports hasPaid false with deviceAllocated true after a refund', async () => {
-    const user = await createTestUser();
-    const payment = await givePaidPayment(user.id);
-    const device = await seedDevice();
-    await allocateDevice(user.id, device.id);
-
-    await prisma.payment.update({
-      where: { id: payment.id },
-      data: { status: 'REFUNDED' },
-    });
+describe('GET /api/v1/auth/me', () => {
+  /**
+   * The two purchase flags are gone from the payload.
+   *
+   * Pinned as an assertion rather than just deleted: a client still reading
+   * `hasPaid` would get `undefined` and silently treat every user as unpaid,
+   * so the absence is the contract.
+   */
+  it('no longer carries hasPaid or deviceAllocated', async () => {
+    const { user } = await createUserWithDevice();
 
     const response = await request(app()).get('/api/v1/auth/me').set('Cookie', user.cookie);
 
-    // The combination the dashboard has an explicit state for.
-    expect(response.body.user).toMatchObject({ hasPaid: false, deviceAllocated: true });
+    expect(response.status).toBe(200);
+    expect(response.body.user).not.toHaveProperty('hasPaid');
+    expect(response.body.user).not.toHaveProperty('deviceAllocated');
+    expect(response.body.user).toMatchObject({ id: user.id, phoneVerified: true });
   });
 
   it('never leaks a password hash', async () => {

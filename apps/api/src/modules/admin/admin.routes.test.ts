@@ -6,11 +6,13 @@ import {
   app,
   createTestAdmin,
   createTestUser,
-  givePaidPayment,
+  createUserWithDevice,
+  pushIntoOverstay,
+  seedBooking,
   seedDevice,
   seedDevices,
+  seedPayment,
 } from '../../test/helpers';
-import { allocateDevice } from '../devices/device.service';
 
 /**
  * Every admin route, with the method and a representative body. Used to
@@ -27,12 +29,26 @@ const ADMIN_ROUTES = [
   },
   {
     method: 'post' as const,
-    path: '/api/v1/admin/devices/some-id/allocate',
-    body: { userId: 'someone' },
+    path: '/api/v1/admin/devices/some-id/clear-inspection',
+    body: { note: 'Opened and checked, empty' },
   },
-  { method: 'post' as const, path: '/api/v1/admin/allocate-next', body: { userId: 'someone' } },
-  { method: 'post' as const, path: '/api/v1/admin/devices/some-id/unassign', body: {} },
   { method: 'post' as const, path: '/api/v1/admin/devices/some-id/retire', body: {} },
+  { method: 'get' as const, path: '/api/v1/admin/bookings' },
+  {
+    method: 'post' as const,
+    path: '/api/v1/admin/bookings/some-id/force-complete',
+    body: { reason: 'Renter unreachable for two days' },
+  },
+  {
+    method: 'post' as const,
+    path: '/api/v1/admin/bookings/some-id/waive-overstay',
+    body: { reason: 'Our lock firmware was down' },
+  },
+  {
+    method: 'post' as const,
+    path: '/api/v1/admin/payments/some-id/clear-review',
+    body: { note: 'Refunded in the Razorpay dashboard' },
+  },
   { method: 'get' as const, path: '/api/v1/admin/users' },
   { method: 'get' as const, path: '/api/v1/admin/payments' },
   { method: 'get' as const, path: '/api/v1/admin/audit' },
@@ -76,11 +92,8 @@ describe('admin route authorisation', () => {
     }
   });
 
-  it('rejects a paid, device-holding user — paying does not confer admin', async () => {
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
-    const device = await seedDevice();
-    await allocateDevice(user.id, device.id);
+  it('rejects a user holding a booked safe — paying does not confer admin', async () => {
+    const { user } = await createUserWithDevice();
 
     const response = await send({ method: 'get', path: '/api/v1/admin/users' }, user.cookie);
     expect(response.status).toBe(403);
@@ -112,30 +125,30 @@ describe('admin route authorisation', () => {
 });
 
 describe('GET /api/v1/admin/devices', () => {
-  it('paginates and filters by status', async () => {
+  it('paginates, filters by status and shows the occupying booking', async () => {
     const admin = await createTestAdmin();
     const user = await createTestUser();
-    await givePaidPayment(user.id);
     const devices = await seedDevices(3);
-    await allocateDevice(user.id, devices[0]!.id);
+    await seedBooking({ userId: user.id, deviceId: devices[0]!.id, status: 'ACTIVE' });
 
     const all = await request(app()).get('/api/v1/admin/devices').set('Cookie', admin.cookie);
     expect(all.body.total).toBe(3);
     expect(all.body.items).toHaveLength(3);
 
-    const assigned = await request(app())
-      .get('/api/v1/admin/devices?status=ASSIGNED')
+    // Occupancy is a property of the bookings, not a device status — a booked
+    // safe is still AVAILABLE as inventory.
+    const occupied = await request(app())
+      .get('/api/v1/admin/devices?status=AVAILABLE')
       .set('Cookie', admin.cookie);
-    expect(assigned.body.total).toBe(1);
-    expect(assigned.body.items[0]).toMatchObject({
-      serialNumber: devices[0]!.serialNumber,
-      owner: { id: user.id },
-    });
+    expect(occupied.body.total).toBe(3);
 
-    const unassigned = await request(app())
-      .get('/api/v1/admin/devices?status=UNASSIGNED')
-      .set('Cookie', admin.cookie);
-    expect(unassigned.body.total).toBe(2);
+    const booked = (all.body.items as Array<{ serialNumber: string; currentBooking: unknown }>)
+      .filter((row) => row.currentBooking !== null);
+    expect(booked).toHaveLength(1);
+    expect(booked[0]).toMatchObject({
+      serialNumber: devices[0]!.serialNumber,
+      currentBooking: { status: 'ACTIVE', effectiveStatus: 'ACTIVE', user: { id: user.id } },
+    });
 
     const paged = await request(app())
       .get('/api/v1/admin/devices?page=2&pageSize=2')
@@ -144,12 +157,9 @@ describe('GET /api/v1/admin/devices', () => {
     expect(paged.body).toMatchObject({ page: 2, pageSize: 2, total: 3, totalPages: 2 });
   });
 
-  it('searches by serial and by owner, case-insensitively', async () => {
+  it('searches by serial, case-insensitively', async () => {
     const admin = await createTestAdmin();
-    const user = await createTestUser({ name: 'Priya Sharma' });
-    await givePaidPayment(user.id);
-    const device = await seedDevice({ serialNumber: 'SAFE-FIND' });
-    await allocateDevice(user.id, device.id);
+    await seedDevice({ serialNumber: 'SAFE-FIND' });
     await seedDevice({ serialNumber: 'SAFE-OTHER' });
 
     const bySerial = await request(app())
@@ -157,11 +167,6 @@ describe('GET /api/v1/admin/devices', () => {
       .set('Cookie', admin.cookie);
     expect(bySerial.body.total).toBe(1);
     expect(bySerial.body.items[0].serialNumber).toBe('SAFE-FIND');
-
-    const byOwner = await request(app())
-      .get('/api/v1/admin/devices?q=priya')
-      .set('Cookie', admin.cookie);
-    expect(byOwner.body.total).toBe(1);
   });
 
   it('rejects a search term over 100 characters', async () => {
@@ -302,146 +307,403 @@ describe('POST /api/v1/admin/devices/bulk', () => {
   });
 });
 
-describe('admin allocation routes', () => {
-  it('allocates a specific device and audits it against the receiving user', async () => {
+describe('POST /api/v1/admin/bookings/:id/force-complete', () => {
+  it('ends the booking and sends the safe for inspection by default', async () => {
     const admin = await createTestAdmin();
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
-    const device = await seedDevice();
+    const { user, deviceId, bookingId } = await createUserWithDevice();
 
     const response = await request(app())
-      .post(`/api/v1/admin/devices/${device.id}/allocate`)
+      .post(`/api/v1/admin/bookings/${bookingId}/force-complete`)
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', admin.cookie)
-      .send({ userId: user.id });
+      .send({ reason: 'Renter unreachable for two days' });
 
     expect(response.status).toBe(200);
-    expect(response.body.device).toMatchObject({ status: 'ASSIGNED', owner: { id: user.id } });
+    expect(response.body.needsInspection).toBe(true);
+
+    const booking = await prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
+    expect(booking.status).toBe('COMPLETED');
+    expect(booking.completionReason).toBe('ADMIN_FORCE_COMPLETED');
+    expect(booking.adminNote).toBe('Renter unreachable for two days');
+
+    /**
+     * The safety property this whole feature exists for: the safe does **not**
+     * go back into the pool. Nobody confirmed it was emptied, so renting it out
+     * again could hand the next person someone else's property along with the
+     * ability to unlock it.
+     */
+    const device = await prisma.device.findUniqueOrThrow({ where: { id: deviceId } });
+    expect(device.status).toBe('NEEDS_INSPECTION');
+    expect(device.inspectionNote).toBe('Renter unreachable for two days');
+
+    // And the safe is commanded locked after the booking ends.
+    expect(device.lockState).toBe('LOCKED');
+
+    // Any open unlock code dies with the booking.
+    const open = await prisma.unlockChallenge.count({
+      where: { userId: user.id, consumedAt: null },
+    });
+    expect(open).toBe(0);
 
     const audit = await prisma.auditLog.findFirst({
-      where: { action: 'device.allocated', userId: user.id },
+      where: { action: 'booking.force_completed' },
     });
-    expect(audit).not.toBeNull();
-    expect(audit?.metadata).toMatchObject({ allocatedByAdminId: admin.id, mode: 'specific' });
-  });
-
-  it('allocates the next available device', async () => {
-    const admin = await createTestAdmin();
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
-    const [oldest] = await seedDevices(2);
-
-    const response = await request(app())
-      .post('/api/v1/admin/allocate-next')
-      .set('Origin', TEST_ORIGIN)
-      .set('Cookie', admin.cookie)
-      .send({ userId: user.id });
-
-    expect(response.status).toBe(200);
-    expect(response.body.device.id).toBe(oldest!.id);
-  });
-
-  it('returns 402 NOT_PAID and audits the failure with the error code', async () => {
-    const admin = await createTestAdmin();
-    const user = await createTestUser();
-    const device = await seedDevice();
-
-    const response = await request(app())
-      .post(`/api/v1/admin/devices/${device.id}/allocate`)
-      .set('Origin', TEST_ORIGIN)
-      .set('Cookie', admin.cookie)
-      .send({ userId: user.id });
-
-    expect(response.status).toBe(402);
-    expect(response.body.error.code).toBe('NOT_PAID');
-
-    const audit = await prisma.auditLog.findFirst({
-      where: { action: 'device.allocation.failed' },
-    });
-    expect(audit).not.toBeNull();
     expect(audit?.metadata).toMatchObject({
-      outcome: 'failed',
-      errorCode: 'NOT_PAID',
-      targetUserId: user.id,
+      bookingId,
+      completedByAdminId: admin.id,
+      needsInspection: true,
+      reason: 'Renter unreachable for two days',
     });
   });
 
-  it('returns 404 USER_NOT_FOUND for an unknown userId', async () => {
+  it('returns the safe to the pool when the admin says they checked it', async () => {
     const admin = await createTestAdmin();
-    const device = await seedDevice();
+    const { deviceId, bookingId } = await createUserWithDevice();
 
     const response = await request(app())
-      .post(`/api/v1/admin/devices/${device.id}/allocate`)
+      .post(`/api/v1/admin/bookings/${bookingId}/force-complete`)
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', admin.cookie)
-      .send({ userId: 'usr_nope' });
+      .send({ reason: 'Collected in person at the desk', needsInspection: false });
 
-    expect(response.status).toBe(404);
-    expect(response.body.error.code).toBe('USER_NOT_FOUND');
+    expect(response.status).toBe(200);
+    expect(response.body.needsInspection).toBe(false);
+
+    const device = await prisma.device.findUniqueOrThrow({ where: { id: deviceId } });
+    expect(device.status).toBe('AVAILABLE');
   });
 
-  it('returns 409 NO_DEVICES_IN_STOCK when the inventory is empty', async () => {
+  it('requires a reason of at least three characters', async () => {
     const admin = await createTestAdmin();
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
+    const { bookingId } = await createUserWithDevice();
 
     const response = await request(app())
-      .post('/api/v1/admin/allocate-next')
+      .post(`/api/v1/admin/bookings/${bookingId}/force-complete`)
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', admin.cookie)
-      .send({ userId: user.id });
+      .send({ reason: 'x' });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('VALIDATION_ERROR');
+
+    const booking = await prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
+    expect(booking.status).toBe('ACTIVE');
+  });
+
+  it('refuses a booking that has already ended, and audits the failure', async () => {
+    const admin = await createTestAdmin();
+    const { bookingId } = await createUserWithDevice();
+
+    await prisma.booking.update({
+      where: { id: bookingId },
+      data: { status: 'COMPLETED', completedAt: new Date(), completionReason: 'COLLECTED' },
+    });
+
+    const response = await request(app())
+      .post(`/api/v1/admin/bookings/${bookingId}/force-complete`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ reason: 'Trying again by mistake' });
 
     expect(response.status).toBe(409);
-    expect(response.body.error.code).toBe('NO_DEVICES_IN_STOCK');
+    expect(response.body.error.code).toBe('BOOKING_STATE_INVALID');
+
+    const audits = await prisma.auditLog.findMany({
+      where: { action: 'booking.force_completed' },
+    });
+    const failure = audits.find(
+      (row) => (row.metadata as { outcome?: string } | null)?.outcome === 'failed',
+    );
+    expect(failure?.metadata).toMatchObject({ errorCode: 'BOOKING_STATE_INVALID' });
   });
 });
 
-describe('admin unassign and retire routes', () => {
-  it('unassigns a device and audits it against the previous owner', async () => {
+describe('POST /api/v1/admin/bookings/:id/waive-overstay', () => {
+  it('waives the fee without recording it as revenue', async () => {
     const admin = await createTestAdmin();
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
-    const device = await seedDevice();
-    await allocateDevice(user.id, device.id);
+    const { bookingId } = await createUserWithDevice();
+    await pushIntoOverstay(bookingId, 2);
 
     const response = await request(app())
-      .post(`/api/v1/admin/devices/${device.id}/unassign`)
+      .post(`/api/v1/admin/bookings/${bookingId}/waive-overstay`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ reason: 'Our lock firmware was down for an hour' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.waivedPaise).toBeGreaterThan(0);
+
+    const booking = await prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
+    expect(booking.overstayWaivedAt).toBeInstanceOf(Date);
+    // A waive must never look like money we collected.
+    expect(booking.overstayPaidPaise).toBe(0);
+    expect(booking.overstaySettledAt).toBeNull();
+
+    // The user can now collect: the fee is no longer outstanding, and the
+    // collection window has opened from the waive.
+    expect(response.body.booking.overstayFeePaise).toBe(0);
+    expect(response.body.booking.collectBy).not.toBeNull();
+
+    const audit = await prisma.auditLog.findFirst({
+      where: { action: 'booking.overstay.waived' },
+    });
+    expect(audit?.metadata).toMatchObject({ bookingId, waivedByAdminId: admin.id });
+    expect((audit?.metadata as { waivedPaise?: number })?.waivedPaise).toBeGreaterThan(0);
+  });
+
+  it('refuses when there is no fee outstanding', async () => {
+    const admin = await createTestAdmin();
+    const { bookingId } = await createUserWithDevice();
+
+    const response = await request(app())
+      .post(`/api/v1/admin/bookings/${bookingId}/waive-overstay`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ reason: 'Nothing to waive here' });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('NOTHING_TO_PAY');
+  });
+
+  it('refuses a second waive on the same overstay', async () => {
+    const admin = await createTestAdmin();
+    const { bookingId } = await createUserWithDevice();
+    await pushIntoOverstay(bookingId, 1);
+
+    const waive = () =>
+      request(app())
+        .post(`/api/v1/admin/bookings/${bookingId}/waive-overstay`)
+        .set('Origin', TEST_ORIGIN)
+        .set('Cookie', admin.cookie)
+        .send({ reason: 'Goodwill gesture for the outage' });
+
+    expect((await waive()).status).toBe(200);
+
+    const second = await waive();
+    expect(second.status).toBe(409);
+    expect(second.body.error.code).toBe('BOOKING_STATE_INVALID');
+  });
+});
+
+describe('GET /api/v1/admin/bookings', () => {
+  it('lists bookings with the user and the serial', async () => {
+    const admin = await createTestAdmin();
+    const { user, serialNumber } = await createUserWithDevice();
+
+    const response = await request(app())
+      .get('/api/v1/admin/bookings')
+      .set('Cookie', admin.cookie);
+
+    expect(response.status).toBe(200);
+    expect(response.body.total).toBe(1);
+    expect(response.body.items[0]).toMatchObject({
+      serialNumber,
+      status: 'ACTIVE',
+      effectiveStatus: 'ACTIVE',
+      user: { id: user.id },
+      flagged: false,
+    });
+  });
+
+  /**
+   * The flagged list is the admin's work queue, and an unpaid overstay is the
+   * case that must never be reachable only by scrolling: the sweeper
+   * deliberately never completes one, so nothing else will surface it.
+   */
+  it('flags an unpaid overstay', async () => {
+    const admin = await createTestAdmin();
+    const { bookingId } = await createUserWithDevice();
+    await pushIntoOverstay(bookingId, 1);
+
+    const flagged = await request(app())
+      .get('/api/v1/admin/bookings?flagged=true')
+      .set('Cookie', admin.cookie);
+
+    expect(flagged.status).toBe(200);
+    expect(flagged.body.items).toHaveLength(1);
+    expect(flagged.body.items[0]).toMatchObject({
+      id: bookingId,
+      effectiveStatus: 'OVERSTAY',
+      flagged: true,
+    });
+    expect(flagged.body.items[0].overstayFeePaise).toBeGreaterThan(0);
+
+    const unflagged = await request(app())
+      .get('/api/v1/admin/bookings?flagged=false')
+      .set('Cookie', admin.cookie);
+    expect(unflagged.body.items).toHaveLength(0);
+  });
+
+  it('flags a booking whose safe is awaiting inspection', async () => {
+    const admin = await createTestAdmin();
+    const { bookingId, deviceId } = await createUserWithDevice();
+
+    await request(app())
+      .post(`/api/v1/admin/bookings/${bookingId}/force-complete`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ reason: 'Renter never came back' });
+
+    const device = await prisma.device.findUniqueOrThrow({ where: { id: deviceId } });
+    expect(device.status).toBe('NEEDS_INSPECTION');
+
+    const flagged = await request(app())
+      .get('/api/v1/admin/bookings?flagged=true')
+      .set('Cookie', admin.cookie);
+
+    expect(flagged.body.items).toHaveLength(1);
+    expect(flagged.body.items[0].id).toBe(bookingId);
+  });
+
+  it('filters by status and searches by serial', async () => {
+    const admin = await createTestAdmin();
+    await createUserWithDevice();
+    const second = await createUserWithDevice();
+
+    const active = await request(app())
+      .get('/api/v1/admin/bookings?status=ACTIVE')
+      .set('Cookie', admin.cookie);
+    expect(active.body.total).toBe(2);
+
+    const completed = await request(app())
+      .get('/api/v1/admin/bookings?status=COMPLETED')
+      .set('Cookie', admin.cookie);
+    expect(completed.body.total).toBe(0);
+
+    const bySerial = await request(app())
+      .get(`/api/v1/admin/bookings?q=${second.serialNumber}`)
+      .set('Cookie', admin.cookie);
+    expect(bySerial.body.total).toBe(1);
+  });
+});
+
+describe('POST /api/v1/admin/devices/:id/clear-inspection', () => {
+  it('returns an inspected safe to the pool, with an audited note', async () => {
+    const admin = await createTestAdmin();
+    const { bookingId, deviceId } = await createUserWithDevice();
+
+    await request(app())
+      .post(`/api/v1/admin/bookings/${bookingId}/force-complete`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ reason: 'Renter never came back' });
+
+    const response = await request(app())
+      .post(`/api/v1/admin/devices/${deviceId}/clear-inspection`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ note: 'Opened at the desk, empty, wiped down' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.device.status).toBe('AVAILABLE');
+
+    const device = await prisma.device.findUniqueOrThrow({ where: { id: deviceId } });
+    expect(device.status).toBe('AVAILABLE');
+    expect(device.inspectionNote).toBe('Opened at the desk, empty, wiped down');
+
+    const audit = await prisma.auditLog.findFirst({
+      where: { action: 'device.inspection.cleared' },
+    });
+    expect(audit?.metadata).toMatchObject({
+      clearedByAdminId: admin.id,
+      note: 'Opened at the desk, empty, wiped down',
+    });
+  });
+
+  /** A safe nobody has flagged does not need clearing, and saying so is honest. */
+  it('refuses a safe that is not awaiting inspection', async () => {
+    const admin = await createTestAdmin();
+    const device = await seedDevice();
+
+    const response = await request(app())
+      .post(`/api/v1/admin/devices/${device.id}/clear-inspection`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ note: 'Nothing was wrong with it' });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('DEVICE_NOT_AVAILABLE');
+  });
+
+  it('requires a note', async () => {
+    const admin = await createTestAdmin();
+    const device = await seedDevice();
+
+    const response = await request(app())
+      .post(`/api/v1/admin/devices/${device.id}/clear-inspection`)
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', admin.cookie)
       .send({});
 
-    expect(response.status).toBe(200);
-    expect(response.body.device.status).toBe('UNASSIGNED');
-
-    const audit = await prisma.auditLog.findFirst({
-      where: { action: 'device.unassigned', userId: user.id },
-    });
-    expect(audit?.metadata).toMatchObject({ unassignedByAdminId: admin.id });
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('VALIDATION_ERROR');
   });
 
-  it('refuses to retire an assigned device and audits the failure', async () => {
+  /**
+   * And a flagged safe cannot be booked in the meantime.
+   *
+   * The end-to-end form of the rule: the device pick filters on
+   * `status = 'AVAILABLE'`, so a safe awaiting inspection is simply not in the
+   * pool until a human has cleared it.
+   */
+  it('keeps a flagged safe out of the booking pool until cleared', async () => {
     const admin = await createTestAdmin();
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
-    const device = await seedDevice();
-    await allocateDevice(user.id, device.id);
+    const { bookingId, deviceId } = await createUserWithDevice();
+
+    await request(app())
+      .post(`/api/v1/admin/bookings/${bookingId}/force-complete`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ reason: 'Renter never came back' });
+
+    const nextRenter = await createTestUser();
+    const refused = await request(app())
+      .post('/api/v1/bookings')
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', nextRenter.cookie)
+      .send({ hours: 1 });
+
+    expect(refused.status).toBe(409);
+    expect(refused.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+
+    await request(app())
+      .post(`/api/v1/admin/devices/${deviceId}/clear-inspection`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ note: 'Checked, empty' });
+
+    const allowed = await request(app())
+      .post('/api/v1/bookings')
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', nextRenter.cookie)
+      .send({ hours: 1 });
+
+    expect(allowed.status).toBe(201);
+    expect(allowed.body.booking.deviceId).toBe(deviceId);
+  });
+});
+
+describe('POST /api/v1/admin/devices/:id/retire', () => {
+  it('refuses to retire a safe with a live booking, and audits the failure', async () => {
+    const admin = await createTestAdmin();
+    const { deviceId } = await createUserWithDevice();
 
     const response = await request(app())
-      .post(`/api/v1/admin/devices/${device.id}/retire`)
+      .post(`/api/v1/admin/devices/${deviceId}/retire`)
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', admin.cookie)
       .send({});
 
     expect(response.status).toBe(409);
-    expect(response.body.error.code).toBe('DEVICE_STILL_ASSIGNED');
+    expect(response.body.error.code).toBe('DEVICE_HAS_LIVE_BOOKING');
 
     const audit = await prisma.auditLog.findFirst({
       where: { action: 'device.retire.failed' },
     });
-    expect(audit?.metadata).toMatchObject({ errorCode: 'DEVICE_STILL_ASSIGNED' });
+    expect(audit?.metadata).toMatchObject({ errorCode: 'DEVICE_HAS_LIVE_BOOKING' });
   });
 
-  it('retires a device once unassigned', async () => {
+  it('retires a free safe', async () => {
     const admin = await createTestAdmin();
     const device = await seedDevice();
 
@@ -460,20 +722,25 @@ describe('admin unassign and retire routes', () => {
 });
 
 describe('GET /api/v1/admin/users', () => {
-  it('puts users needing attention first', async () => {
+  /**
+   * The work queue has changed shape, not disappeared.
+   *
+   * There is no Allocate button to feed any more, so what sorts to the top is
+   * trouble: a user who owes an overstay fee, then anyone holding a safe, then
+   * everyone else.
+   */
+  it('puts users who owe an overstay fee first, then holders', async () => {
     const admin = await createTestAdmin();
 
-    const waiting = await createTestUser({ name: 'Waiting For Safe' });
-    await givePaidPayment(waiting.id);
-
-    const refunded = await createTestUser({ name: 'Refunded Holder' });
-    const payment = await givePaidPayment(refunded.id);
-    const device = await seedDevice();
-    await allocateDevice(refunded.id, device.id);
-    await prisma.payment.update({
-      where: { id: payment.id },
-      data: { status: 'REFUNDED' },
+    const holder = await createUserWithDevice();
+    await prisma.user.update({
+      where: { id: holder.user.id },
+      data: { name: 'Ordinary Holder' },
     });
+
+    const owing = await createUserWithDevice();
+    await prisma.user.update({ where: { id: owing.user.id }, data: { name: 'Owes A Fee' } });
+    await pushIntoOverstay(owing.bookingId, 2);
 
     await createTestUser({ name: 'Nothing Doing' });
 
@@ -484,42 +751,57 @@ describe('GET /api/v1/admin/users', () => {
     expect(response.status).toBe(200);
     const names = (response.body.items as Array<{ name: string }>).map((row) => row.name);
 
-    // Refunded-but-holding first, then paid-but-unallocated.
-    expect(names[0]).toBe('Refunded Holder');
-    expect(names[1]).toBe('Waiting For Safe');
+    expect(names[0]).toBe('Owes A Fee');
+    expect(names[1]).toBe('Ordinary Holder');
 
-    const refundedRow = response.body.items[0];
-    expect(refundedRow).toMatchObject({
-      hasPaid: false,
-      deviceSerial: device.serialNumber,
-      refundedWithDevice: true,
+    // And the column an admin actually reads: what have they got, and is it
+    // in trouble?
+    expect(response.body.items[0].currentBooking).toMatchObject({
+      id: owing.bookingId,
+      serialNumber: owing.serialNumber,
+      effectiveStatus: 'OVERSTAY',
+    });
+    expect(response.body.items[0].currentBooking.overstayFeePaise).toBeGreaterThan(0);
+
+    expect(response.body.items[1].currentBooking).toMatchObject({
+      effectiveStatus: 'ACTIVE',
+      overstayFeePaise: 0,
     });
   });
 
-  it('filters by paid and allocated', async () => {
+  it('filters by whether the user holds a booking', async () => {
     const admin = await createTestAdmin();
 
-    const allocated = await createTestUser();
-    await givePaidPayment(allocated.id);
-    const device = await seedDevice();
-    await allocateDevice(allocated.id, device.id);
-
-    const waiting = await createTestUser();
-    await givePaidPayment(waiting.id);
-
+    const holder = await createUserWithDevice();
     await createTestUser();
 
-    const paidUnallocated = await request(app())
-      .get('/api/v1/admin/users?paid=true&allocated=false')
+    const booked = await request(app())
+      .get('/api/v1/admin/users?booked=true')
       .set('Cookie', admin.cookie);
-    expect(paidUnallocated.body.total).toBe(1);
-    expect(paidUnallocated.body.items[0].id).toBe(waiting.id);
+    expect(booked.body.total).toBe(1);
+    expect(booked.body.items[0].id).toBe(holder.user.id);
 
-    const unpaid = await request(app())
-      .get('/api/v1/admin/users?paid=false')
+    const free = await request(app())
+      .get('/api/v1/admin/users?booked=false')
       .set('Cookie', admin.cookie);
-    // The unpaid user plus the admin account itself.
-    expect(unpaid.body.total).toBe(2);
+    // The user with no booking plus the admin account itself.
+    expect(free.body.total).toBe(2);
+  });
+
+  it('reports a null current booking once it has ended', async () => {
+    const admin = await createTestAdmin();
+    const { user, bookingId } = await createUserWithDevice();
+
+    await prisma.booking.update({
+      where: { id: bookingId },
+      data: { status: 'COMPLETED', completedAt: new Date(), completionReason: 'COLLECTED' },
+    });
+
+    const response = await request(app())
+      .get(`/api/v1/admin/users?q=${encodeURIComponent(user.email)}`)
+      .set('Cookie', admin.cookie);
+
+    expect(response.body.items[0].currentBooking).toBeNull();
   });
 
   it('searches by name, email and phone', async () => {
@@ -542,6 +824,13 @@ describe('GET /api/v1/admin/users', () => {
     expect(byPhone.body.total).toBe(1);
   });
 
+  /**
+   * The exact field list, asserted.
+   *
+   * This is the allow-list that keeps admin tooling from being the place a
+   * password hash first reaches a browser, so it is pinned rather than
+   * described.
+   */
   it('returns only the agreed user fields', async () => {
     const admin = await createTestAdmin();
     await createTestUser();
@@ -553,13 +842,12 @@ describe('GET /api/v1/admin/users', () => {
     for (const row of response.body.items as Array<Record<string, unknown>>) {
       expect(Object.keys(row).sort()).toEqual([
         'createdAt',
-        'deviceSerial',
+        'currentBooking',
         'email',
-        'hasPaid',
         'id',
         'name',
         'phone',
-        'refundedWithDevice',
+        'phoneVerified',
         'role',
       ]);
     }
@@ -567,10 +855,16 @@ describe('GET /api/v1/admin/users', () => {
 });
 
 describe('GET /api/v1/admin/payments and /audit', () => {
-  it('lists payments with the owning user and filters by status', async () => {
+  it('lists payments with their purpose, booking and owning user', async () => {
     const admin = await createTestAdmin();
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
+    const { user, bookingId } = await createUserWithDevice();
+    await seedPayment({
+      userId: user.id,
+      bookingId,
+      purpose: 'BOOKING',
+      amount: 20_000,
+      status: 'PAID',
+    });
 
     const all = await request(app())
       .get('/api/v1/admin/payments')
@@ -578,13 +872,128 @@ describe('GET /api/v1/admin/payments and /audit', () => {
     expect(all.body.total).toBe(1);
     expect(all.body.items[0]).toMatchObject({
       status: 'PAID',
+      purpose: 'BOOKING',
+      bookingId,
       user: { id: user.id },
+      reviewReason: null,
     });
 
     const failed = await request(app())
       .get('/api/v1/admin/payments?status=FAILED')
       .set('Cookie', admin.cookie);
     expect(failed.body.total).toBe(0);
+
+    const overstay = await request(app())
+      .get('/api/v1/admin/payments?purpose=OVERSTAY')
+      .set('Cookie', admin.cookie);
+    expect(overstay.body.total).toBe(0);
+  });
+
+  /**
+   * The refund queue.
+   *
+   * Money we captured and could not apply stays `PAID` — we never rewrite a
+   * payment to pretend it did not happen — so this filter is the only way an
+   * admin finds it.
+   */
+  it('filters the payments that need a manual refund', async () => {
+    const admin = await createTestAdmin();
+    const user = await createTestUser();
+
+    const flagged = await seedPayment({
+      userId: user.id,
+      amount: 20_000,
+      status: 'PAID',
+      reviewReason: 'BOOKING_EXPIRED_DEVICE_TAKEN',
+    });
+    await seedPayment({ userId: user.id, amount: 20_000, status: 'PAID' });
+
+    const queue = await request(app())
+      .get('/api/v1/admin/payments?needsReview=true')
+      .set('Cookie', admin.cookie);
+
+    expect(queue.body.total).toBe(1);
+    expect(queue.body.items[0]).toMatchObject({
+      id: flagged.id,
+      status: 'PAID',
+      reviewReason: 'BOOKING_EXPIRED_DEVICE_TAKEN',
+      reviewClearedAt: null,
+    });
+
+    const rest = await request(app())
+      .get('/api/v1/admin/payments?needsReview=false')
+      .set('Cookie', admin.cookie);
+    expect(rest.body.total).toBe(1);
+  });
+
+  it('clears a review flag with an audited note, without touching the status', async () => {
+    const admin = await createTestAdmin();
+    const user = await createTestUser();
+    const flagged = await seedPayment({
+      userId: user.id,
+      amount: 20_000,
+      status: 'PAID',
+      reviewReason: 'OVERSTAY_QUOTE_EXPIRED',
+    });
+
+    const response = await request(app())
+      .post(`/api/v1/admin/payments/${flagged.id}/clear-review`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ note: 'Refunded in the Razorpay dashboard, ref rfnd_123' });
+
+    expect(response.status).toBe(200);
+
+    const row = await prisma.payment.findUniqueOrThrow({ where: { id: flagged.id } });
+    expect(row.reviewClearedAt).toBeInstanceOf(Date);
+    // A payment is PAID until Razorpay says otherwise. Ticking a box is not
+    // Razorpay saying otherwise.
+    expect(row.status).toBe('PAID');
+
+    const audit = await prisma.auditLog.findFirst({
+      where: { action: 'payment.review_cleared' },
+    });
+    expect(audit?.metadata).toMatchObject({
+      paymentRowId: flagged.id,
+      clearedByAdminId: admin.id,
+      note: 'Refunded in the Razorpay dashboard, ref rfnd_123',
+    });
+  });
+
+  it('refuses to clear a payment that is not flagged', async () => {
+    const admin = await createTestAdmin();
+    const user = await createTestUser();
+    const ordinary = await seedPayment({ userId: user.id, amount: 20_000, status: 'PAID' });
+
+    const response = await request(app())
+      .post(`/api/v1/admin/payments/${ordinary.id}/clear-review`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ note: 'Nothing wrong with this one' });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('BOOKING_STATE_INVALID');
+  });
+
+  it('refuses to clear the same flag twice', async () => {
+    const admin = await createTestAdmin();
+    const user = await createTestUser();
+    const flagged = await seedPayment({
+      userId: user.id,
+      amount: 20_000,
+      status: 'PAID',
+      reviewReason: 'BOOKING_NO_LONGER_PAYABLE',
+    });
+
+    const clear = () =>
+      request(app())
+        .post(`/api/v1/admin/payments/${flagged.id}/clear-review`)
+        .set('Origin', TEST_ORIGIN)
+        .set('Cookie', admin.cookie)
+        .send({ note: 'Refunded by hand' });
+
+    expect((await clear()).status).toBe(200);
+    expect((await clear()).status).toBe(409);
   });
 
   it('lists audit entries newest first and filters by action', async () => {
@@ -633,15 +1042,18 @@ describe('admin responses never carry secret material', () => {
   it('exposes no hash, token or credential field on any admin endpoint', async () => {
     const admin = await createTestAdmin();
 
-    // Build a rich dataset: a paid user with a device, a payment, audit rows,
-    // a refresh token, and a device carrying a (hypothetical) credential.
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
-    const device = await seedDevice();
-    await allocateDevice(user.id, device.id);
+    // Build a rich dataset: a user holding a booked safe, a payment, audit
+    // rows, a refresh token, and a device carrying a (hypothetical) credential.
+    const { user, deviceId, bookingId } = await createUserWithDevice();
+    await seedPayment({
+      userId: user.id,
+      bookingId,
+      amount: 20_000,
+      status: 'PAID',
+    });
 
     await prisma.device.update({
-      where: { id: device.id },
+      where: { id: deviceId },
       data: { credentialHash: 'DEVICE-CREDENTIAL-SENTINEL' },
     });
     await prisma.refreshToken.create({
@@ -655,6 +1067,7 @@ describe('admin responses never carry secret material', () => {
 
     const endpoints = [
       '/api/v1/admin/devices',
+      '/api/v1/admin/bookings',
       '/api/v1/admin/users',
       '/api/v1/admin/payments',
       '/api/v1/admin/audit',
@@ -677,17 +1090,15 @@ describe('admin responses never carry secret material', () => {
     }
   });
 
-  it('exposes no password hash on the allocation response', async () => {
+  it('exposes no password hash on a force-complete response', async () => {
     const admin = await createTestAdmin();
-    const user = await createTestUser();
-    await givePaidPayment(user.id);
-    const device = await seedDevice();
+    const { bookingId } = await createUserWithDevice();
 
     const response = await request(app())
-      .post(`/api/v1/admin/devices/${device.id}/allocate`)
+      .post(`/api/v1/admin/bookings/${bookingId}/force-complete`)
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', admin.cookie)
-      .send({ userId: user.id });
+      .send({ reason: 'Renter unreachable' });
 
     const { keys } = walk(response.body);
     expect(keys.filter((key) => FORBIDDEN_KEY.test(key))).toEqual([]);
