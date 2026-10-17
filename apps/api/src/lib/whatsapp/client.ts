@@ -94,6 +94,23 @@ export interface SendTemplateInput {
    * attached to an error. Keep it short-lived.
    */
   params: readonly string[];
+
+  /**
+   * The variable half of a dynamic URL button, when the template has one.
+   *
+   * Meta fixes the *base* of the URL in the approved template and appends one
+   * variable at send time, so a template approved with
+   * `https://app.example.test/bookings/` can only ever produce a link under
+   * that path — this field cannot redirect anyone off-site, whatever it
+   * contains. Omit it for a template with no button; supplying one for a
+   * template Meta has no button on is a `TEMPLATE` error, which is terminal
+   * and ours to fix.
+   *
+   * **Never a code, a token or an amount.** Every caller builds it from a
+   * booking id and a fixed path segment, so there is no shape it could take
+   * that leaks a credential into a chat message.
+   */
+  urlButtonSuffix?: string;
 }
 
 export interface SendTemplateResult {

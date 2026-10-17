@@ -38,7 +38,30 @@ export interface EnqueueInput {
   kind: MessageKind;
   /** The device event this message is about, when there is one. */
   deviceEventId?: string | null;
+  /**
+   * When the message becomes due. Defaults to now, which is every
+   * pre-rental kind's behaviour and stays byte-identical to it.
+   */
+  sendAt?: Date;
+  /** The booking this message is about, for a scheduled lifecycle kind. */
+  bookingId?: string | null;
+  /** Idempotency key. See the column comment in schema.prisma. */
+  dedupeKey?: string | null;
 }
+
+/**
+ * A terminal skip reason.
+ *
+ * Wider than {@link SkipReason}, which is only the three things *sending*
+ * can refuse. These four are decided by the worker before or instead of a
+ * send: the message was cancelled, re-validation refused it, or it was
+ * claimed too late to be true.
+ */
+export type TerminalSkipReason =
+  | SkipReason
+  | 'CANCELLED'
+  | 'NOT_APPLICABLE'
+  | 'STALE';
 
 /**
  * Queues a message. **Must be called inside the transaction it belongs to.**
@@ -55,12 +78,27 @@ export async function enqueue(
   client: PrismaTransaction,
   input: EnqueueInput,
 ): Promise<string> {
+  const sendAt = input.sendAt ?? new Date();
+
   const row = await client.outboundMessage.create({
     data: {
       userId: input.userId,
       kind: input.kind,
       status: 'PENDING',
       deviceEventId: input.deviceEventId ?? null,
+      sendAt,
+      /**
+       * Seeded to `sendAt`, not to now.
+       *
+       * The claim query requires both to have elapsed, so leaving this at the
+       * default would make no difference to *when* a message goes out — but it
+       * would make the backoff column read as "retryable since before it was
+       * due", which is the kind of small lie that costs an hour during an
+       * incident.
+       */
+      nextAttemptAt: sendAt,
+      bookingId: input.bookingId ?? null,
+      dedupeKey: input.dedupeKey ?? null,
     },
     select: { id: true },
   });
@@ -79,12 +117,24 @@ export async function enqueue(
 export async function markSkipped(
   client: PrismaTransaction | typeof prisma,
   id: string,
-  reason: SkipReason,
+  reason: TerminalSkipReason,
 ): Promise<void> {
   await client.outboundMessage.update({
     where: { id },
     data: { status: 'SKIPPED', failureCategory: reason },
   });
+}
+
+/**
+ * Whether a due time is too far behind `now` for the message to still be
+ * honest.
+ *
+ * A pure function of two dates and one setting, exported so the boundary can
+ * be tested directly rather than inferred from a worker run.
+ */
+export function isStale(sendAt: Date, now: Date): boolean {
+  const toleranceMs = env.REMINDER_MAX_LATENESS_MINUTES * 60 * 1000;
+  return now.getTime() - sendAt.getTime() > toleranceMs;
 }
 
 /** Backoff for attempt `n`: 30s, 2m, 8m, 32m … capped at an hour. */
@@ -128,10 +178,25 @@ export async function processPending(
    * mistake the `Command` deferral note warns about for MQTT.
    */
   const claimed = await prisma.$transaction(async (tx) => {
+    /**
+     * Both clauses, and the pair is the point.
+     *
+     * `sendAt` is when the message became due; `nextAttemptAt` is retry
+     * backoff. Requiring both means a backoff can only ever push a message
+     * later, never pull one earlier than its due time — so a retry cannot
+     * deliver "your booking ends in 30 minutes" an hour early, which is the
+     * one direction a scheduled message must never move.
+     *
+     * Ordered by `sendAt` rather than `createdAt`: a reminder queued at
+     * activation is due hours after a receipt queued later, and the queue
+     * should drain in the order things are *due*.
+     */
     const rows = await tx.$queryRaw<Array<{ id: string }>>`
       SELECT "id" FROM "OutboundMessage"
-      WHERE "status" = 'PENDING' AND "nextAttemptAt" <= ${now}
-      ORDER BY "createdAt" ASC
+      WHERE "status" = 'PENDING'
+        AND "sendAt" <= ${now}
+        AND "nextAttemptAt" <= ${now}
+      ORDER BY "sendAt" ASC
       LIMIT ${limit}
       FOR UPDATE SKIP LOCKED
     `;
@@ -154,6 +219,8 @@ export async function processPending(
         kind: true,
         attempts: true,
         deviceEventId: true,
+        bookingId: true,
+        sendAt: true,
       },
     });
   });
@@ -161,6 +228,36 @@ export async function processPending(
   result.claimed = claimed.length;
 
   for (const message of claimed) {
+    /**
+     * Too late to be true? Then say nothing.
+     *
+     * A deadline message delivered long after its deadline is not a late
+     * message, it is a false one: "your booking ends in 10 minutes", arriving
+     * forty minutes after it ended, actively misinforms somebody about a safe
+     * holding their things. Applies only to booking kinds — a message about
+     * something that already happened (an unlock alert, a receipt) has no
+     * deadline to miss, and those should go out however late they are.
+     *
+     * The tolerance is generous relative to the poll interval (5 minutes
+     * against 5 seconds), so an ordinary restart or a slow deploy loses
+     * nothing; only a worker that was genuinely down for minutes does.
+     */
+    if (message.bookingId && isStale(message.sendAt, now)) {
+      await markSkipped(prisma, message.id, 'STALE');
+      result.skipped += 1;
+      logger.warn(
+        {
+          outboundMessageId: message.id,
+          kind: message.kind,
+          bookingId: message.bookingId,
+          latenessMs: now.getTime() - message.sendAt.getTime(),
+          toleranceMinutes: env.REMINDER_MAX_LATENESS_MINUTES,
+        },
+        'Skipped a scheduled message claimed past its lateness tolerance',
+      );
+      continue;
+    }
+
     const recipient = await loadRecipient(message.userId);
 
     if (!recipient) {

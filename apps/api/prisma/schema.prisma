@@ -216,6 +216,15 @@ enum OutboundFailureCategory {
   /// longer true — collected, cancelled, completed, or the fee already paid.
   /// Written by `cancelPending` at the state change.
   CANCELLED
+  /// Skip: re-validation at send time refused it.
+  ///
+  /// Deliberately distinct from `CANCELLED`, which is often the *same
+  /// situation* caught by the other guard: cancellation runs at the state
+  /// change, re-validation runs at the send, and the two are independent on
+  /// purpose. Two reasons means the data says which guard caught it, and a
+  /// pile of `NOT_APPLICABLE` is the signal that some state change is failing
+  /// to cancel what it should.
+  NOT_APPLICABLE
   /// Skip: claimed too long after `sendAt` to still be honest.
   ///
   /// "Your booking ends in 10 minutes", delivered 40 minutes after it ended,

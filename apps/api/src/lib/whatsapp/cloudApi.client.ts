@@ -50,6 +50,30 @@ export class CloudApiWhatsAppClient implements WhatsAppClient {
   }
 
   async sendTemplate(input: SendTemplateInput): Promise<SendTemplateResult> {
+    /**
+     * Body and button are separate components, and the button one carries an
+     * `index` because a template may have several. Ours have at most one, so
+     * the index is always `'0'` — written as a literal rather than derived,
+     * because a wrong index is a `TEMPLATE` rejection with no clue attached.
+     */
+    const components: Array<Record<string, unknown>> = [];
+
+    if (input.params.length) {
+      components.push({
+        type: 'body',
+        parameters: input.params.map((text) => ({ type: 'text', text })),
+      });
+    }
+
+    if (input.urlButtonSuffix !== undefined) {
+      components.push({
+        type: 'button',
+        sub_type: 'url',
+        index: '0',
+        parameters: [{ type: 'text', text: input.urlButtonSuffix }],
+      });
+    }
+
     const payload = {
       messaging_product: 'whatsapp',
       recipient_type: 'individual',
@@ -59,14 +83,7 @@ export class CloudApiWhatsAppClient implements WhatsAppClient {
       template: {
         name: input.templateName,
         language: { code: input.language },
-        components: input.params.length
-          ? [
-              {
-                type: 'body',
-                parameters: input.params.map((text) => ({ type: 'text', text })),
-              },
-            ]
-          : [],
+        components,
       },
     };
 

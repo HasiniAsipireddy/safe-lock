@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import { WHATSAPP_CONSENT_VERSION, maskPhone, toE164 } from '@safelock/shared';
 import { env } from '../../config/env';
 import { logger } from '../logger';
@@ -138,53 +139,94 @@ export async function loadRecipient(
  */
 export async function reasonNotToSend(
   recipient: Recipient,
-  options: { now?: Date } = {},
+  options: { now?: Date; scope?: CapScope } = {},
 ): Promise<SkipReason | null> {
   if (!recipient.phoneVerifiedAt || !recipient.phone) return 'NO_VERIFIED_PHONE';
   if (!recipient.whatsappConsentAt) return 'NO_CONSENT';
-  if (await isCapReached(recipient.userId, options.now)) return 'CAP_REACHED';
+  if (await isCapReached(recipient.userId, options.now, options.scope ?? 'USER')) {
+    return 'CAP_REACHED';
+  }
   return null;
 }
 
 /**
- * Whether the user's rolling 24-hour send allowance is spent.
+ * Which budget a kind draws on.
  *
- * Counts rows that were actually **attempted** (`SENT` or `FAILED`), not
- * `SKIPPED` ones: a skip sent nothing, cost nothing, and must not consume an
- * allowance. A `PENDING` row is counted too — it is a message we have
- * committed to sending, and not counting it would let a burst slip past the
- * cap before the worker caught up.
+ * Two budgets, not one pool and not an exemption. Booking traffic is created
+ * by server-side state changes a user does not control directly, so letting it
+ * share the user allowance would mean somebody's own extensions dropping their
+ * own verification code. Splitting them makes the abuse protection on the
+ * user-triggered half *sharper*: it now counts only what a user's action
+ * produced.
+ */
+export type CapScope = 'USER' | 'BOOKING';
+
+export function capScopeFor(kind: MessageKind): CapScope {
+  return isBookingMessageKind(kind) ? 'BOOKING' : 'USER';
+}
+
+/**
+ * What each scope counts, as a Prisma filter.
+ *
+ * The asymmetry is deliberate.
+ *
+ * **User scope** counts rows that were *attempted or committed to* — `PENDING`
+ * included — because these are user-triggered and a burst must not slip past
+ * the cap before the worker catches up. `SKIPPED` never counts: nothing was
+ * sent and nothing cost anything.
+ *
+ * **Booking scope** counts only what was actually `SENT`. A rental's reminders
+ * are cancelled and re-created every time the booking is extended, and a user
+ * who extends four times should not find their overstay notice dropped by the
+ * ghosts of reminders that were never delivered. The looseness is affordable
+ * because nothing a client can call creates one of these rows.
+ */
+function capFilter(scope: CapScope): Prisma.OutboundMessageWhereInput {
+  const kinds = [...BOOKING_MESSAGE_KINDS];
+
+  return scope === 'BOOKING'
+    ? { kind: { in: kinds }, status: 'SENT' }
+    : { kind: { notIn: kinds }, status: { in: ['PENDING', 'SENT', 'FAILED'] } };
+}
+
+function capLimit(scope: CapScope): number {
+  return scope === 'BOOKING' ? env.WHATSAPP_BOOKING_SEND_CAP : env.WHATSAPP_DAILY_SEND_CAP;
+}
+
+/**
+ * Whether the user's rolling 24-hour allowance for this scope is spent.
  *
  * Rolling rather than calendar-day, so the cap cannot be reset by waiting for
  * midnight in a timezone we did not choose.
  */
-export async function isCapReached(userId: string, now = new Date()): Promise<boolean> {
+export async function isCapReached(
+  userId: string,
+  now = new Date(),
+  scope: CapScope = 'USER',
+): Promise<boolean> {
   const since = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
   const used = await prisma.outboundMessage.count({
-    where: {
-      userId,
-      createdAt: { gte: since },
-      status: { in: ['PENDING', 'SENT', 'FAILED'] },
-    },
+    where: { userId, createdAt: { gte: since }, ...capFilter(scope) },
   });
 
-  return used >= env.WHATSAPP_DAILY_SEND_CAP;
+  return used >= capLimit(scope);
 }
 
-/** How many sends remain in the current window, for user-facing copy. */
+/**
+ * How many sends remain in the current window, for user-facing copy.
+ *
+ * The **user** budget only. This number is shown to someone waiting for a
+ * verification code, and booking reminders are not theirs to spend.
+ */
 export async function remainingSends(userId: string, now = new Date()): Promise<number> {
   const since = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
   const used = await prisma.outboundMessage.count({
-    where: {
-      userId,
-      createdAt: { gte: since },
-      status: { in: ['PENDING', 'SENT', 'FAILED'] },
-    },
+    where: { userId, createdAt: { gte: since }, ...capFilter('USER') },
   });
 
-  return Math.max(0, env.WHATSAPP_DAILY_SEND_CAP - used);
+  return Math.max(0, capLimit('USER') - used);
 }
 
 /**
@@ -197,11 +239,9 @@ export async function capResetsAt(userId: string, now = new Date()): Promise<Dat
   const since = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
   const oldest = await prisma.outboundMessage.findFirst({
-    where: {
-      userId,
-      createdAt: { gte: since },
-      status: { in: ['PENDING', 'SENT', 'FAILED'] },
-    },
+    // The user budget, for the same reason as `remainingSends`: this is the
+    // "try again at" shown to someone waiting for a code.
+    where: { userId, createdAt: { gte: since }, ...capFilter('USER') },
     orderBy: { createdAt: 'asc' },
     select: { createdAt: true },
   });
@@ -221,6 +261,13 @@ export interface SendInput {
    * after it.
    */
   params: readonly string[];
+  /**
+   * The dynamic URL button's variable, for a template that has one.
+   *
+   * Built from a booking id, never from user input, and bounded by the base
+   * URL Meta approved into the template. See `SendTemplateInput`.
+   */
+  urlButtonSuffix?: string;
   /** Skip the cap check. Only for a message the product must not drop. */
   ignoreCap?: boolean;
 }
@@ -258,6 +305,9 @@ export async function sendWhatsApp(input: SendInput): Promise<SendOutcome> {
       templateName: templateFor(input.kind),
       language: env.WHATSAPP_LANGUAGE,
       params: input.params,
+      ...(input.urlButtonSuffix === undefined
+        ? {}
+        : { urlButtonSuffix: input.urlButtonSuffix }),
     });
 
     logger.info(
@@ -294,7 +344,15 @@ async function eligibility(input: SendInput): Promise<SkipReason | null> {
 
   if (!recipient.phoneVerifiedAt || !recipient.phone) return 'NO_VERIFIED_PHONE';
   if (!recipient.whatsappConsentAt) return 'NO_CONSENT';
-  if (!input.ignoreCap && (await isCapReached(recipient.userId))) return 'CAP_REACHED';
+
+  // The kind picks the budget. A booking reminder can therefore never consume
+  // the allowance a verification code needs, and vice versa.
+  if (
+    !input.ignoreCap &&
+    (await isCapReached(recipient.userId, new Date(), capScopeFor(input.kind)))
+  ) {
+    return 'CAP_REACHED';
+  }
 
   return null;
 }

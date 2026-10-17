@@ -36,6 +36,14 @@ export interface RecordedMessage {
   templateName: string;
   language: string;
   params: readonly string[];
+  /**
+   * The dynamic URL button's variable, when the template had one.
+   *
+   * Recorded so a test can assert the **exact** suffix: a reminder whose
+   * button points at the wrong booking is a link that shows someone a
+   * not-found page at the moment they most need the page.
+   */
+  urlButtonSuffix: string | null;
   providerMessageId: string;
   sentAt: Date;
 }
@@ -70,6 +78,7 @@ export class FakeWhatsAppClient implements WhatsAppClient {
       templateName: input.templateName,
       language: input.language,
       params: [...input.params],
+      urlButtonSuffix: input.urlButtonSuffix ?? null,
       providerMessageId,
       sentAt: new Date(),
     });
