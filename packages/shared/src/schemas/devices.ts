@@ -71,13 +71,7 @@ export const bulkCreateDevicesSchema = z
   })
   .strict();
 
-export const allocateDeviceSchema = z
-  .object({
-    userId: z.string().trim().min(1, 'userId is required').max(64),
-  })
-  .strict();
-
-/** `POST /admin/devices/:id/unassign` and `/retire` take no body. */
+/** `POST /admin/devices/:id/retire` takes no body. */
 export const emptyBodySchema = z.object({}).strict();
 
 // --- Unlock OTP --------------------------------------------------------------
@@ -138,25 +132,27 @@ const searchSchema = z
   .optional();
 
 export const deviceStatusFilterSchema = z
-  .enum(['UNASSIGNED', 'ASSIGNED', 'RETIRED'])
+  .enum(['AVAILABLE', 'NEEDS_INSPECTION', 'RETIRED'])
   .optional();
 
-export const listDevicesQuerySchema = z.object({
-  status: deviceStatusFilterSchema,
-  q: searchSchema,
-  page: pageSchema,
-  pageSize: pageSizeSchema,
-});
-
-/** `paid` and `allocated` are tri-state: absent means "don't filter". */
+/** Tri-state filters: absent means "don't filter". */
 const booleanFilterSchema = z
   .enum(['true', 'false'])
   .optional()
   .transform((value) => (value === undefined ? undefined : value === 'true'));
 
+export const listDevicesQuerySchema = z.object({
+  status: deviceStatusFilterSchema,
+  /** Only safes that are occupied by a live booking right now. */
+  occupied: booleanFilterSchema,
+  q: searchSchema,
+  page: pageSchema,
+  pageSize: pageSizeSchema,
+});
+
 export const listUsersQuerySchema = z.object({
-  paid: booleanFilterSchema,
-  allocated: booleanFilterSchema,
+  /** Only users holding a live booking. Replaces the old paid/allocated pair. */
+  booked: booleanFilterSchema,
   q: searchSchema,
   page: pageSchema,
   pageSize: pageSizeSchema,
@@ -164,6 +160,14 @@ export const listUsersQuerySchema = z.object({
 
 export const listPaymentsQuerySchema = z.object({
   status: z.enum(['CREATED', 'PAID', 'FAILED', 'REFUNDED']).optional(),
+  purpose: z.enum(['BOOKING', 'EXTENSION', 'OVERSTAY']).optional(),
+  /**
+   * Only payments awaiting a manual refund.
+   *
+   * This is the list an admin works through: money we took and could not
+   * apply. Flagged rows must not be findable only by scrolling.
+   */
+  needsReview: booleanFilterSchema,
   page: pageSchema,
   pageSize: pageSizeSchema,
 });
@@ -176,7 +180,6 @@ export const listAuditQuerySchema = z.object({
 
 export type CreateDeviceInput = z.infer<typeof createDeviceSchema>;
 export type BulkCreateDevicesInput = z.infer<typeof bulkCreateDevicesSchema>;
-export type AllocateDeviceInput = z.infer<typeof allocateDeviceSchema>;
 export type ListDevicesQuery = z.infer<typeof listDevicesQuerySchema>;
 export type ListUsersQuery = z.infer<typeof listUsersQuerySchema>;
 export type ListPaymentsQuery = z.infer<typeof listPaymentsQuerySchema>;

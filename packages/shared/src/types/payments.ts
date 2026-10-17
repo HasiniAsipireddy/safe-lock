@@ -1,3 +1,5 @@
+import type { PaymentPurpose } from './bookings';
+
 /** Mirrors the Prisma `PaymentStatus` enum. */
 export type PaymentStatus = 'CREATED' | 'PAID' | 'FAILED' | 'REFUNDED';
 
@@ -14,30 +16,9 @@ export interface PaymentSummary {
   razorpayOrderId: string;
   createdAt: string;
   paidAt: string | null;
-}
-
-/** Response body of `GET /payments/me`. */
-export interface PaymentMeResponse {
-  hasPaid: boolean;
-  /** The most recent payment attempt, or null if the user never started one. */
-  payment: PaymentSummary | null;
-  /** Current activation price in paise, straight from the server config. */
-  priceInPaise: number;
-  currency: string;
-}
-
-/**
- * Response body of `POST /payments/order`.
- *
- * `keyId` is the Razorpay **publishable** key id. The key *secret* never
- * leaves the server.
- */
-export interface CreateOrderResponse {
-  orderId: string;
-  amount: number;
-  currency: string;
-  keyId: string;
-  paymentId: string;
+  /** What this payment bought. Every payment belongs to a booking now. */
+  purpose: PaymentPurpose;
+  bookingId: string | null;
 }
 
 /** Request body of `POST /payments/verify` — the three fields Checkout returns. */
@@ -47,8 +28,16 @@ export interface VerifyPaymentRequest {
   razorpay_signature: string;
 }
 
-/** Response body of `POST /payments/verify`. */
+/**
+ * Response body of `POST /payments/verify`.
+ *
+ * `needsReview` must **not** be rendered as plain success. It means the money
+ * arrived and could not be applied — a booking hold that lapsed and whose safe
+ * was taken, or an overstay quote that expired while the fee grew past it. The
+ * payment row stays `PAID` (we never pretend a payment did not happen) and is
+ * queued for a manual refund. The UI says so and points at support.
+ */
 export interface VerifyPaymentResponse {
   payment: PaymentSummary;
-  hasPaid: boolean;
+  needsReview: boolean;
 }

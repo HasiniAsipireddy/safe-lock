@@ -17,10 +17,6 @@ export const ERROR_CODES = {
   INTERNAL_ERROR: 'INTERNAL_ERROR',
 
   // --- Payments -------------------------------------------------------------
-  /** The user already has a PAID payment, so a second order is refused. */
-  ALREADY_PAID: 'ALREADY_PAID',
-  /** A feature was requested that requires a completed payment. */
-  PAYMENT_REQUIRED: 'PAYMENT_REQUIRED',
   /** HMAC check on a Checkout callback or webhook body failed. */
   INVALID_SIGNATURE: 'INVALID_SIGNATURE',
   /** No Payment row matches the supplied Razorpay order id. */
@@ -112,7 +108,7 @@ export const ERROR_CODES = {
   // --- Phone verification / WhatsApp ----------------------------------------
   /**
    * Unlock requires a verified phone number, because that is where the
-   * one-time code goes. Distinct from `NO_DEVICE` and `NOT_PAID`: the user has
+   * one-time code goes. Distinct from `NO_ACTIVE_BOOKING`: the user has
    * something to *do* about it, and the dashboard shows them how.
    */
   PHONE_NOT_VERIFIED: 'PHONE_NOT_VERIFIED',
@@ -142,34 +138,25 @@ export const ERROR_CODES = {
   /** WhatsApp opt-in is required before any message may be sent. */
   CONSENT_REQUIRED: 'CONSENT_REQUIRED',
 
-  // --- Devices / allocation -------------------------------------------------
-  /** Allocation attempted for a user with no server-verified payment. */
-  NOT_PAID: 'NOT_PAID',
-  /** The user already holds a device (one per user for now). */
-  ALREADY_HAS_DEVICE: 'ALREADY_HAS_DEVICE',
-  /** The requested device is not `UNASSIGNED`. */
+  // --- Device inventory -----------------------------------------------------
+  /**
+   * The device is not in a state this action accepts — retired, or awaiting
+   * inspection when the action needed it available.
+   */
   DEVICE_NOT_AVAILABLE: 'DEVICE_NOT_AVAILABLE',
-  /** No `UNASSIGNED` device left to allocate. */
-  NO_DEVICES_IN_STOCK: 'NO_DEVICES_IN_STOCK',
-  /** Retire was attempted on a device that is still assigned to a user. */
-  DEVICE_STILL_ASSIGNED: 'DEVICE_STILL_ASSIGNED',
+  /**
+   * Retire was attempted on a safe that still has a live booking.
+   *
+   * Retiring hardware out of somebody's rental would leave a renter holding a
+   * safe the system has forgotten about.
+   */
+  DEVICE_HAS_LIVE_BOOKING: 'DEVICE_HAS_LIVE_BOOKING',
   /** The `userId` supplied to an admin action matches no user. */
   USER_NOT_FOUND: 'USER_NOT_FOUND',
   /** A serial number that already exists in the inventory. */
   DUPLICATE_SERIAL: 'DUPLICATE_SERIAL',
 
   // --- Lock / unlock --------------------------------------------------------
-  /**
-   * The caller is paid but holds no device yet — still waiting for an admin to
-   * allocate one. Distinct from NOT_PAID: paying again would not help.
-   */
-  NO_DEVICE: 'NO_DEVICE',
-  /**
-   * The caller's payment was refunded while they still hold hardware. Remote
-   * operation is withdrawn; reclaiming the safe is a deliberate admin action.
-   * See docs/decisions.md.
-   */
-  REFUNDED_CONTACT_SUPPORT: 'REFUNDED_CONTACT_SUPPORT',
   /** The submitted OTP did not match. The challenge is still open. */
   OTP_INVALID: 'OTP_INVALID',
   /** The challenge passed its 5-minute expiry. Request a new code. */
