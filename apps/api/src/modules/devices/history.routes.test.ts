@@ -6,7 +6,6 @@ import {
   app,
   createTestUser,
   createUserWithDevice,
-  seedDevice,
   seedDeviceEvent,
   seedDeviceEvents,
 } from '../../test/helpers';
