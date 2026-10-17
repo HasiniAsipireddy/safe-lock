@@ -4,6 +4,7 @@ import { checkDatabase } from './lib/prisma';
 import { createAccountRouter } from './modules/account/account.routes';
 import { createAdminRouter } from './modules/admin/admin.routes';
 import { createAuthRouter } from './modules/auth/auth.routes';
+import { createBookingsRouter } from './modules/bookings/bookings.routes';
 import { createDevicesRouter } from './modules/devices/devices.routes';
 import { createNotificationsRouter } from './modules/notifications/notifications.routes';
 import { createPaymentsRouter } from './modules/payments/payments.routes';
@@ -31,6 +32,7 @@ export function createApiRouter(limiters: Limiters): Router {
   });
 
   router.use('/auth', createAuthRouter(limiters));
+  router.use('/bookings', createBookingsRouter(limiters));
   router.use('/payments', createPaymentsRouter(limiters));
   router.use('/devices', createDevicesRouter(limiters));
   router.use('/account', createAccountRouter(limiters));

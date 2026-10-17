@@ -1,11 +1,20 @@
 import express, { Router } from 'express';
-import { createOrderSchema, verifyPaymentSchema } from '@safelock/shared';
+import { verifyPaymentSchema } from '@safelock/shared';
 import { requireAuth } from '../../middleware/auth';
 import type { Limiters } from '../../middleware/rateLimit';
 import { validateBody } from '../../middleware/validate';
-import { getMyPayment, postOrder, postVerify } from './payments.controller';
+import { postVerify } from './payments.controller';
 import { postWebhook } from './payments.webhook';
 
+/**
+ * Payment routes, mounted at `/api/v1/payments`.
+ *
+ * Only two now. **Orders are created from the booking routes**, where the
+ * amount can be derived from a booking's snapshotted rates — there is no
+ * account-level "activate my safe" purchase any more. What stays here is the
+ * webhook (the source of truth for whether money arrived) and the Checkout
+ * callback, both of which are about a payment rather than a booking.
+ */
 export function createPaymentsRouter(limiters: Limiters): Router {
   const router = Router();
 
@@ -21,23 +30,9 @@ export function createPaymentsRouter(limiters: Limiters): Router {
   router.post('/webhook', express.raw({ type: '*/*', limit: '1mb' }), postWebhook);
 
   /**
-   * TODO(phone-verification): once WhatsApp/SMS phone verification exists,
-   * insert `requireVerifiedPhone` here, between `requireAuth` and the rate
-   * limiter, so an unverified number cannot start a payment. Intentionally
-   * absent for now — there is no verification flow to satisfy it.
-   */
-  router.post(
-    '/order',
-    requireAuth,
-    limiters.createOrder,
-    // Rejects any body, including one trying to smuggle in its own amount.
-    validateBody(createOrderSchema),
-    postOrder,
-  );
-
-  /**
-   * TODO(phone-verification): `requireVerifiedPhone` goes here too, after
-   * `requireAuth`.
+   * TODO(phone-verification): `requireVerifiedPhone` would go here, between
+   * `requireAuth` and the limiter. Still deliberately absent — gating payment
+   * on verification is a product decision nobody has made.
    */
   router.post(
     '/verify',
@@ -46,8 +41,6 @@ export function createPaymentsRouter(limiters: Limiters): Router {
     validateBody(verifyPaymentSchema),
     postVerify,
   );
-
-  router.get('/me', requireAuth, getMyPayment);
 
   return router;
 }

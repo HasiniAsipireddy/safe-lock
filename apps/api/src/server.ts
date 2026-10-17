@@ -3,6 +3,10 @@ import { WEB_ORIGINS, env } from './config/env';
 import { logger } from './lib/logger';
 import { disconnectPrisma } from './lib/prisma';
 import { startOutboxWorker, stopOutboxWorker } from './lib/outbox/worker';
+import {
+  startBookingSweeper,
+  stopBookingSweeper,
+} from './modules/bookings/booking.sweeper';
 
 /**
  * Process entry point: listen, then shut down cleanly.
@@ -37,6 +41,18 @@ const server = app.listen(env.PORT, () => {
    * timer nobody asked for. Tests call `processPending()` directly.
    */
   startOutboxWorker();
+
+  /**
+   * The booking sweeper, started here and **only** here, for the same reason
+   * the outbox worker is: a loop that started with the app would tick during
+   * the test suite and race every assertion about booking state. Tests call
+   * `sweepBookings()` directly.
+   *
+   * Correctness does not depend on it — every read derives a booking's status
+   * from the server clock — so a late or dead sweeper cannot leave a safe
+   * unlockable. It reconciles rows and releases devices.
+   */
+  startBookingSweeper();
 });
 
 let shuttingDown = false;
@@ -55,6 +71,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // Stop claiming new outbound messages first. A row already claimed keeps its
   // pushed-out backoff, so the next process picks it up rather than losing it.
   stopOutboxWorker();
+  stopBookingSweeper();
 
   // Hard deadline. unref'd so it never by itself keeps the process alive.
   const forceExit = setTimeout(() => {

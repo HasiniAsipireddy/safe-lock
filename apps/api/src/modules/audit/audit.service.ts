@@ -92,6 +92,36 @@ export const AUDIT_ACTIONS = {
   WEBHOOK_SIGNATURE_FAILED: 'payment.webhook.signature.failed',
   PAYMENT_REQUIRED_BLOCKED: 'payment.required.blocked',
 
+  // --- Bookings -------------------------------------------------------------
+  BOOKING_CREATED: 'booking.created',
+  /** A booking became ACTIVE. Only ever from a verified payment. */
+  BOOKING_ACTIVATED: 'booking.activated',
+  BOOKING_CANCELLED: 'booking.cancelled',
+  /** The user confirmed they took their belongings. */
+  BOOKING_COLLECTED: 'booking.collected',
+  BOOKING_EXTENDED: 'booking.extended',
+  /** Passed `endsAt + grace`; fees are now accruing. */
+  BOOKING_OVERSTAY_STARTED: 'booking.overstay.started',
+  /** An overstay fee was captured, opening the collection window. */
+  BOOKING_OVERSTAY_SETTLED: 'booking.overstay.settled',
+  /** An admin wrote off a fee. The reason is required and recorded. */
+  BOOKING_OVERSTAY_WAIVED: 'booking.overstay.waived',
+  /**
+   * The collection window lapsed with no confirmation. The safe's contents are
+   * unknown, so the device was sent for inspection rather than released.
+   */
+  BOOKING_COLLECTION_LAPSED: 'booking.collection.lapsed',
+  BOOKING_FORCE_COMPLETED: 'booking.force_completed',
+  /** A device was cleared for rental again after a human looked inside. */
+  DEVICE_INSPECTION_CLEARED: 'device.inspection.cleared',
+  /**
+   * Money arrived that could not be applied. The payment stays PAID and is
+   * listed for a manual refund — see `PaymentReviewReason`.
+   */
+  PAYMENT_NEEDS_REVIEW: 'payment.needs_review',
+  /** An admin dealt with such a payment (refunded by hand, note recorded). */
+  PAYMENT_REVIEW_CLEARED: 'payment.review_cleared',
+
   // --- Devices / allocation -------------------------------------------------
   DEVICE_CREATED: 'device.created',
   DEVICE_BULK_CREATED: 'device.bulk_created',

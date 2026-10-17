@@ -1,25 +1,30 @@
-import crypto from 'node:crypto';
-import { ERROR_CODES, type PaymentSummary, type PaymentStatus } from '@safelock/shared';
-import { env } from '../../config/env';
+import {
+  ERROR_CODES,
+  type PaymentPurpose,
+  type PaymentStatus,
+  type PaymentSummary,
+} from '@safelock/shared';
 import { prisma } from '../../lib/prisma';
 import type { PrismaTransaction } from '../../lib/prisma';
-import { HttpError, conflict, forbidden, notFound } from '../../lib/httpError';
+import { HttpError, forbidden, notFound } from '../../lib/httpError';
 import { logger } from '../../lib/logger';
-import { createRazorpayOrder } from '../../lib/razorpay';
-import { userHasPaid } from '../users/user.mapper';
+import { applyBookingPayment } from './booking.settlement';
 import { verifyCheckoutSignature } from './signature';
 
 /**
  * Payment service.
  *
- * Two invariants hold everywhere in this file:
+ * Three invariants hold everywhere in this file:
  *
- * 1. **The price comes only from `env.SAFE_PRICE_PAISE`.** No code path reads
- *    an amount from a request body. A client that posts `{ amount: 100 }` is
- *    charged the server price.
+ * 1. **The amount is always a server figure**, computed from a booking's
+ *    snapshotted rates (see `booking.payments.ts`). No code path reads an
+ *    amount from a request body.
  * 2. **A row only reaches `PAID` after a signature check** — either the
  *    Checkout callback HMAC in {@link verifyPayment}, or the webhook body HMAC
  *    before {@link applyWebhookEvent} is called.
+ * 3. **Settling a payment and applying it to its booking happen in one
+ *    transaction.** A booking must never be ACTIVE without the money, and
+ *    money must never be taken without either an effect or a review flag.
  */
 
 interface PaymentRow {
@@ -32,6 +37,9 @@ interface PaymentRow {
   razorpayPaymentId: string | null;
   paidAt: Date | null;
   createdAt: Date;
+  purpose: PaymentPurpose;
+  bookingId: string | null;
+  quoteExpiresAt: Date | null;
 }
 
 const SUMMARY_SELECT = {
@@ -44,6 +52,9 @@ const SUMMARY_SELECT = {
   razorpayPaymentId: true,
   paidAt: true,
   createdAt: true,
+  purpose: true,
+  bookingId: true,
+  quoteExpiresAt: true,
 } as const;
 
 /** Strips internal fields; the Razorpay signature is never stored or returned. */
@@ -56,86 +67,8 @@ export function toPaymentSummary(payment: PaymentRow): PaymentSummary {
     razorpayOrderId: payment.razorpayOrderId,
     createdAt: payment.createdAt.toISOString(),
     paidAt: payment.paidAt ? payment.paidAt.toISOString() : null,
-  };
-}
-
-// --- Order creation ----------------------------------------------------------
-
-export interface CreateOrderResult {
-  orderId: string;
-  amount: number;
-  currency: string;
-  keyId: string;
-  paymentId: string;
-}
-
-/**
- * Creates a Razorpay order for the signed-in user.
- *
- * The Payment row id is generated up front so it can be sent as the Razorpay
- * `receipt`: a dashboard entry or a webhook can then be traced back to a row
- * and a user without trusting anything the browser said.
- *
- * A user with an outstanding `CREATED` row gets a *new* order rather than the
- * old one. Razorpay orders expire, and reusing one could charge a stale price
- * if `SAFE_PRICE_PAISE` changed in between.
- */
-export async function createOrder(userId: string): Promise<CreateOrderResult> {
-  if (await userHasPaid(userId)) {
-    throw conflict(
-      ERROR_CODES.ALREADY_PAID,
-      'This account has already been activated. No further payment is needed.',
-    );
-  }
-
-  const paymentId = crypto.randomUUID();
-  const amount = env.SAFE_PRICE_PAISE;
-  const currency = env.CURRENCY;
-
-  const order = await createRazorpayOrder({
-    amountInPaise: amount,
-    currency,
-    receipt: paymentId,
-    notes: { userId },
-  });
-
-  // Trust our own figures over the echoed ones, but refuse to proceed if the
-  // gateway created an order for a different amount than we asked for.
-  if (order.amount !== amount || order.currency !== currency) {
-    logger.error(
-      {
-        requestedAmount: amount,
-        returnedAmount: order.amount,
-        requestedCurrency: currency,
-        returnedCurrency: order.currency,
-      },
-      'Razorpay order amount mismatch',
-    );
-    throw new HttpError({
-      status: 502,
-      code: ERROR_CODES.PAYMENT_GATEWAY_ERROR,
-      message: 'The payment gateway returned an unexpected order. Please try again.',
-    });
-  }
-
-  await prisma.payment.create({
-    data: {
-      id: paymentId,
-      userId,
-      razorpayOrderId: order.id,
-      amount,
-      currency,
-      status: 'CREATED',
-    },
-  });
-
-  return {
-    orderId: order.id,
-    amount,
-    currency,
-    // The publishable key id only. The key secret never leaves the server.
-    keyId: env.RAZORPAY_KEY_ID,
-    paymentId,
+    purpose: payment.purpose,
+    bookingId: payment.bookingId,
   };
 }
 
@@ -143,9 +76,15 @@ export async function createOrder(userId: string): Promise<CreateOrderResult> {
 
 export interface VerifyResult {
   payment: PaymentSummary;
-  hasPaid: boolean;
   /** False when the row was already PAID, i.e. this was a repeat call. */
   changed: boolean;
+  /**
+   * Set when the money arrived but could not be applied — a lapsed hold whose
+   * safe was taken, or an expired overstay quote. The payment stays PAID and
+   * is queued for a manual refund; the client must say so plainly rather than
+   * showing success.
+   */
+  needsReview: boolean;
 }
 
 /**
@@ -198,19 +137,20 @@ export async function verifyPayment(params: {
     // between the check above and here.
     const row = await tx.payment.findUnique({
       where: { razorpayOrderId: params.orderId },
-      select: SUMMARY_SELECT,
+      select: { ...SUMMARY_SELECT, reviewReason: true },
     });
 
     if (!row) throw notFound('We could not find that payment.');
 
     if (row.status === 'PAID') {
-      // Repeat call, or the webhook got here first.
-      return { row, changed: false };
+      // Repeat call, or the webhook got here first. The booking has already
+      // been settled by whichever path won.
+      return { row, changed: false, needsReview: row.reviewReason !== null };
     }
 
     // A refunded payment must not be resurrected by a replayed callback.
     if (row.status === 'REFUNDED') {
-      return { row, changed: false };
+      return { row, changed: false, needsReview: false };
     }
 
     const updated = await tx.payment.update({
@@ -223,38 +163,30 @@ export async function verifyPayment(params: {
       select: SUMMARY_SELECT,
     });
 
-    return { row: updated, changed: true };
+    /**
+     * Apply it to the booking **in this transaction**.
+     *
+     * A booking must never be ACTIVE without the money, and money must never
+     * be taken without either an effect or a review flag. Both halves commit
+     * together or neither does.
+     */
+    const settlement = await applyBookingPayment({
+      tx,
+      paymentRowId: updated.id,
+      bookingId: updated.bookingId,
+      purpose: updated.purpose,
+      amountPaise: updated.amount,
+      quoteExpiresAt: updated.quoteExpiresAt,
+      userId: updated.userId,
+    });
+
+    return { row: updated, changed: true, needsReview: settlement.kind === 'needs-review' };
   });
 
   return {
     payment: toPaymentSummary(outcome.row),
-    hasPaid: outcome.row.status === 'PAID',
     changed: outcome.changed,
-  };
-}
-
-// --- Payment status ----------------------------------------------------------
-
-export async function getPaymentStateForUser(userId: string): Promise<{
-  hasPaid: boolean;
-  payment: PaymentSummary | null;
-  priceInPaise: number;
-  currency: string;
-}> {
-  const [paid, latest] = await Promise.all([
-    userHasPaid(userId),
-    prisma.payment.findFirst({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-      select: SUMMARY_SELECT,
-    }),
-  ]);
-
-  return {
-    hasPaid: paid,
-    payment: latest ? toPaymentSummary(latest) : null,
-    priceInPaise: env.SAFE_PRICE_PAISE,
-    currency: env.CURRENCY,
+    needsReview: outcome.needsReview ?? false,
   };
 }
 
@@ -359,7 +291,27 @@ async function applyPaymentCaptured(
     },
   });
 
-  return { kind: 'applied', action: 'marked-paid', paymentRowId: row.id };
+  /**
+   * The webhook is the source of truth, so this is the path that normally
+   * activates a booking — the browser may never have called `/verify` at all.
+   * Settled in the same transaction that records the event id, so Razorpay's
+   * retry gets a clean attempt if anything throws.
+   */
+  const settlement = await applyBookingPayment({
+    tx,
+    paymentRowId: row.id,
+    bookingId: row.bookingId,
+    purpose: row.purpose,
+    amountPaise: row.amount,
+    quoteExpiresAt: row.quoteExpiresAt,
+    userId: row.userId,
+  });
+
+  return {
+    kind: 'applied',
+    action: settlement.kind === 'needs-review' ? `needs-review:${settlement.reason}` : 'marked-paid',
+    paymentRowId: row.id,
+  };
 }
 
 /** `payment.failed` only moves a row that has not been settled. */
@@ -391,10 +343,13 @@ async function applyPaymentFailed(
 /**
  * `refund.processed`.
  *
- * Policy note: this marks the payment REFUNDED, which makes `hasPaid` false
- * again and so revokes access through `requirePaid`. Whether a refund should
- * also de-allocate the physical device is an open question — see the refund
- * policy TODO in docs/decisions.md.
+ * **It marks the money refunded and nothing else.** Under the rental model a
+ * refund does not touch the booking: a safe someone is physically using cannot
+ * be taken back by a webhook, and a booking that has already ended has nothing
+ * left to revoke. Whether a refunded booking should also be force-completed is
+ * a policy question, and the answer today is that an admin decides — which is
+ * why this is also the path that clears a `reviewReason` row once the refund it
+ * was flagged for actually lands. See docs/decisions.md.
  */
 async function applyRefundProcessed(
   tx: PrismaTransaction,
@@ -413,10 +368,13 @@ async function applyRefundProcessed(
   const row = razorpayPaymentId
     ? await tx.payment.findUnique({
         where: { razorpayPaymentId },
-        select: SUMMARY_SELECT,
+        select: { ...SUMMARY_SELECT, reviewReason: true, reviewClearedAt: true },
       })
     : fallbackOrderId
-      ? await findByOrderId(tx, fallbackOrderId)
+      ? await tx.payment.findUnique({
+          where: { razorpayOrderId: fallbackOrderId },
+          select: { ...SUMMARY_SELECT, reviewReason: true, reviewClearedAt: true },
+        })
       : null;
 
   if (!row) return { kind: 'ignored', reason: 'no payment row for refund' };
@@ -427,8 +385,24 @@ async function applyRefundProcessed(
 
   await tx.payment.update({
     where: { id: row.id },
-    data: { status: 'REFUNDED' },
+    data: {
+      status: 'REFUNDED',
+      /**
+       * A refund landing on a flagged row **is** the flag being dealt with.
+       *
+       * The admin list exists to say "this money needs refunding by hand"; once
+       * the refund is confirmed by Razorpay, leaving it on the list would make
+       * the list wrong in the direction that gets a second refund issued. The
+       * admin can still clear a flag explicitly with a note (see
+       * `clearPaymentReview`) for the cases a refund never arrives.
+       */
+      ...(row.reviewReason && !row.reviewClearedAt ? { reviewClearedAt: new Date() } : {}),
+    },
   });
 
-  return { kind: 'applied', action: 'marked-refunded', paymentRowId: row.id };
+  return {
+    kind: 'applied',
+    action: row.reviewReason ? 'marked-refunded-review-cleared' : 'marked-refunded',
+    paymentRowId: row.id,
+  };
 }

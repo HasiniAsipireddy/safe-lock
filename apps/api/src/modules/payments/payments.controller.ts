@@ -1,46 +1,8 @@
 import type { RequestHandler } from 'express';
-import type {
-  CreateOrderResponse,
-  PaymentMeResponse,
-  VerifyPaymentInput,
-  VerifyPaymentResponse,
-} from '@safelock/shared';
+import type { VerifyPaymentInput, VerifyPaymentResponse } from '@safelock/shared';
 import { HttpError } from '../../lib/httpError';
 import { AUDIT_ACTIONS, auditContext, writeAudit } from '../audit/audit.service';
 import * as paymentsService from './payments.service';
-
-export const postOrder: RequestHandler = async (req, res, next) => {
-  const userId = req.user!.id;
-
-  try {
-    const order = await paymentsService.createOrder(userId);
-
-    await writeAudit({
-      action: AUDIT_ACTIONS.PAYMENT_ORDER_CREATED,
-      userId,
-      ...auditContext(req),
-      metadata: {
-        paymentRowId: order.paymentId,
-        razorpayOrderId: order.orderId,
-        amount: order.amount,
-        currency: order.currency,
-      },
-    });
-
-    const response: CreateOrderResponse = order;
-    res.status(201).json(response);
-  } catch (error) {
-    if (error instanceof HttpError && error.status === 409) {
-      await writeAudit({
-        action: AUDIT_ACTIONS.PAYMENT_ORDER_REFUSED,
-        userId,
-        ...auditContext(req),
-        metadata: { reason: error.code },
-      });
-    }
-    next(error);
-  }
-};
 
 export const postVerify: RequestHandler = async (req, res, next) => {
   const userId = req.user!.id;
@@ -70,9 +32,15 @@ export const postVerify: RequestHandler = async (req, res, next) => {
       });
     }
 
+    /**
+     * `needsReview` is the one thing the client must not be allowed to read as
+     * plain success: the money arrived, but it could not be applied (a lapsed
+     * hold whose safe was taken, or an expired overstay quote). The booking is
+     * **not** active, and the UI says so and points at support.
+     */
     const response: VerifyPaymentResponse = {
       payment: result.payment,
-      hasPaid: result.hasPaid,
+      needsReview: result.needsReview,
     };
     res.status(200).json(response);
   } catch (error) {
@@ -98,16 +66,6 @@ export const postVerify: RequestHandler = async (req, res, next) => {
         });
       }
     }
-    next(error);
-  }
-};
-
-export const getMyPayment: RequestHandler = async (req, res, next) => {
-  try {
-    const state = await paymentsService.getPaymentStateForUser(req.user!.id);
-    const response: PaymentMeResponse = state;
-    res.status(200).json(response);
-  } catch (error) {
     next(error);
   }
 };
