@@ -3,6 +3,7 @@
 import { useEffect, type ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/context/AuthContext';
+import { currentInternalPath, nextFromLocation } from '@/lib/safeRedirect';
 
 /**
  * Client-side route guards.
@@ -37,14 +38,21 @@ function FullPageSpinner({ label }: { label: string }) {
   );
 }
 
-/** Wraps pages that require a signed-in user (e.g. /dashboard, /pay). */
+/** Wraps pages that require a signed-in user (e.g. /dashboard, /bookings/:id/extend). */
 export function Protected({ children }: { children: ReactNode }) {
   const { status } = useAuth();
   const router = useRouter();
 
+  /**
+   * Carries where they were going into the login redirect.
+   *
+   * Someone tapping a reminder link with a lapsed session should end up at the
+   * booking they tapped, not at a dashboard they then have to navigate from —
+   * with a deadline running, that difference matters.
+   */
   useEffect(() => {
     if (status === 'unauthenticated') {
-      router.replace('/login');
+      router.replace(`/login?next=${encodeURIComponent(currentInternalPath())}`);
     }
   }, [status, router]);
 
@@ -90,9 +98,17 @@ export function GuestOnly({ children }: { children: ReactNode }) {
   const { status } = useAuth();
   const router = useRouter();
 
+  /**
+   * An already-signed-in visitor still goes where they were headed.
+   *
+   * Without this, following a reminder link in a browser that is already
+   * authenticated would bounce through /login and land on the dashboard,
+   * discarding the destination for the one group of users who needed no help
+   * getting there.
+   */
   useEffect(() => {
     if (status === 'authenticated') {
-      router.replace('/dashboard');
+      router.replace(nextFromLocation());
     }
   }, [status, router]);
 

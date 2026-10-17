@@ -54,8 +54,23 @@ export function createBookingsRouter(limiters: Limiters): Router {
    */
   router.get('/current', requireAuth, limiters.bookingRead, async (req, res, next) => {
     try {
-      const booking = await currentBookingFor(req.user!.id);
-      const response: CurrentBookingResponse = { booking, quote: quote() };
+      const now = new Date();
+      const { booking, row } = await currentBookingFor(req.user!.id, now);
+
+      /**
+       * The extension offer rides along with the booking.
+       *
+       * The dashboard offers extensions too, and before this it priced them
+       * itself — `hourlyRatePaise * hours` in the browser, against a rule that
+       * says the client does no money arithmetic. Now both it and the
+       * extension page read the same server-computed options, so neither can
+       * offer a duration or a price the order endpoint would refuse.
+       */
+      const response: CurrentBookingResponse = {
+        booking,
+        extension: row ? await extensionAvailability(row, now) : null,
+        quote: quote(),
+      };
       res.status(200).json(response);
     } catch (error) {
       next(error);

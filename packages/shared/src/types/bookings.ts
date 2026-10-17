@@ -135,6 +135,15 @@ export interface BookingSummary {
 /** `GET /bookings/current`. Null when the user has no live booking. */
 export interface CurrentBookingResponse {
   booking: BookingSummary | null;
+  /**
+   * Whether the live booking can be extended, and at what price. Null when
+   * there is no live booking.
+   *
+   * Here so the dashboard offers exactly what the extension page and the order
+   * endpoint would accept, and so no client multiplies an hourly rate by a
+   * number of hours itself.
+   */
+  extension: ExtensionAvailability | null;
   /** Live config, for quoting a *new* booking. Never used to price an old one. */
   quote: BookingQuote;
 }

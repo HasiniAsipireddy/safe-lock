@@ -8,6 +8,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { GENERIC_LOGIN_ERROR, loginSchema, type LoginInput } from '@safelock/shared';
 import { useAuth } from '@/context/AuthContext';
 import { ApiError } from '@/lib/apiError';
+import { nextFromLocation } from '@/lib/safeRedirect';
 import { AuthCard } from '@/components/ui/AuthCard';
 import { Button } from '@/components/ui/Button';
 import { FormError } from '@/components/ui/FormError';
@@ -42,7 +43,18 @@ function LoginForm() {
     setFormError(null);
     try {
       await login(values);
-      router.replace('/dashboard');
+
+      /**
+       * Where to go after signing in.
+       *
+       * A WhatsApp reminder links straight to a booking page, so someone
+       * arriving from one with an expired session must land back where they
+       * were headed rather than on a generic dashboard. The value is
+       * attacker-controlled — it comes from a query string — so it is never
+       * navigated to directly: `nextFromLocation` resolves it against this
+       * origin and refuses anything that escapes.
+       */
+      router.replace(nextFromLocation());
     } catch (error) {
       // Any credential failure shows the same message, so the response can
       // never reveal whether the account exists or the password was wrong.

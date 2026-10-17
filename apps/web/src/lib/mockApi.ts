@@ -63,6 +63,7 @@ import {
   type AuthResponse,
   type BookingCompletionReason,
   type BookingOrderResponse,
+  type BookingDetailResponse,
   type BookingQuote,
   type BookingStatus,
   type BookingSummary,
@@ -70,6 +71,8 @@ import {
   type BulkCreateRowResult,
   type CreateBookingResponse,
   type CurrentBookingResponse,
+  type ExtensionAvailability,
+  type ExtensionRefusalReason,
   type DeviceCurrentBooking,
   type DeviceEventType,
   type DeviceStatus,
@@ -1107,15 +1110,76 @@ function handleMockCurrentBooking(): CurrentBookingResponse {
 
   return {
     booking: live ? toMockBookingSummary(live) : null,
+    extension: live ? mockExtensionAvailability(live) : null,
     quote: mockQuote(),
   };
 }
 
-function handleMockGetBooking(bookingId: string): { booking: BookingSummary } {
+function handleMockGetBooking(bookingId: string): BookingDetailResponse {
   const account = requireAccount();
   const booking = requireMockBooking(bookingId, account.user.id);
 
-  return { booking: toMockBookingSummary(booking) };
+  return {
+    booking: toMockBookingSummary(booking),
+    extension: mockExtensionAvailability(booking),
+  };
+}
+
+/**
+ * The mock's copy of `extensionAvailability`.
+ *
+ * Mirrors the server's rules in the same order, including turning a following
+ * booking into a shorter offer rather than a flat refusal. A mock that said
+ * "yes" where the API says "no" would make the extension page look finished
+ * while being wrong, which is the one thing a mock must not do.
+ */
+function mockExtensionAvailability(booking: MockBooking): ExtensionAvailability {
+  const refused = (reason: ExtensionRefusalReason): ExtensionAvailability => ({
+    allowed: false,
+    reason,
+    options: [],
+    maxHours: 0,
+  });
+
+  if (!booking.endsAt || (booking.status !== 'ACTIVE' && booking.status !== 'OVERSTAY')) {
+    return refused('NOT_RUNNING');
+  }
+
+  if (mockOutstandingFee(booking) > 0) return refused('OVERSTAY_FEE_DUE');
+  if (booking.overstaySettledAt || booking.overstayWaivedAt) {
+    return refused('IN_COLLECTION_WINDOW');
+  }
+
+  const endsAt = new Date(booking.endsAt).getTime();
+  const startsAt = new Date(booking.startsAt).getTime();
+
+  const following = bookings
+    .filter(
+      (other) =>
+        other.id !== booking.id &&
+        other.deviceId === booking.deviceId &&
+        OCCUPYING.includes(other.status) &&
+        new Date(other.reservedUntil).getTime() > startsAt,
+    )
+    .sort((a, b) => new Date(a.startsAt).getTime() - new Date(b.startsAt).getTime())[0];
+
+  const turnaroundMs =
+    (booking.rates.graceMinutes + booking.rates.collectionWindowMinutes) * MS_PER_MINUTE;
+
+  const maxByCollision = following
+    ? Math.floor((new Date(following.startsAt).getTime() - turnaroundMs - endsAt) / MS_PER_HOUR)
+    : Number.POSITIVE_INFINITY;
+
+  const maxHours = Math.min(MOCK_MAX_HOURS, maxByCollision);
+  if (maxHours < MOCK_MIN_HOURS) return refused('FOLLOWING_BOOKING');
+
+  const options: Array<{ hours: number; pricePaise: number }> = [];
+  for (let hours = MOCK_MIN_HOURS; hours <= maxHours; hours += 1) {
+    // From the booking's snapshot, never the live config.
+    options.push({ hours, pricePaise: bookingPricePaise(booking.rates, hours) });
+  }
+
+  return { allowed: true, reason: null, options, maxHours };
 }
 
 /**

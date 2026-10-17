@@ -148,23 +148,31 @@ export function quote(): BookingQuote {
 export async function currentBookingFor(
   userId: string,
   now = new Date(),
-): Promise<BookingSummary | null> {
-  const row = await prisma.booking.findFirst({
+): Promise<{ booking: BookingSummary | null; row: BookingRow | null }> {
+  const found = await prisma.booking.findFirst({
     where: { userId, status: { in: ['PENDING_PAYMENT', 'ACTIVE', 'OVERSTAY'] } },
     orderBy: { createdAt: 'desc' },
     select: BOOKING_SELECT,
   });
 
-  if (!row) return null;
+  if (!found) return { booking: null, row: null };
 
-  const summary = toBookingSummary(row as BookingRow, now);
+  const row = found as BookingRow;
+  const summary = toBookingSummary(row, now);
 
   // The stored row still occupies the device, but the clock says it is over.
   // Report the truth; the sweeper will catch up and release it.
   const finished =
     summary.effectiveStatus === 'EXPIRED_UNPAID' || summary.effectiveStatus === 'COMPLETED';
 
-  return finished ? null : summary;
+  /**
+   * The row comes back alongside the summary so the caller can ask it further
+   * questions — today, whether it can be extended — without a second read of
+   * the same booking. Null when there is nothing live, so a caller cannot
+   * accidentally compute an offer for a booking this function just decided to
+   * hide.
+   */
+  return finished ? { booking: null, row: null } : { booking: summary, row };
 }
 
 export async function getBookingForUser(

@@ -3,6 +3,7 @@
 // which resolve `.ts` directly.
 export * from './constants';
 export * from './money';
+export * from './safeRedirect';
 export * from './schemas/auth';
 export * from './schemas/bookings';
 export * from './schemas/devices';

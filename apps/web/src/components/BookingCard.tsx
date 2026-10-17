@@ -7,6 +7,7 @@ import {
   overstayHourlyPaise,
   type BookingOrderResponse,
   type BookingSummary,
+  type ExtensionAvailability,
 } from '@safelock/shared';
 import { BookingStatusBadge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
@@ -39,9 +40,20 @@ import { useBookingCheckout } from '@/lib/useBookingCheckout';
  */
 export function BookingCard({
   booking,
+  extension,
   onChanged,
 }: {
   booking: BookingSummary;
+  /**
+   * The server's extension offer, from the same response as the booking.
+   *
+   * Passed in rather than computed here: this card, the extension page and the
+   * order endpoint must agree about which durations exist and what they cost,
+   * and the only way to guarantee that is for one of them to decide and the
+   * others to render. Null means "no offer", which is also what an unpaid
+   * booking gets.
+   */
+  extension: ExtensionAvailability | null;
   /** Called after any action that changes the booking, to reload it. */
   onChanged: () => void;
 }) {
@@ -51,7 +63,7 @@ export function BookingCard({
     return <PendingBooking booking={booking} onChanged={onChanged} />;
   }
 
-  return <RunningBooking booking={booking} onChanged={onChanged} />;
+  return <RunningBooking booking={booking} extension={extension} onChanged={onChanged} />;
 }
 
 // --- Awaiting payment --------------------------------------------------------
@@ -173,9 +185,11 @@ function PendingBooking({
 
 function RunningBooking({
   booking,
+  extension,
   onChanged,
 }: {
   booking: BookingSummary;
+  extension: ExtensionAvailability | null;
   onChanged: () => void;
 }) {
   const { user } = useAuth();
@@ -189,7 +203,26 @@ function RunningBooking({
   const [collecting, setCollecting] = useState(false);
   const [confirmCollect, setConfirmCollect] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [extendHours, setExtendHours] = useState(1);
+  /**
+   * The selected duration, chosen from the server's options.
+   *
+   * Defaults to the shortest on offer — an extension is money, so the
+   * cheapest choice should be what a mis-tap buys — and resets whenever the
+   * offer changes, so a reload after a collision cannot leave a duration
+   * selected that is no longer available.
+   */
+  const extendOptions = extension?.allowed ? extension.options : [];
+  const [extendHours, setExtendHours] = useState<number | null>(
+    extendOptions[0]?.hours ?? null,
+  );
+
+  const offeredHours = extendOptions.map((option) => option.hours).join(',');
+  useEffect(() => {
+    setExtendHours(extendOptions[0]?.hours ?? null);
+    // Keyed on the *set* of offered hours, not the array identity, which is a
+    // fresh object on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [offeredHours]);
 
   const feeCheckout = useBookingCheckout({
     createOrder: () =>
@@ -208,7 +241,7 @@ function RunningBooking({
       api.post<BookingOrderResponse>(`/bookings/${booking.id}/extend/order`, {
         hours: extendHours,
       }),
-    description: `Extend rental by ${extendHours}h`,
+    description: `Extend rental by ${extendHours ?? 0}h`,
     prefill: { name: user?.name, email: user?.email, phone: user?.phone },
     onPaid: onChanged,
   });
@@ -227,7 +260,15 @@ function RunningBooking({
     }
   }
 
-  const extendPrice = booking.rates.hourlyRatePaise * extendHours;
+  /**
+   * The price of the selected option, **as quoted by the server**.
+   *
+   * This used to be `hourlyRatePaise * extendHours` — money arithmetic in the
+   * browser, against the rule that the client does none. Now it is a lookup,
+   * so the number on the button is the number the order will be for.
+   */
+  const extendPrice =
+    extendOptions.find((option) => option.hours === extendHours)?.pricePaise ?? null;
 
   return (
     <section
@@ -343,7 +384,7 @@ function RunningBooking({
       ) : null}
 
       {/* --- Extend ---------------------------------------------------------- */}
-      {!feeDue && !settled ? (
+      {extendOptions.length > 0 && extendHours !== null && extendPrice !== null ? (
         <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-800">
           <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
             Need more time?
@@ -361,15 +402,22 @@ function RunningBooking({
               >
                 Extra hours
               </label>
+              {/*
+                The options are the server's, so this list cannot offer a
+                duration the order endpoint would refuse — which is what the
+                hardcoded 1-to-12 it replaces did whenever another booking
+                followed this one.
+              */}
               <select
                 id="extend-hours"
                 value={extendHours}
                 onChange={(event) => setExtendHours(Number(event.target.value))}
                 className="mt-1 min-h-12 rounded-xl border border-slate-300 bg-white px-3 text-base text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
               >
-                {Array.from({ length: 12 }, (_unused, index) => index + 1).map((hours) => (
-                  <option key={hours} value={hours}>
-                    {hours} hour{hours === 1 ? '' : 's'}
+                {extendOptions.map((option) => (
+                  <option key={option.hours} value={option.hours}>
+                    {option.hours} hour{option.hours === 1 ? '' : 's'} ·{' '}
+                    {formatInr(option.pricePaise)}
                   </option>
                 ))}
               </select>

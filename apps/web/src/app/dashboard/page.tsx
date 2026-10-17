@@ -7,6 +7,7 @@ import {
   formatInr,
   type BookingSummary,
   type CurrentBookingResponse,
+  type ExtensionAvailability,
   type DeviceSummary,
   type MyDeviceResponse,
 } from '@safelock/shared';
@@ -50,6 +51,7 @@ function DashboardContent() {
   const [signingOut, setSigningOut] = useState(false);
 
   const [booking, setBooking] = useState<BookingSummary | null>(null);
+  const [extension, setExtension] = useState<ExtensionAvailability | null>(null);
   const [device, setDevice] = useState<DeviceSummary | null>(null);
   const [state, setState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [message, setMessage] = useState<string | null>(null);
@@ -68,6 +70,7 @@ function DashboardContent() {
       });
 
       setBooking(current.booking);
+      setExtension(current.extension);
 
       const paid =
         current.booking !== null &&
@@ -153,6 +156,7 @@ function DashboardContent() {
         <>
           <BookingCard
             booking={booking}
+            extension={extension}
             onChanged={() => {
               setState('loading');
               void load();
