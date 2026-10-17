@@ -121,10 +121,26 @@ export async function deliverOtp(params: {
    * Letting a cap lock someone out of their own safe would be the cap doing
    * more harm than the abuse it exists to prevent.
    */
+  /**
+   * **The code, and nothing else.**
+   *
+   * `safelock_unlock_code` is an AUTHENTICATION template, and Meta's layout
+   * for that category permits exactly one body parameter: the code. Passing
+   * the serial as a second one is rejected as a `TEMPLATE` error — which is
+   * terminal and never retried, so the user would get no code at all and the
+   * challenge would be compensated away. A live bug until now, and the worst
+   * possible place to have one.
+   *
+   * Nothing is lost. A user has at most one live booking, so the message is
+   * unambiguous about which safe it is for, and the serial is already carried
+   * by `safelock_unlock_alert`, a UTILITY template where a second parameter is
+   * allowed. The dev console print above still names the safe, because that
+   * line is for a developer with several seeded devices.
+   */
   return sendWhatsApp({
     recipient,
     kind: 'UNLOCK_OTP',
-    params: [params.code, params.serialNumber],
+    params: [params.code],
     ignoreCap: true,
   });
 }

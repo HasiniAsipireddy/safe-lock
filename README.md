@@ -659,11 +659,12 @@ differs.
 - Sample: `418203`
 
 > Note: Meta's authentication layout permits only the code parameter, so the
-> safe's serial is **not** in this message. The API passes
-> `[code, serialNumber]`; if your approved template accepts only one
-> parameter, drop the second from `deliverOtp` in
-> `apps/api/src/modules/devices/otp.service.ts` — it is the one line that
-> decides this.
+> safe's serial is **not** in this message, and the API passes `[code]` and
+> nothing else. It used to pass `[code, serialNumber]`, which this template
+> would have rejected as a `TEMPLATE` error — terminal, never retried, so no
+> code would have arrived at all. A user has one live booking, so the message
+> is unambiguous anyway, and the serial is in `safelock_unlock_alert` where a
+> second parameter is allowed.
 
 **2. `safelock_phone_verification`** — category **AUTHENTICATION**, language `en`
 

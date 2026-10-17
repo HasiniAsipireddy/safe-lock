@@ -30,7 +30,7 @@ function post(url: string, cookie?: string, instance = app()) {
 
 describe('unlock code delivery', () => {
   it('sends the code through the WhatsApp client with the configured template', async () => {
-    const { user, serialNumber } = await createUserWithDevice();
+    const { user } = await createUserWithDevice();
     fake.reset();
 
     const { code } = await withCapturedOtp(() => post(REQUEST_URL, user.cookie).send({}));
@@ -40,9 +40,27 @@ describe('unlock code delivery', () => {
       to: `+91${user.phone}`,
       templateName: env.WHATSAPP_TEMPLATE_UNLOCK_OTP,
       language: env.WHATSAPP_LANGUAGE,
-      // The code first, then the safe it opens — the template's order.
-      params: [code, serialNumber],
     });
+  });
+
+  /**
+   * **Exactly one parameter**, asserted with `toEqual` rather than a subset
+   * match so an extra one fails here.
+   *
+   * `safelock_unlock_code` is an AUTHENTICATION template and Meta's layout for
+   * that category permits only the code. A second parameter — the serial was
+   * passed for a while — is a `TEMPLATE` rejection, which is terminal and
+   * never retried, so the outcome is no code at all and a compensated
+   * challenge. The cheapest possible test for the most expensive possible
+   * failure.
+   */
+  it('passes the code as the only template parameter', async () => {
+    const { user } = await createUserWithDevice();
+    fake.reset();
+
+    const { code } = await withCapturedOtp(() => post(REQUEST_URL, user.cookie).send({}));
+
+    expect(fake.last()!.params).toEqual([code]);
   });
 
   it('sends to the owner’s number in E.164, not the stored national form', async () => {
