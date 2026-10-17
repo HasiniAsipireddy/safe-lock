@@ -3,7 +3,20 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts', 'prisma/**/*.test.ts'],
+    /**
+     * `@safelock/shared` is included here on purpose.
+     *
+     * It has no runner of its own, and neither does the web app, so a pure
+     * function living in shared — `safeInternalPath`, the money and status
+     * helpers — would otherwise be the least tested code in the repo while
+     * being the most depended on. This is the one suite in the monorepo, and
+     * the shared tests need no database, so they cost a few milliseconds.
+     */
+    include: [
+      'src/**/*.test.ts',
+      'prisma/**/*.test.ts',
+      '../../packages/shared/src/**/*.test.ts',
+    ],
     // Tests share one Postgres database and truncate between cases, so they
     // must not run concurrently.
     fileParallelism: false,

@@ -37,6 +37,19 @@ export function stopOutboxWorker(): void {
   timer = null;
 }
 
+/**
+ * Whether the poll loop is scheduled.
+ *
+ * Exists so the test suite can **assert that it is not**. Every send under
+ * test is a direct `processPending` call with an explicit `now`; a loop
+ * ticking in the background would claim rows mid-assertion and make results
+ * depend on timing. The claim in the comment above is worth having a test for,
+ * because the mistake it describes is a one-line change in `app.ts`.
+ */
+export function isOutboxWorkerRunning(): boolean {
+  return timer !== null;
+}
+
 async function tick(): Promise<void> {
   if (running) return;
   running = true;
