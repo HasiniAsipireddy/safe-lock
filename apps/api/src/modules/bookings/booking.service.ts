@@ -6,6 +6,8 @@ import {
   reservedUntilFrom,
   type BookingQuote,
   type BookingSummary,
+  type ExtensionAvailability,
+  type ExtensionRefusalReason,
   type RateSnapshot,
 } from '@safelock/shared';
 import { env } from '../../config/env';
@@ -423,6 +425,91 @@ export async function activateBooking(
  * would re-price time already charged at the overstay rate, and the answer to
  * an overstay is to pay it.
  */
+/**
+ * Whether an extension is possible, **without throwing**.
+ *
+ * The single source of that answer. The page that offers extensions, the
+ * dashboard and the order endpoint all end up here, so none of them can offer
+ * a duration another would refuse — three implementations of one rule is three
+ * chances to show a button that 409s.
+ *
+ * Refusals are reasons rather than messages: the server decides *why*, the
+ * client decides how to say it, and the remedy differs per reason.
+ */
+export async function extensionAvailability(
+  row: BookingRow,
+  now = new Date(),
+): Promise<ExtensionAvailability> {
+  const snapshot = snapshotOf(row);
+  const refused = (reason: ExtensionRefusalReason): ExtensionAvailability => ({
+    allowed: false,
+    reason,
+    options: [],
+    maxHours: 0,
+  });
+
+  if (!row.endsAt || (row.status !== 'ACTIVE' && row.status !== 'OVERSTAY')) {
+    return refused('NOT_RUNNING');
+  }
+
+  /**
+   * A fee owed is not an extendable situation.
+   *
+   * The hour being extended has already been charged at the overstay rate, so
+   * extending would re-price time already billed. The answer to an overstay is
+   * to pay it and collect.
+   */
+  if (outstandingFeePaise(row, now) > 0) return refused('OVERSTAY_FEE_DUE');
+
+  // Past the grace period there is a fee by definition, so the check above
+  // covers it — but a waived fee could leave us here, and extending then would
+  // confuse the accounting. Refuse explicitly.
+  if (row.overstayWaivedAt || row.overstaySettledAt) return refused('IN_COLLECTION_WINDOW');
+
+  /**
+   * How far the reservation may be pushed before it meets the next booking.
+   *
+   * The earliest following booking is read once and turned into a maximum
+   * number of hours, rather than a yes/no per duration: "you can have two more
+   * hours but not five" is a far better answer than "no", and it is the same
+   * query either way. The bound is on `reservedUntil`, not `endsAt`, because
+   * the safe also needs its grace period and collection window back before the
+   * next renter arrives.
+   */
+  const following = await prisma.booking.findFirst({
+    where: {
+      deviceId: row.deviceId,
+      id: { not: row.id },
+      status: { in: ['PENDING_PAYMENT', 'ACTIVE', 'OVERSTAY'] },
+      reservedUntil: { gt: row.startsAt },
+    },
+    orderBy: { startsAt: 'asc' },
+    select: { startsAt: true },
+  });
+
+  const turnaroundMs =
+    (snapshot.graceMinutes + snapshot.collectionWindowMinutes) * 60 * 1000;
+
+  const maxHoursByCollision = following
+    ? Math.floor(
+        (following.startsAt.getTime() - turnaroundMs - row.endsAt.getTime()) /
+          (60 * 60 * 1000),
+      )
+    : Number.POSITIVE_INFINITY;
+
+  const maxHours = Math.min(env.RENTAL_MAX_HOURS, maxHoursByCollision);
+
+  if (maxHours < env.RENTAL_MIN_HOURS) return refused('FOLLOWING_BOOKING');
+
+  const options: Array<{ hours: number; pricePaise: number }> = [];
+  for (let hours = env.RENTAL_MIN_HOURS; hours <= maxHours; hours += 1) {
+    // Priced from the **snapshot**, not the live config.
+    options.push({ hours, pricePaise: bookingPricePaise(snapshot, hours) });
+  }
+
+  return { allowed: true, reason: null, options, maxHours };
+}
+
 export async function assertExtendable(
   row: BookingRow,
   hours: number,
@@ -438,58 +525,50 @@ export async function assertExtendable(
     });
   }
 
-  if (!row.endsAt || (row.status !== 'ACTIVE' && row.status !== 'OVERSTAY')) {
-    throw stateInvalid('Only a paid, running booking can be extended.');
+  /**
+   * The same answer the page was given, turned into an error.
+   *
+   * Deliberately *not* a second implementation: this function exists to map
+   * one refusal onto a status code and a sentence, and that mapping is the
+   * only thing it adds.
+   */
+  const availability = await extensionAvailability(row, now);
+
+  if (!availability.allowed || hours > availability.maxHours) {
+    throw extensionRefusal(availability.reason ?? 'FOLLOWING_BOOKING');
   }
 
-  if (outstandingFeePaise(row, now) > 0) {
-    throw new HttpError({
-      status: 409,
-      code: ERROR_CODES.EXTENSION_NOT_AVAILABLE,
-      message:
-        'An overstay fee is outstanding, so this booking cannot be extended. Pay the fee and collect your items.',
-    });
-  }
-
-  // Past the grace period there is a fee by definition, so the check above
-  // covers it — but a waived fee could leave us here, and extending then would
-  // silently un-waive nothing and confuse the accounting. Refuse explicitly.
-  if (row.overstayWaivedAt || row.overstaySettledAt) {
-    throw new HttpError({
-      status: 409,
-      code: ERROR_CODES.EXTENSION_NOT_AVAILABLE,
-      message: 'This booking is in its collection window and cannot be extended.',
-    });
-  }
+  // Unreachable: NOT_RUNNING covers a null `endsAt`, and `allowed` is false
+  // in that case. Narrowing for the arithmetic below.
+  if (!row.endsAt) throw stateInvalid('Only a paid, running booking can be extended.');
 
   const newEndsAt = new Date(row.endsAt.getTime() + hours * 60 * 60 * 1000);
-  const newReservedUntil = reservedUntilFrom(snapshot, newEndsAt);
-
-  const clash = await prisma.booking.findFirst({
-    where: {
-      deviceId: row.deviceId,
-      id: { not: row.id },
-      status: { in: ['PENDING_PAYMENT', 'ACTIVE', 'OVERSTAY'] },
-      startsAt: { lt: newReservedUntil },
-      reservedUntil: { gt: row.startsAt },
-    },
-    select: { id: true },
-  });
-
-  if (clash) {
-    throw new HttpError({
-      status: 409,
-      code: ERROR_CODES.EXTENSION_NOT_AVAILABLE,
-      message: 'This safe is booked by someone else after you, so it cannot be extended.',
-    });
-  }
 
   return {
-    // Priced from the **snapshot**, not the live config.
     pricePaise: bookingPricePaise(snapshot, hours),
     newEndsAt,
-    newReservedUntil,
+    newReservedUntil: reservedUntilFrom(snapshot, newEndsAt),
   };
+}
+
+/** One refusal reason, as the HTTP error the write paths throw. */
+function extensionRefusal(reason: ExtensionRefusalReason): HttpError {
+  if (reason === 'NOT_RUNNING') {
+    return stateInvalid('Only a paid, running booking can be extended.');
+  }
+
+  const message =
+    reason === 'OVERSTAY_FEE_DUE'
+      ? 'An overstay fee is outstanding, so this booking cannot be extended. Pay the fee and collect your items.'
+      : reason === 'IN_COLLECTION_WINDOW'
+        ? 'This booking is in its collection window and cannot be extended.'
+        : 'This safe is booked by someone else after you, so it cannot be extended.';
+
+  return new HttpError({
+    status: 409,
+    code: ERROR_CODES.EXTENSION_NOT_AVAILABLE,
+    message,
+  });
 }
 
 /** Applies a paid extension. Called only after the money is confirmed. */

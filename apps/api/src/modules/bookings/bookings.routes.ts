@@ -3,6 +3,7 @@ import {
   createBookingSchema,
   emptyBookingBodySchema,
   extendBookingSchema,
+  type BookingDetailResponse,
   type CreateBookingInput,
   type CurrentBookingResponse,
   type ExtendBookingInput,
@@ -24,6 +25,7 @@ import {
   collectBooking,
   createBooking,
   currentBookingFor,
+  extensionAvailability,
   getBookingForUser,
   quote,
 } from './booking.service';
@@ -60,10 +62,26 @@ export function createBookingsRouter(limiters: Limiters): Router {
     }
   });
 
+  /**
+   * One booking, with whether it can be extended and at what price.
+   *
+   * The extension block is here rather than behind its own endpoint so the
+   * page cannot render a stale offer: the same read that says "your booking
+   * ends at 9:30" says what extending it would cost. Ownership is folded into
+   * a 404 by `getBookingForUser`, so a link to someone else's booking — the
+   * link a WhatsApp message carries — says only "we couldn't find that".
+   */
   router.get('/:id', requireAuth, limiters.bookingRead, async (req, res, next) => {
     try {
+      const now = new Date();
       const row = await getBookingForUser(routeParam(req, 'id'), req.user!.id);
-      res.status(200).json({ booking: toBookingSummary(row) });
+
+      const response: BookingDetailResponse = {
+        booking: toBookingSummary(row, now),
+        extension: await extensionAvailability(row, now),
+      };
+
+      res.status(200).json(response);
     } catch (error) {
       next(error);
     }

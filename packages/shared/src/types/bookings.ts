@@ -154,6 +154,51 @@ export interface CreateBookingResponse {
   booking: BookingSummary;
 }
 
+/** Why an extension is not on offer. Null when it is. */
+export type ExtensionRefusalReason =
+  /** The booking is not running: never paid, cancelled, or already over. */
+  | 'NOT_RUNNING'
+  /** A fee is owed. The remedy is to pay it and collect, not to extend. */
+  | 'OVERSTAY_FEE_DUE'
+  /** The fee was settled or waived, so the booking is in its collection window. */
+  | 'IN_COLLECTION_WINDOW'
+  /** Someone else has this safe booked after this booking. */
+  | 'FOLLOWING_BOOKING';
+
+/**
+ * Whether this booking can be extended, and by how much.
+ *
+ * Computed by one **non-throwing** function on the server, which the
+ * throwing guard then calls. That is what stops the extension page, the
+ * dashboard and the order endpoint from disagreeing about whether extending
+ * is possible — three implementations of the same rule is three chances to
+ * offer a button that 409s.
+ *
+ * `options` is empty whenever `allowed` is false, and prices come **from the
+ * booking's snapshot**: the client does no money arithmetic, and a config
+ * change since the booking started cannot re-price it.
+ */
+export interface ExtensionAvailability {
+  allowed: boolean;
+  reason: ExtensionRefusalReason | null;
+  /** Price per offerable duration, cheapest first. Empty when refused. */
+  options: Array<{ hours: number; pricePaise: number }>;
+  /**
+   * The longest extension on offer, in hours. 0 when refused.
+   *
+   * Can be shorter than the configured maximum when another booking follows
+   * this one — the safe has to be free again, including its turnaround, by
+   * the time the next renter arrives.
+   */
+  maxHours: number;
+}
+
+/** `GET /bookings/:id`. */
+export interface BookingDetailResponse {
+  booking: BookingSummary;
+  extension: ExtensionAvailability;
+}
+
 /** The Razorpay order for a booking, extension or overstay fee. */
 export interface BookingOrderResponse {
   orderId: string;
