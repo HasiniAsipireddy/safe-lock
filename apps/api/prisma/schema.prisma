@@ -25,10 +25,60 @@ enum PaymentStatus {
   REFUNDED
 }
 
+/// Whether a safe can be rented.
+///
+/// `ASSIGNED` is gone with the purchase model: a device is no longer owned by
+/// anybody, and occupancy is a property of its bookings.
 enum DeviceStatus {
-  UNASSIGNED
-  ASSIGNED
+  /// In the pool and bookable.
+  AVAILABLE
+  /// A booking ended without the renter confirming they took their things —
+  /// the collection window lapsed, or an admin force-completed it. **Not
+  /// bookable** until a human has looked inside and cleared it, because the
+  /// alternative is handing the next renter a safe containing someone else's
+  /// property, with the ability to unlock it.
+  NEEDS_INSPECTION
   RETIRED
+}
+
+/// Where a booking is in its life. Mirrors `BookingStatus` in @safelock/shared.
+enum BookingStatus {
+  PENDING_PAYMENT
+  ACTIVE
+  OVERSTAY
+  COMPLETED
+  CANCELLED
+  EXPIRED_UNPAID
+}
+
+/// How a booking ended, and therefore whether the safe needs inspecting.
+enum BookingCompletionReason {
+  /// The renter said they have their belongings. The only reason that returns
+  /// the device to the pool automatically.
+  COLLECTED
+  COLLECTION_WINDOW_LAPSED
+  ADMIN_FORCE_COMPLETED
+}
+
+/// What a payment is for. One Razorpay order per payment, always.
+enum PaymentPurpose {
+  BOOKING
+  EXTENSION
+  OVERSTAY
+}
+
+/// Why a captured payment needs a human.
+///
+/// A row carrying one of these is **real money we have taken and could not
+/// apply**. It stays `PAID` — never pretend otherwise — and is listed for an
+/// admin to refund by hand. See docs/decisions.md.
+enum PaymentReviewReason {
+  /// Captured after the booking's hold lapsed, and the device had been taken.
+  BOOKING_EXPIRED_DEVICE_TAKEN
+  /// Captured against a quote past its TTL whose fee had since grown.
+  OVERSTAY_QUOTE_EXPIRED
+  /// The booking was cancelled or completed before the money arrived.
+  BOOKING_NO_LONGER_PAYABLE
 }
 
 enum LockState {
@@ -195,15 +245,19 @@ model User {
   deviceEvents      DeviceEvent[]
   unlockChallenges  UnlockChallenge[]
   notifications     Notification[]
-  /// At most one, enforced by the unique constraint on Device.ownerId.
-  device            Device?
+  bookings            Booking[]
 }
 
 /// A physical safe lock in the inventory.
+///
+/// **Nobody owns a device.** The purchase model's `ownerId` is gone: a safe is
+/// occupied for the duration of a `Booking` and free otherwise, and the
+/// database enforces that no two bookings can occupy one at the same time (see
+/// the exclusion constraint on `Booking`).
 model Device {
   id           String       @id @default(cuid())
   serialNumber String       @unique
-  status       DeviceStatus @default(UNASSIGNED)
+  status       DeviceStatus @default(AVAILABLE)
   /// A safe ships locked, so a device in stock defaults to LOCKED and
   /// allocation re-asserts it. The UI must show the device's actual state,
   /// never "what the last button press implied" — hence lockStateUpdatedAt,
@@ -213,10 +267,11 @@ model Device {
   online              Boolean   @default(false)
   lastSeenAt          DateTime?
 
-  /// Unique: a user owns at most one device for now. The constraint, not just
-  /// a service check, is what makes concurrent allocation safe.
-  ownerId     String?   @unique
-  allocatedAt DateTime?
+  /// Set when a booking ended without the renter confirming collection, and
+  /// cleared by an admin with an audited note. A device with this set is not
+  /// bookable — see `DeviceStatus.NEEDS_INSPECTION`.
+  inspectionNote    String?
+  inspectionNotedAt DateTime?
 
   /// Reserved for the hardware phase: a hash or key-reference for per-device
   /// credentials. **Never populated or returned by any endpoint today**, and
@@ -226,12 +281,11 @@ model Device {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  owner User? @relation(fields: [ownerId], references: [id], onDelete: SetNull)
-
   events           DeviceEvent[]
   unlockChallenges UnlockChallenge[]
+  bookings         Booking[]
 
-  /// Supports the "oldest UNASSIGNED first" allocation pick.
+  /// Supports the "oldest AVAILABLE first" device pick.
   @@index([status, createdAt])
 }
 
@@ -478,6 +532,86 @@ model OutboundMessage {
   @@index([userId, createdAt])
 }
 
+/// One rental of one safe.
+///
+/// ## The device is held from creation, not from payment
+/// `PENDING_PAYMENT` reserves the safe for `holdExpiresAt`, so a user who pays
+/// is never told "sorry, gone". The obvious abuse — opening many unpaid
+/// bookings to drain the pool — is closed by one live booking per user (the
+/// partial unique index below) plus rate limits.
+///
+/// ## The clock starts when the money lands
+/// `endsAt` is **null while pending** and set at activation to
+/// `paidAt + hours`, so nobody loses purchased time to a slow checkout.
+/// `reservedUntil` is what the overlap constraint uses, and it covers the
+/// grace period and collection window too: the safe may still physically hold
+/// someone's belongings for all of it.
+///
+/// ## Overlap is a database constraint, not a service check
+/// A raw-SQL migration adds
+/// `EXCLUDE USING gist (deviceId WITH =, tstzrange(startsAt, reservedUntil) WITH &&)`
+/// over the occupying statuses. Prisma cannot model it, so it lives in the
+/// migration — and it is the only thing that makes concurrent booking correct,
+/// exactly as `Device.ownerId`'s unique index used to be for allocation.
+model Booking {
+  id       String @id @default(cuid())
+  userId   String
+  deviceId String
+
+  status BookingStatus @default(PENDING_PAYMENT)
+
+  /// Hours purchased. Extensions add to it.
+  hours Int
+
+  startsAt DateTime
+  /// Null until activation: the clock starts when the payment is captured.
+  endsAt   DateTime?
+  /// When an unpaid hold lapses. Null once paid.
+  holdExpiresAt DateTime?
+  /// How long the device is unavailable to anyone else. The constraint's upper
+  /// bound. Extended by an extension, and by the sweeper during an overstay so
+  /// a physically occupied safe stays unbookable.
+  reservedUntil DateTime
+
+  /// Total charged for the booking and its extensions, in paise.
+  pricePaise Int
+  currency   String @default("INR")
+
+  /// --- Rate snapshot. Config changes must never re-price a live booking. ---
+  hourlyRatePaise         Int
+  /// Basis points: 15000 = 1.5x. Never a float.
+  overstayMultiplierBps   Int
+  graceMinutes            Int
+  capHours                Int
+  collectionWindowMinutes Int
+
+  /// When an overstay fee was captured, opening the collection window.
+  overstaySettledAt DateTime?
+  /// What was actually collected for the overstay, in paise. For the books.
+  overstayPaidPaise Int       @default(0)
+  /// Set when an admin waived the fee instead of collecting it.
+  overstayWaivedAt  DateTime?
+
+  completedAt      DateTime?
+  completionReason BookingCompletionReason?
+  /// Admin reason for a force-complete or a waive. Audited as well.
+  adminNote        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device   Device    @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  payments Payment[]
+
+  /// The sweeper's query: non-terminal bookings with a deadline behind them.
+  @@index([status, endsAt])
+  @@index([status, holdExpiresAt])
+  /// A user's booking history, and the current-booking lookup.
+  @@index([userId, createdAt])
+  @@index([deviceId, reservedUntil])
+}
+
 /// An outstanding password reset code.
 ///
 /// Replaces the long-token link of step 3. The token was 32 random bytes in a
@@ -537,13 +671,36 @@ model Payment {
   /// Set when the payment first reaches PAID, by whichever of
   /// /payments/verify or the webhook gets there first.
   paidAt            DateTime?
-  createdAt         DateTime      @default(now())
-  updatedAt         DateTime      @updatedAt
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// What this payment buys. Every payment belongs to a booking now — there
+  /// is no account-level activation any more.
+  purpose   PaymentPurpose
+  bookingId String?
+
+  /// For an OVERSTAY payment: when its quote stops being honoured.
+  ///
+  /// The fee keeps accruing while the user is at the checkout, so the quote is
+  /// binding for a bounded window and the order carries the same expiry. A
+  /// capture after this instant whose amount no longer covers the fee is
+  /// **not** settled silently — it is flagged below.
+  quoteExpiresAt DateTime?
+
+  /// Set when the money arrived but could not be applied. The row stays PAID.
+  reviewReason   PaymentReviewReason?
+  /// Set when an admin has dealt with it (refunded by hand, note audited).
+  reviewClearedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  booking Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
 
   @@index([userId])
   @@index([status])
+  @@index([bookingId])
+  /// The admin "needs refund" list.
+  @@index([reviewReason, reviewClearedAt])
 }
 
 /// Razorpay webhook idempotency ledger. A delivery whose event id is already

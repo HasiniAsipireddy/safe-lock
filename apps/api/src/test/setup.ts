@@ -38,6 +38,7 @@ const TABLES = [
   'RefreshToken',
   'PasswordResetCode',
   'OutboundMessage',
+  'Booking',
   'PhoneVerification',
   'Notification',
   'DeviceEvent',

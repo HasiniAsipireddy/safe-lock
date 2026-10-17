@@ -78,6 +78,14 @@ export interface RateLimitConfig {
   phoneVerifyIp: LimitSpec;
   /** Per-user limiter on `POST /account/phone/confirm`. */
   phoneConfirm: LimitSpec;
+  /** Per-user limiter on booking reads. Generous: the dashboard polls them. */
+  bookingRead: LimitSpec;
+  /**
+   * Per-user limiter on booking writes — create, order, extend, collect,
+   * cancel. Tighter than the reads: each one either holds a safe or creates a
+   * Razorpay order.
+   */
+  bookingWrite: LimitSpec;
   /** Per-user limiter on /payments/order. */
   createOrder: LimitSpec;
   /** Per-user limiter on /payments/verify. */
@@ -153,6 +161,13 @@ export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
   // Above the 5 attempts one challenge allows, so the per-challenge counter is
   // what normally stops a guesser and this is the backstop against cycling.
   phoneConfirm: { windowMs: 10 * 60 * 1000, limit: 15 },
+
+  // The dashboard reads the current booking on load and when the tab returns.
+  bookingRead: { windowMs: 5 * 60 * 1000, limit: 120 },
+  // A booking holds a safe out of the pool, so a runaway client must not be
+  // able to create them in bulk. The one-live-booking-per-user index is the
+  // hard limit; this paces the attempts.
+  bookingWrite: { windowMs: 10 * 60 * 1000, limit: 20 },
 
   createOrder: { windowMs: 10 * 60 * 1000, limit: 5 },
   verifyPayment: { windowMs: 10 * 60 * 1000, limit: 20 },
@@ -269,6 +284,8 @@ export interface Limiters {
   phoneVerify: ReturnType<typeof rateLimit>;
   phoneVerifyIp: ReturnType<typeof rateLimit>;
   phoneConfirm: ReturnType<typeof rateLimit>;
+  bookingRead: ReturnType<typeof rateLimit>;
+  bookingWrite: ReturnType<typeof rateLimit>;
   createOrder: ReturnType<typeof rateLimit>;
   verifyPayment: ReturnType<typeof rateLimit>;
   adminWrite: ReturnType<typeof rateLimit>;
@@ -444,6 +461,30 @@ export function createLimiters(
         },
       },
       stores.phoneConfirm,
+    ),
+
+    bookingRead: build(
+      config.bookingRead,
+      'Too many requests. Please wait a moment and try again.',
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.bookingRead,
+    ),
+
+    bookingWrite: build(
+      config.bookingWrite,
+      'Too many booking actions. Please wait a few minutes and try again.',
+      {
+        keyGenerator: (req) => {
+          if (req.user?.id) return `u:${req.user.id}`;
+          return req.ip ? `ip:${ipKeyGenerator(req.ip)}` : 'ip:unknown';
+        },
+      },
+      stores.bookingWrite,
     ),
 
     createOrder: build(

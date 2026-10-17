@@ -47,6 +47,14 @@ export async function createRazorpayOrder(params: {
   currency: string;
   receipt: string;
   notes: Record<string, string>;
+  /**
+   * Unix seconds after which Razorpay refuses a payment attempt.
+   *
+   * Set from the booking hold or the overstay quote TTL, so the gateway
+   * rejects most late attempts before they ever reach our webhook — the
+   * cheapest place to stop them. What gets through is still handled.
+   */
+  expireBy?: number;
 }): Promise<CreatedOrder> {
   try {
     const order = await razorpayClient().orders.create({
@@ -54,6 +62,7 @@ export async function createRazorpayOrder(params: {
       currency: params.currency,
       receipt: params.receipt,
       notes: params.notes,
+      ...(params.expireBy ? { expire_by: params.expireBy } : {}),
       // Razorpay may only capture up to the order amount; auto-capture avoids
       // a separate capture call for a one-time purchase.
       payment_capture: true,

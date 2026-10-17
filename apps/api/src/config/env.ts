@@ -151,18 +151,70 @@ const envSchema = z
     SEED_ADMIN_PHONE: z.string().optional(),
     SEED_ALLOW_PRODUCTION: z.string().optional(),
 
+    // --- Rental pricing -------------------------------------------------------
     /**
-     * One-time activation price in PAISE. The single source of truth for what
-     * a safe costs — see `payments.service.ts`, which never reads an amount
-     * from the request.
+     * Hourly rental rate in PAISE. The single source of truth for what a safe
+     * costs — the booking service never reads an amount from a request.
+     *
+     * **PROVISIONAL**, exactly like the one-time price it replaces: 10000 paise
+     * (Rs 100/hour) is a development placeholder, not a business decision. It
+     * is snapshotted onto every booking, so changing it never re-prices a live
+     * one. See CLAUDE.md's open questions.
      */
-    SAFE_PRICE_PAISE: z.coerce
+    RENTAL_HOURLY_RATE_PAISE: z.coerce
       .number()
-      .int('SAFE_PRICE_PAISE must be an integer number of paise')
+      .int('RENTAL_HOURLY_RATE_PAISE must be an integer number of paise')
       .positive()
       // Razorpay's own floor for an INR order is 100 paise (Rs 1).
-      .min(100, 'SAFE_PRICE_PAISE must be at least 100 (Rs 1)')
-      .default(99900),
+      .min(100, 'RENTAL_HOURLY_RATE_PAISE must be at least 100 (Rs 1)')
+      .default(10_000),
+
+    /** Shortest and longest a single booking or extension may be. */
+    RENTAL_MIN_HOURS: z.coerce.number().int().min(1).max(24).default(1),
+    RENTAL_MAX_HOURS: z.coerce.number().int().min(1).max(24).default(24),
+
+    /**
+     * Overstay surcharge in **basis points**: 15000 = 1.5x the hourly rate.
+     *
+     * Basis points rather than a decimal because money must never touch a
+     * float, and a fractional paisa cannot be charged.
+     */
+    OVERSTAY_MULTIPLIER_BPS: z.coerce.number().int().min(10_000).max(100_000).default(15_000),
+    /** Minutes after `endsAt` before any fee accrues. */
+    OVERSTAY_GRACE_MINUTES: z.coerce.number().int().min(0).max(240).default(15),
+    /** Most hours of overstay that can ever be charged. Bounds the bill. */
+    OVERSTAY_CAP_HOURS: z.coerce.number().int().min(1).max(168).default(24),
+    /** Minutes to collect belongings after an overstay fee is settled. */
+    COLLECTION_WINDOW_MINUTES: z.coerce.number().int().min(5).max(240).default(30),
+
+    /**
+     * How long an unpaid booking holds its device.
+     *
+     * The device is reserved from creation so a user who pays is never told
+     * "sorry, gone". The Razorpay order expiry is set to match, so a payment
+     * cannot easily arrive after the hold has lapsed.
+     */
+    BOOKING_HOLD_MINUTES: z.coerce.number().int().min(2).max(60).default(10),
+
+    /**
+     * How long an overstay quote is binding.
+     *
+     * Fees keep accruing while the user is at the checkout, so the quoted
+     * amount is honoured for this long and the Razorpay order carries the same
+     * expiry. A capture after it, whose amount no longer covers the fee, is
+     * flagged for a manual refund rather than silently settling less than is
+     * owed. See docs/decisions.md.
+     */
+    OVERSTAY_QUOTE_TTL_MINUTES: z.coerce.number().int().min(5).max(60).default(15),
+
+    /** How often the booking sweeper runs. Correctness never depends on it. */
+    BOOKING_SWEEP_INTERVAL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(600_000)
+      .default(60_000),
+
     CURRENCY: z.literal('INR').default('INR'),
 
     RAZORPAY_KEY_ID: z.string().min(1, 'RAZORPAY_KEY_ID is required'),
@@ -170,6 +222,14 @@ const envSchema = z
     RAZORPAY_WEBHOOK_SECRET: z.string().min(1, 'RAZORPAY_WEBHOOK_SECRET is required'),
   })
   .superRefine((value, ctx) => {
+    if (value.RENTAL_MIN_HOURS > value.RENTAL_MAX_HOURS) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['RENTAL_MIN_HOURS'],
+        message: 'RENTAL_MIN_HOURS must not exceed RENTAL_MAX_HOURS',
+      });
+    }
+
     /**
      * Cloud mode needs all four credentials, in every environment.
      *
