@@ -31,6 +31,24 @@ const envSchema = z
     CORS_ORIGINS: z.string().optional(),
 
     /**
+     * The one canonical base URL for links we put in messages.
+     *
+     * Deliberately **not** `WEB_ORIGIN`: that is a comma-separated CSRF/CORS
+     * allowlist which may legitimately hold several origins (an apex and a
+     * www, a preview host), and a WhatsApp deep link needs exactly one. Taking
+     * the first entry of a list would make the link depend on the order
+     * someone happened to type an unrelated setting in.
+     *
+     * Outside production it defaults to `http://localhost:3000`, so local dev
+     * needs no setup (see `PUBLIC_WEB_URL` below). In production the boot
+     * fails unless it is set, `https:`, not a loopback host, and free of
+     * placeholder text — a message carrying a link to `localhost` is a dead
+     * end on someone's phone, and the whole point of these messages is the
+     * page they point at.
+     */
+    PUBLIC_WEB_URL: z.string().optional(),
+
+    /**
      * Whether to trust `X-Forwarded-*`. Off by default: trusting the header
      * when there is no proxy in front lets any client spoof its IP and defeat
      * every per-IP rate limit. Set to the number of proxy hops (or `true`)
@@ -122,6 +140,18 @@ const envSchema = z
     WHATSAPP_TEMPLATE_UNLOCK_ALERT: z.string().default('safelock_unlock_alert'),
     WHATSAPP_TEMPLATE_FAILED_ATTEMPTS: z.string().default('safelock_failed_attempts'),
 
+    /**
+     * Rental lifecycle templates. All UTILITY, all purely informational — a
+     * body that urges an upsell risks Meta reclassifying the template as
+     * MARKETING, which would make it opt-out-able and stop a fee notice
+     * reaching someone who muted promotions.
+     */
+    WHATSAPP_TEMPLATE_BOOKING_CONFIRMED: z.string().default('safelock_booking_confirmed'),
+    WHATSAPP_TEMPLATE_BOOKING_ENDING_SOON: z.string().default('safelock_booking_ending_soon'),
+    WHATSAPP_TEMPLATE_OVERSTAY_STARTED: z.string().default('safelock_overstay_started'),
+    WHATSAPP_TEMPLATE_OVERSTAY_SETTLED: z.string().default('safelock_overstay_settled'),
+    WHATSAPP_TEMPLATE_COLLECTION_CLOSING: z.string().default('safelock_collection_closing'),
+
     /** Template language tag, as registered with Meta. */
     WHATSAPP_LANGUAGE: z.string().default('en'),
     /** Graph API version. Pinned, so Meta rolling forward cannot change behaviour. */
@@ -130,14 +160,58 @@ const envSchema = z
     WHATSAPP_TIMEOUT_MS: z.coerce.number().int().positive().max(60_000).default(8_000),
 
     /**
-     * Messages per user per rolling 24 hours, across every kind.
+     * **User-triggered** messages per user per rolling 24 hours.
      *
      * Each message costs money and lands on someone's phone, so an uncapped
      * send endpoint is both a billing risk and a way to use us to harass
      * someone. 10 clears an ordinary day (a verification, a few unlocks and
      * their alerts) with room to spare.
+     *
+     * Everything a user's own action produces stays under this budget:
+     * `PHONE_OTP`, `PASSWORD_RESET`, and — the ones worth being explicit
+     * about — `UNLOCK_ALERT` and `FAILED_ATTEMPTS_ALERT`. Those two follow an
+     * unlock attempt somebody made, so they are user-triggered traffic and
+     * must not drift into the uncapped or the booking budget.
+     * `UNLOCK_OTP` alone passes `ignoreCap`, as it always has: a cap that can
+     * stop someone opening a safe they are standing at is a lock-out, not
+     * abuse protection. Its rows are still counted *against* this budget.
+     *
+     * Booking lifecycle messages are scoped out of this count and into
+     * `WHATSAPP_BOOKING_SEND_CAP` below — letting a chatty rental consume this
+     * one would mean a user's verification code dropped by their own
+     * extensions. Narrowing what this counts makes the protection sharper,
+     * not weaker.
      */
     WHATSAPP_DAILY_SEND_CAP: z.coerce.number().int().positive().max(1000).default(10),
+
+    /**
+     * Booking lifecycle messages per user per rolling 24 hours.
+     *
+     * A separate budget, not an exemption. These rows can only be created by a
+     * server-side booking state change — there is no endpoint that emits one —
+     * but a pathological day (two dozen extensions) should still be bounded.
+     * 20 clears a normal rental several times over: a confirmation, two
+     * reminders and an overstay notice is four.
+     *
+     * **Counts rows actually `SENT`**, never `SKIPPED` or cancelled ones, so
+     * repeated extensions — which cancel and re-create unsent reminders — do
+     * not eat the budget. A message dropped by this cap is recorded
+     * `SKIPPED`/`CAP_REACHED` and shown to admins rather than vanishing.
+     */
+    WHATSAPP_BOOKING_SEND_CAP: z.coerce.number().int().positive().max(1000).default(20),
+
+    /**
+     * How late a *scheduled* booking message may be claimed and still sent.
+     *
+     * Past it, the row is `SKIPPED`/`STALE` and nothing is sent: "your booking
+     * ends in 10 minutes", arriving after it ended, is not a late message but
+     * a false one. Must stay comfortably above `OUTBOX_POLL_INTERVAL_MS`
+     * (5s by default, so 5 minutes is sixty polls of headroom) or an ordinary
+     * restart would start discarding reminders. Only scheduled kinds are
+     * subject to it — a message describing an event that already happened has
+     * no deadline to miss.
+     */
+    REMINDER_MAX_LATENESS_MINUTES: z.coerce.number().int().min(1).max(120).default(5),
 
     /** How often the outbox worker looks for pending messages. */
     OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().positive().max(600_000).default(5_000),
@@ -316,6 +390,55 @@ const envSchema = z
       });
     }
 
+    /**
+     * A booking message with a broken link is worse than no message: it tells
+     * someone their fee has started and then strands them. So the base URL is
+     * checked at boot, not at the first send.
+     */
+    const publicWebUrl = value.PUBLIC_WEB_URL?.trim();
+
+    if (!publicWebUrl) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['PUBLIC_WEB_URL'],
+        message:
+          'PUBLIC_WEB_URL is required in production (the canonical https base for links in messages)',
+      });
+    } else if (/change_me|replace_me|placeholder|example\.com/i.test(publicWebUrl)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['PUBLIC_WEB_URL'],
+        message: 'PUBLIC_WEB_URL still holds a placeholder value; set the real site URL',
+      });
+    } else {
+      let parsed: URL | null = null;
+      try {
+        parsed = new URL(publicWebUrl);
+      } catch {
+        parsed = null;
+      }
+
+      if (!parsed) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['PUBLIC_WEB_URL'],
+          message: 'PUBLIC_WEB_URL must be an absolute URL, e.g. https://app.example.test',
+        });
+      } else if (parsed.protocol !== 'https:') {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['PUBLIC_WEB_URL'],
+          message: 'PUBLIC_WEB_URL must be https: in production',
+        });
+      } else if (/^(localhost|127\.|0\.0\.0\.0|\[::1\])/i.test(parsed.hostname)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['PUBLIC_WEB_URL'],
+          message: 'PUBLIC_WEB_URL must not be a loopback host in production',
+        });
+      }
+    }
+
     // An empty allowlist in production would make originCheck reject every
     // state-changing request, and cors() refuse every browser.
     if (!value.WEB_ORIGIN && !value.CORS_ORIGINS) {
@@ -359,6 +482,18 @@ export const WEB_ORIGINS: readonly string[] = (env.WEB_ORIGIN ?? env.CORS_ORIGIN
   .split(',')
   .map((origin) => origin.trim().replace(/\/+$/, ''))
   .filter(Boolean);
+
+/**
+ * The canonical site base for links in outbound messages, without a trailing
+ * slash.
+ *
+ * Falls back to `http://localhost:3000` outside production so a fresh clone
+ * needs no configuration; production cannot reach the fallback, because the
+ * superRefine above refuses to boot without a real value.
+ */
+export const PUBLIC_WEB_URL: string = (
+  env.PUBLIC_WEB_URL?.trim() || 'http://localhost:3000'
+).replace(/\/+$/, '');
 
 /** Refresh token lifetime as milliseconds. */
 export const REFRESH_TOKEN_TTL_MS = env.REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;

@@ -95,7 +95,13 @@ describe('enqueue', () => {
     expect(Object.keys(row).sort()).toEqual(
       [
         'attempts',
+        // Scheduling, added with the booking lifecycle messages. All three
+        // are ids and timestamps: a due time, the booking a message is about,
+        // and an idempotency key built from those two. None of them can hold
+        // message content, which is what this test is really guarding.
+        'bookingId',
         'createdAt',
+        'dedupeKey',
         'deliveryStatus',
         'deliveryUpdatedAt',
         'deviceEventId',
@@ -104,6 +110,7 @@ describe('enqueue', () => {
         'kind',
         'nextAttemptAt',
         'providerMessageId',
+        'sendAt',
         'sentAt',
         'status',
         'updatedAt',

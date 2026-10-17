@@ -157,6 +157,26 @@ enum OutboundMessageKind {
   UNLOCK_ALERT
   /// "Five wrong codes were entered." Utility category.
   FAILED_ATTEMPTS_ALERT
+
+  // --- Rental lifecycle. Utility category, and all five are *scheduled*: ----
+  // they carry a `bookingId`, a `sendAt` that is a real deadline rather than
+  // "now", and a `dedupeKey`. The worker re-validates every one of them
+  // against the live booking before sending, so none can ever assert
+  // something that stopped being true after it was queued.
+
+  /// "Safe X is yours until Y." Sent at activation, and again after an
+  /// extension — the sentence an extension needs is the same sentence.
+  BOOKING_CONFIRMED
+  /// "Your booking ends at Y." One row per lead time.
+  BOOKING_ENDING_SOON
+  /// "Your booking ended and an overstay fee has started."
+  OVERSTAY_STARTED
+  /// "We received your overstay payment." Never sent for a *waived* fee: a
+  /// write-off worded as a receipt would be a lie about money. See
+  /// docs/decisions.md.
+  OVERSTAY_SETTLED
+  /// "Your collection window closes at Y."
+  COLLECTION_CLOSING
 }
 
 /// Where an outbound message got to.
@@ -186,7 +206,23 @@ enum OutboundFailureCategory {
   /// Skip: the user has not opted in to WhatsApp.
   NO_CONSENT
   /// Skip: the user's daily send cap is spent.
+  ///
+  /// Also the reason a *scheduled* booking message is dropped once the
+  /// separate booking budget is spent. Those rows are surfaced in the admin
+  /// view on purpose: a dropped `OVERSTAY_STARTED` is a user who was never
+  /// told a fee had started, which must be visible rather than silent.
   CAP_REACHED
+  /// Skip: the booking this message was about moved on, so the message is no
+  /// longer true — collected, cancelled, completed, or the fee already paid.
+  /// Written by `cancelPending` at the state change.
+  CANCELLED
+  /// Skip: claimed too long after `sendAt` to still be honest.
+  ///
+  /// "Your booking ends in 10 minutes", delivered 40 minutes after it ended,
+  /// is not a late message but a false one. Only ever applies to scheduled
+  /// booking kinds; a message describing an event that already happened has
+  /// no deadline to miss.
+  STALE
   INVALID_NUMBER
   TEMPLATE
   AUTH
@@ -496,6 +532,15 @@ model RefreshToken {
 /// one-time code, so they are rebuilt from live data at send time
 /// (`lib/whatsapp/send.ts`) and exist only in memory. A dump of this table
 /// yields who was messaged about what, and no codes.
+///
+/// ## Scheduling is a due time, not a job queue
+/// A row may be queued now and due later (`sendAt`). Nothing re-reads a
+/// booking to decide *whether* to schedule — `dedupeKey` makes that
+/// idempotent — and nothing trusts the schedule at send time either: a row
+/// carrying a `bookingId` is re-validated against the live booking, and a
+/// booking that moved on yields `SKIPPED`, never a message. Cancellation at
+/// the state change and re-validation at send are independent, exactly like
+/// the two unlock-eligibility guards.
 model OutboundMessage {
   id     String              @id @default(cuid())
   userId String
@@ -509,6 +554,44 @@ model OutboundMessage {
 
   /// Earliest time the worker may try again. Exponential backoff.
   nextAttemptAt DateTime @default(now())
+
+  /// When this message is **due**.
+  ///
+  /// Distinct from `nextAttemptAt`, and the distinction is the point:
+  /// `sendAt` is the moment the message is *about* and never moves once the
+  /// row exists, while `nextAttemptAt` is retry backoff and only ever moves
+  /// forward. The claim query requires both to have elapsed, so a backoff can
+  /// never pull a message earlier than its due time. Immediate kinds leave it
+  /// at `now()` and behave exactly as before.
+  sendAt DateTime @default(now())
+
+  /// The booking a scheduled lifecycle message belongs to.
+  ///
+  /// Null for every pre-rental kind — an unlock alert is about a device event,
+  /// not a rental. Non-null is also the flag the worker branches on: a row
+  /// with a booking is re-validated against it, and is subject to the
+  /// staleness tolerance and the booking send budget.
+  bookingId String?
+
+  /// Idempotency key for scheduling, unique across the table.
+  ///
+  /// Shaped `<bookingId>:<kind>:<discriminator>`, where the discriminator is
+  /// the `sendAt` epoch for the deadline kinds, `endsAt` for
+  /// `BOOKING_CONFIRMED` and the payment id for `OVERSTAY_SETTLED` —
+  /// deliberately **not** "now", or settlement running twice (the verified
+  /// callback *and* the webhook) would send two messages. Scheduling is
+  /// therefore a `createMany({ skipDuplicates: true })` and needs no prior
+  /// read.
+  ///
+  /// Null for non-booking messages, and Postgres treats NULLs as distinct, so
+  /// the unique index does not constrain them.
+  ///
+  /// A cancelled (`SKIPPED`) row keeps its key, so re-creating that exact key
+  /// is silently dropped. Reachable only by returning a booking to a state it
+  /// already left at the same timestamp: an extension adds whole hours, and
+  /// the leads are 30 and 10 minutes, so every re-scheduled key differs. See
+  /// docs/decisions.md.
+  dedupeKey String? @unique
 
   /// Meta's `wamid.…`, once accepted. The key a delivery webhook matches on.
   providerMessageId String? @unique
@@ -525,11 +608,16 @@ model OutboundMessage {
 
   user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   deviceEvent DeviceEvent? @relation(fields: [deviceEventId], references: [id], onDelete: SetNull)
+  booking     Booking?     @relation(fields: [bookingId], references: [id], onDelete: Cascade)
 
   /// The worker's claim query: PENDING rows whose backoff has elapsed.
   @@index([status, nextAttemptAt])
+  /// The same claim query's other half, and its `ORDER BY sendAt`.
+  @@index([status, sendAt])
   /// The daily cap count, and a user's message history.
   @@index([userId, createdAt])
+  /// `cancelPending` for one booking.
+  @@index([bookingId, status])
 }
 
 /// One rental of one safe.
@@ -603,6 +691,9 @@ model Booking {
   user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   device   Device    @relation(fields: [deviceId], references: [id], onDelete: Restrict)
   payments Payment[]
+  /// Scheduled lifecycle messages. Cascade-deleted with the booking, which is
+  /// the right answer for a nudge toward a page that no longer exists.
+  outboundMessages OutboundMessage[]
 
   /// The sweeper's query: non-terminal bookings with a deadline behind them.
   @@index([status, endsAt])

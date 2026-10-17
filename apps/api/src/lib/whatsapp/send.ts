@@ -31,7 +31,35 @@ export type MessageKind =
   | 'PHONE_OTP'
   | 'PASSWORD_RESET'
   | 'UNLOCK_ALERT'
-  | 'FAILED_ATTEMPTS_ALERT';
+  | 'FAILED_ATTEMPTS_ALERT'
+  // Rental lifecycle. Scheduled rather than immediate, and the only kinds
+  // that carry a booking id. See `OutboundMessageKind` in the schema.
+  | 'BOOKING_CONFIRMED'
+  | 'BOOKING_ENDING_SOON'
+  | 'OVERSTAY_STARTED'
+  | 'OVERSTAY_SETTLED'
+  | 'COLLECTION_CLOSING';
+
+/**
+ * The kinds that belong to a booking rather than to a device event.
+ *
+ * One list, used for three decisions that must not disagree: which rows are
+ * re-validated before sending, which are subject to the staleness tolerance,
+ * and which draw on the booking send budget instead of the user one.
+ */
+export const BOOKING_MESSAGE_KINDS = [
+  'BOOKING_CONFIRMED',
+  'BOOKING_ENDING_SOON',
+  'OVERSTAY_STARTED',
+  'OVERSTAY_SETTLED',
+  'COLLECTION_CLOSING',
+] as const satisfies readonly MessageKind[];
+
+export type BookingMessageKind = (typeof BOOKING_MESSAGE_KINDS)[number];
+
+export function isBookingMessageKind(kind: MessageKind): kind is BookingMessageKind {
+  return (BOOKING_MESSAGE_KINDS as readonly MessageKind[]).includes(kind);
+}
 
 export type SkipReason = 'NO_VERIFIED_PHONE' | 'NO_CONSENT' | 'CAP_REACHED';
 
@@ -53,6 +81,16 @@ export function templateFor(kind: MessageKind): string {
       return env.WHATSAPP_TEMPLATE_UNLOCK_ALERT;
     case 'FAILED_ATTEMPTS_ALERT':
       return env.WHATSAPP_TEMPLATE_FAILED_ATTEMPTS;
+    case 'BOOKING_CONFIRMED':
+      return env.WHATSAPP_TEMPLATE_BOOKING_CONFIRMED;
+    case 'BOOKING_ENDING_SOON':
+      return env.WHATSAPP_TEMPLATE_BOOKING_ENDING_SOON;
+    case 'OVERSTAY_STARTED':
+      return env.WHATSAPP_TEMPLATE_OVERSTAY_STARTED;
+    case 'OVERSTAY_SETTLED':
+      return env.WHATSAPP_TEMPLATE_OVERSTAY_SETTLED;
+    case 'COLLECTION_CLOSING':
+      return env.WHATSAPP_TEMPLATE_COLLECTION_CLOSING;
   }
 }
 

@@ -55,6 +55,28 @@ export async function buildParams(
       throw new Error(
         `${kind} cannot be sent from the outbox: a one-time code cannot be rebuilt`,
       );
+
+    case 'BOOKING_CONFIRMED':
+    case 'BOOKING_ENDING_SOON':
+    case 'OVERSTAY_STARTED':
+    case 'OVERSTAY_SETTLED':
+    case 'COLLECTION_CLOSING':
+      /**
+       * Booking messages build their parameters elsewhere, and deliberately.
+       *
+       * Each one has to be **re-validated** against the live booking before it
+       * may be sent — a reminder whose booking has ended must be skipped, not
+       * sent with recomputed text — so the same read that produces the
+       * parameters also decides whether there is a message at all. Splitting
+       * that across two functions would let them disagree, and the way they
+       * would disagree is a false statement about somebody's safe.
+       *
+       * Unreachable: the worker routes any row carrying a `bookingId` to
+       * `bookingMessages.revalidate` and never reaches here.
+       */
+      throw new Error(
+        `${kind} is a booking message: its parameters come from re-validation, not buildParams`,
+      );
   }
 }
 

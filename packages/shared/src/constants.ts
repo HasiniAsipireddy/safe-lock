@@ -197,6 +197,34 @@ export const NAME_RULES = {
 } as const;
 
 /**
+ * How long before `endsAt` a booking reminder is sent, in minutes.
+ *
+ * Shared rather than environment configuration, deliberately: these numbers
+ * end up in Meta-approved template copy *and* in UI text that promises them,
+ * and two copies of a promise drift. Changing them is a code change and a
+ * template review, which is the right amount of friction.
+ *
+ * One scheduled message per entry, each skipped if the lead exceeds the time
+ * actually remaining.
+ */
+export const BOOKING_REMINDER_LEAD_MINUTES = [30, 10] as const;
+
+/** How long before the collection deadline its reminder is sent, in minutes. */
+export const COLLECTION_REMINDER_LEAD_MINUTES = 10;
+
+/**
+ * How far *after* the grace period the overstay notice is scheduled, in
+ * seconds.
+ *
+ * Not cosmetic. The fee is exactly zero at `endsAt + grace`, and the worker
+ * re-validates an `OVERSTAY_STARTED` row by requiring an outstanding fee — so
+ * a message due at that precise instant would be refused as not-applicable on
+ * every poll until it went stale, and the one notice that matters most would
+ * never arrive. A minute past the boundary there is always a fee to name.
+ */
+export const OVERSTAY_NOTICE_DELAY_SECONDS = 60;
+
+/**
  * Generic message for any failed login. Deliberately does not say whether the
  * identifier or the password was wrong — that would let an attacker enumerate
  * registered accounts.
