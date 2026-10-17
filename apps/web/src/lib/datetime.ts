@@ -63,6 +63,43 @@ export function formatDayHeading(iso: string): string {
   });
 }
 
+/** `16 Oct, 14:32` — a booking's start or end, compact enough for a card. */
+export function formatShortDateTime(iso: string): string {
+  return new Date(iso).toLocaleString(undefined, {
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+/**
+ * `2h 15m`, `14m`, `0m` — a duration, for the time left on a booking.
+ *
+ * Clamped at zero rather than going negative, because every caller is counting
+ * down to a deadline and "-3m left" is not a thing to show anybody. Whether
+ * the deadline has *passed* is a separate question the caller already has to
+ * ask, since what happens next differs: a lapsed hold is gone, a lapsed
+ * booking starts accruing a fee.
+ *
+ * Seconds are deliberately absent above a minute. A safe rental is not a
+ * stopwatch, and a ticking seconds display invites a per-second re-render for
+ * no decision the user makes differently.
+ */
+export function formatDuration(ms: number): string {
+  const totalMinutes = Math.max(0, Math.floor(ms / 60_000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (hours === 0) return `${minutes}m`;
+  return `${hours}h ${minutes}m`;
+}
+
+/** Milliseconds from now until an ISO instant. Negative once it has passed. */
+export function msUntil(iso: string): number {
+  return new Date(iso).getTime() - Date.now();
+}
+
 /** Groups events into consecutive day buckets, preserving their order. */
 export function groupByDay<T extends { createdAt: string }>(
   items: T[],

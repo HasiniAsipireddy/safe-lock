@@ -19,13 +19,26 @@ import { toUserMessage } from '@/lib/apiError';
  *   failed to move must not look as though it moved.
  * - **Unlock always goes through a code.** The button opens
  *   {@link UnlockDialog}; there is no path from here to an unlock request.
- * - **UNKNOWN disables everything.** It should not happen for an allocated
- *   safe, but if it ever does the honest answer is "state unavailable", not a
- *   pair of buttons whose effect nobody can predict.
+ * - **UNKNOWN disables everything.** It should not happen for a booked safe,
+ *   but if it ever does the honest answer is "state unavailable", not a pair
+ *   of buttons whose effect nobody can predict.
+ * - **An outstanding overstay fee disables unlock, never lock.** The API
+ *   refuses the unlock (402) and allows the lock, and the asymmetry is
+ *   deliberate: refusing to let someone secure a safe they are standing at
+ *   would punish them in the one direction that creates risk rather than
+ *   recovering money.
  */
-export function SafeCard({ device: initial }: { device: DeviceSummary }) {
+export function SafeCard({
+  device: initial,
+  overstayFeePaise = 0,
+}: {
+  device: DeviceSummary;
+  /** Non-zero when a fee is owed. Disables unlock and says why. */
+  overstayFeePaise?: number;
+}) {
   const { user } = useAuth();
   const phoneVerified = user?.phoneVerified ?? false;
+  const feeDue = overstayFeePaise > 0;
   const [device, setDevice] = useState(initial);
   const [locking, setLocking] = useState(false);
   const [confirmLock, setConfirmLock] = useState(false);
@@ -93,17 +106,11 @@ export function SafeCard({ device: initial }: { device: DeviceSummary }) {
         </div>
       </div>
 
-      <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
+      <dl className="mt-4 text-sm">
         <div>
           <dt className="text-slate-500 dark:text-slate-400">Last seen</dt>
           <dd className="mt-0.5 font-medium text-slate-900 dark:text-slate-100">
             {formatTimestamp(device.lastSeenAt)}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-slate-500 dark:text-slate-400">Allocated</dt>
-          <dd className="mt-0.5 font-medium text-slate-900 dark:text-slate-100">
-            {formatTimestamp(device.allocatedAt)}
           </dd>
         </div>
       </dl>
@@ -119,23 +126,28 @@ export function SafeCard({ device: initial }: { device: DeviceSummary }) {
         </Button>
         {/*
           Unlock is disabled for an unverified number, because the API refuses
-          it (403 PHONE_NOT_VERIFIED) — the one-time code has nowhere to go.
+          it (403 PHONE_NOT_VERIFIED) — the one-time code has nowhere to go —
+          and while a fee is owed, because the API refuses that too (402).
           Offering a button that cannot work and explaining afterwards is worse
-          than saying so now; the dashboard also shows a prompt with the fix.
+          than saying so now; the booking card above carries the fix for each.
 
-          Lock stays enabled: it needs no code, and an unverified user must
-          still be able to secure their own safe.
+          Lock stays enabled in both cases: it needs no code and no settled
+          fee, and a user must always be able to secure their own safe.
         */}
         <Button
           variant="secondary"
           onClick={() => setUnlocking(true)}
-          disabled={stateUnavailable || locking || !phoneVerified}
+          disabled={stateUnavailable || locking || !phoneVerified || feeDue}
         >
           Unlock
         </Button>
       </div>
 
-      {!phoneVerified ? (
+      {feeDue ? (
+        <p className="mt-2 text-sm text-amber-800 dark:text-amber-200">
+          Pay your overstay fee to unlock and collect your items. Locking still works.
+        </p>
+      ) : !phoneVerified ? (
         <p className="mt-2 text-sm text-amber-800 dark:text-amber-200">
           Verify your phone number to unlock. Locking still works.
         </p>

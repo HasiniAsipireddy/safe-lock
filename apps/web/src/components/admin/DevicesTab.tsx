@@ -13,15 +13,28 @@ import { api } from '@/lib/api';
 import { toUserMessage } from '@/lib/apiError';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
-import { DeviceStatusBadge, LockStateBadge, OnlineBadge } from '@/components/ui/Badge';
+import {
+  BookingStatusBadge,
+  DeviceStatusBadge,
+  LockStateBadge,
+  OnlineBadge,
+} from '@/components/ui/Badge';
+import { formatShortDateTime } from '@/lib/datetime';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { useToast } from '@/components/ui/Toast';
 import { AdminTable, type Column } from './AdminTable';
 
 type StatusFilter = DeviceStatus | 'ALL';
 
+/**
+ * The two actions a safe still has.
+ *
+ * Unassign is gone with allocation. What replaced it is `clear-inspection`,
+ * which is the opposite kind of action: not "take this away from someone" but
+ * "a human has looked inside and it is fit to rent again".
+ */
 interface PendingAction {
-  kind: 'unassign' | 'retire';
+  kind: 'clear-inspection' | 'retire';
   device: AdminDeviceRow;
 }
 
@@ -36,6 +49,7 @@ export function DevicesTab({ onInventoryChange }: { onInventoryChange?: () => vo
   const [query, setQuery] = useState('');
   const [pending, setPending] = useState<PendingAction | null>(null);
   const [acting, setActing] = useState(false);
+  const [note, setNote] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -75,13 +89,19 @@ export function DevicesTab({ onInventoryChange }: { onInventoryChange?: () => vo
     setActing(true);
 
     try {
-      await api.post(`/admin/devices/${pending.device.id}/${pending.kind}`, {});
+      // The note is required for clear-inspection, and is the record that a
+      // human looked inside. Retire takes no body.
+      await api.post(
+        `/admin/devices/${pending.device.id}/${pending.kind}`,
+        pending.kind === 'clear-inspection' ? { note: note.trim() } : {},
+      );
       toast.success(
-        pending.kind === 'unassign'
-          ? `${pending.device.serialNumber} returned to stock.`
+        pending.kind === 'clear-inspection'
+          ? `${pending.device.serialNumber} returned to the pool.`
           : `${pending.device.serialNumber} retired.`,
       );
       setPending(null);
+      setNote('');
       refresh();
     } catch (error) {
       toast.error(toUserMessage(error));
@@ -99,21 +119,40 @@ export function DevicesTab({ onInventoryChange }: { onInventoryChange?: () => vo
     {
       key: 'status',
       header: 'Status',
-      cell: (device) => <DeviceStatusBadge status={device.status} />,
+      cell: (device) => (
+        <span className="flex flex-col gap-1">
+          <DeviceStatusBadge status={device.status} />
+          {/* Why it needs inspecting, so an admin knows what to look for
+              before opening it. */}
+          {device.status === 'NEEDS_INSPECTION' && device.inspectionNote ? (
+            <span className="text-xs text-amber-700 dark:text-amber-300">
+              {device.inspectionNote}
+            </span>
+          ) : null}
+        </span>
+      ),
     },
     {
-      key: 'owner',
-      header: 'Owner',
+      key: 'booking',
+      header: 'Rented by',
       cell: (device) =>
-        device.owner ? (
+        device.currentBooking ? (
           <span>
-            {device.owner.name}
+            {device.currentBooking.user.name}
             <span className="block text-xs text-slate-500 dark:text-slate-400">
-              {device.owner.email}
+              {device.currentBooking.user.email}
             </span>
+            <span className="mt-1 block">
+              <BookingStatusBadge status={device.currentBooking.effectiveStatus} />
+            </span>
+            {device.currentBooking.endsAt ? (
+              <span className="block text-xs text-slate-500 dark:text-slate-400">
+                until {formatShortDateTime(device.currentBooking.endsAt)}
+              </span>
+            ) : null}
           </span>
         ) : (
-          <span className="text-slate-400 dark:text-slate-500">—</span>
+          <span className="text-slate-400 dark:text-slate-500">Free</span>
         ),
     },
     {
@@ -132,17 +171,20 @@ export function DevicesTab({ onInventoryChange }: { onInventoryChange?: () => vo
       hideLabelOnMobile: true,
       cell: (device) => (
         <span className="flex flex-wrap gap-2">
-          {device.status === 'ASSIGNED' && (
+          {device.status === 'NEEDS_INSPECTION' && (
             <Button
               variant="secondary"
               fullWidth={false}
               className="min-h-10 px-3 text-sm"
-              onClick={() => setPending({ kind: 'unassign', device })}
+              onClick={() => {
+                setNote('');
+                setPending({ kind: 'clear-inspection', device });
+              }}
             >
-              Unassign
+              Clear inspection
             </Button>
           )}
-          {device.status !== 'RETIRED' && (
+          {device.status !== 'RETIRED' && !device.currentBooking && (
             <Button
               variant="ghost"
               fullWidth={false}
@@ -170,7 +212,7 @@ export function DevicesTab({ onInventoryChange }: { onInventoryChange?: () => vo
             <Input
               label="Search"
               type="search"
-              placeholder="Serial, owner name or email"
+              placeholder="Serial number"
               value={search}
               maxLength={100}
               onChange={(event) => setSearch(event.target.value)}
@@ -188,8 +230,8 @@ export function DevicesTab({ onInventoryChange }: { onInventoryChange?: () => vo
               className="min-h-12 rounded-xl border border-slate-300 bg-white px-3 text-base text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
             >
               <option value="ALL">All</option>
-              <option value="UNASSIGNED">In stock</option>
-              <option value="ASSIGNED">Assigned</option>
+              <option value="AVAILABLE">In pool</option>
+              <option value="NEEDS_INSPECTION">Needs inspection</option>
               <option value="RETIRED">Retired</option>
             </select>
           </label>
@@ -207,18 +249,38 @@ export function DevicesTab({ onInventoryChange }: { onInventoryChange?: () => vo
 
       <ConfirmDialog
         open={pending !== null}
-        title={pending?.kind === 'retire' ? 'Retire this safe?' : 'Unassign this safe?'}
+        title={
+          pending?.kind === 'retire' ? 'Retire this safe?' : 'Return this safe to the pool?'
+        }
         description={
           pending?.kind === 'retire'
             ? `${pending?.device.serialNumber} will be taken permanently out of service. This cannot be undone from the panel.`
-            : `${pending?.device.serialNumber} will be returned to stock and ${pending?.device.owner?.name ?? 'its owner'} will lose access.`
+            : `Only do this once you have opened ${pending?.device.serialNumber} and confirmed it is empty. The next renter will be able to unlock whatever is inside.`
         }
-        confirmLabel={pending?.kind === 'retire' ? 'Retire safe' : 'Unassign safe'}
+        confirmLabel={pending?.kind === 'retire' ? 'Retire safe' : 'Return to pool'}
         destructive
         pending={acting}
+        confirmDisabled={pending?.kind === 'clear-inspection' && note.trim().length < 3}
         onConfirm={() => void runPendingAction()}
-        onCancel={() => setPending(null)}
-      />
+        onCancel={() => {
+          setPending(null);
+          setNote('');
+        }}
+      >
+        {/*
+          A required note, not an optional one. It is the only record that a
+          human actually looked, and it is audited.
+        */}
+        {pending?.kind === 'clear-inspection' ? (
+          <Input
+            label="What did you find?"
+            hint="Recorded in the audit log. At least 3 characters."
+            value={note}
+            maxLength={500}
+            onChange={(event) => setNote(event.target.value)}
+          />
+        ) : null}
+      </ConfirmDialog>
     </div>
   );
 }

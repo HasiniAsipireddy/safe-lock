@@ -28,27 +28,49 @@ import {
   RESET_CODE_LENGTH,
   RESET_CODE_MAX_ATTEMPTS,
   UNLOCK_FAILURE_LABELS,
+  bookingPricePaise,
   changePasswordBodySchema,
   classifyIdentifier,
+  clearInspectionSchema,
+  collectByFrom,
   confirmPhoneVerificationSchema,
+  createBookingSchema,
+  effectiveBookingStatus,
+  extendBookingSchema,
+  forceCompleteBookingSchema,
   forgotPasswordSchema,
+  formatInr,
   maskPhone,
   normaliseSerial,
   otpSchema,
+  overstayFeePaise,
+  overstayHourlyPaise,
+  overstayHoursAccrued,
   requestPhoneVerificationSchema,
+  reservedUntilFrom,
   resetPasswordBodySchema,
   serialNumberSchema,
   toNationalPhone,
+  unlockEligibility,
   updateProfileSchema,
+  waiveOverstaySchema,
   type AdminAuditRow,
+  type AdminBookingRow,
   type AdminDeviceRow,
   type AdminPaymentRow,
   type AdminUserRow,
   type ApiErrorBody,
   type AuthResponse,
+  type BookingCompletionReason,
+  type BookingOrderResponse,
+  type BookingQuote,
+  type BookingStatus,
+  type BookingSummary,
   type BulkCreateResult,
   type BulkCreateRowResult,
-  type CreateOrderResponse,
+  type CreateBookingResponse,
+  type CurrentBookingResponse,
+  type DeviceCurrentBooking,
   type DeviceEventType,
   type DeviceStatus,
   type DeviceSummary,
@@ -64,10 +86,12 @@ import {
   type NotificationsResponse,
   type Paginated,
   type PasswordResetResponse,
-  type PaymentMeResponse,
+  type PaymentPurpose,
+  type PaymentReviewReason,
   type PhoneVerificationRequestResponse,
   type PaymentSummary,
   type PublicUser,
+  type RateSnapshot,
   type UnlockConfirmResponse,
   type UnlockFailureReason,
   type UnlockRequestResponse,
@@ -79,15 +103,39 @@ import type { HttpMethod } from './api';
 const LATENCY_MS = 650;
 const SESSION_KEY = 'safelock.mock.session';
 
-/** Mock activation price in paise. Mirrors the API's SAFE_PRICE_PAISE default. */
-const MOCK_PRICE_PAISE = 99_900;
+/**
+ * The mock's rental config. Mirrors the API's env defaults.
+ *
+ * Snapshotted onto every mock booking exactly as the API snapshots it, so the
+ * UI exercises the same "a live booking is priced by its own rates" path — the
+ * one place where showing the current config instead would be a real bug.
+ */
+const MOCK_RATES: RateSnapshot = {
+  hourlyRatePaise: 10_000,
+  overstayMultiplierBps: 15_000,
+  graceMinutes: 15,
+  capHours: 24,
+  collectionWindowMinutes: 30,
+  currency: 'INR',
+};
+
+const MOCK_MIN_HOURS = 1;
+const MOCK_MAX_HOURS = 24;
+/** Mirrors BOOKING_HOLD_MINUTES. */
+const MOCK_HOLD_MINUTES = 10;
+/** Mirrors OVERSTAY_QUOTE_TTL_MINUTES. */
+const MOCK_QUOTE_TTL_MINUTES = 15;
+
+const MS_PER_HOUR = 60 * 60 * 1000;
+const MS_PER_MINUTE = 60 * 1000;
 
 /**
  * The only "signature" the mock verify endpoint accepts.
  *
  * It is not a real HMAC and could not pass the API's `timingSafeEqual` check —
- * it exists so the mock /pay flow exercises the same request shape as the real
- * one. The real signature is computed by Razorpay and checked server-side.
+ * it exists so the mock booking flow exercises the same request shape as the
+ * real one. The real signature is computed by Razorpay and checked
+ * server-side.
  */
 export const MOCK_CHECKOUT_SIGNATURE = '0'.repeat(64);
 
@@ -96,7 +144,14 @@ interface MockAccount {
   /** Mock-only, in memory, never persisted and never logged. */
   password: string;
   /** Payment attempts for this account, newest last. */
-  payments: PaymentSummary[];
+  payments: MockPayment[];
+}
+
+/** A mock Payment row. Every one belongs to a booking, as in the API. */
+interface MockPayment extends PaymentSummary {
+  quoteExpiresAt: string | null;
+  reviewReason: PaymentReviewReason | null;
+  reviewClearedAt: string | null;
 }
 
 const accounts: MockAccount[] = [
@@ -108,10 +163,8 @@ const accounts: MockAccount[] = [
       phone: '9876543210',
       role: 'USER',
       createdAt: new Date('2026-01-01T00:00:00.000Z').toISOString(),
-      // Starts unpaid so the /pay flow can be walked through end to end,
-      // and unverified so the phone-verification step can be too.
-      hasPaid: false,
-      deviceAllocated: false,
+      // Starts with no booking so the /book flow can be walked through end to
+      // end, and unverified so the phone-verification step can be too.
       phoneVerified: false,
     },
     password: 'Demo1234',
@@ -135,14 +188,14 @@ interface MockDevice {
   lockStateUpdatedAt: string | null;
   online: boolean;
   lastSeenAt: string | null;
-  ownerId: string | null;
-  allocatedAt: string | null;
+  inspectionNote: string | null;
+  inspectionNotedAt: string | null;
   createdAt: string;
 }
 
 /**
  * Seeded inventory so the admin panel has something to show in mock mode.
- * Two devices in stock, one already retired.
+ * Two safes bookable, one retired.
  */
 const devices: MockDevice[] = [
   makeMockDevice('SAFE-0001', 0),
@@ -154,16 +207,147 @@ function makeMockDevice(serialNumber: string, ageIndex: number): MockDevice {
   return {
     id: `dev_mock_${serialNumber.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
     serialNumber,
-    status: 'UNASSIGNED',
+    status: 'AVAILABLE',
     // Mirrors the API: a safe in stock is locked, not of unknown state.
     lockState: 'LOCKED',
     lockStateUpdatedAt: null,
     online: false,
     lastSeenAt: null,
-    ownerId: null,
-    allocatedAt: null,
-    // Older index = created earlier, so "next available" ordering is stable.
+    inspectionNote: null,
+    inspectionNotedAt: null,
+    // Older index = created earlier, so the "oldest available first" pick is
+    // stable.
     createdAt: new Date(Date.UTC(2026, 0, 1) + ageIndex * 60_000).toISOString(),
+  };
+}
+
+// --- Bookings (mock) ---------------------------------------------------------
+
+/**
+ * A mock `Booking` row.
+ *
+ * The rates are snapshotted on the row, like the API's. The mock has no
+ * exclusion constraint, so `pickMockDevice` does the overlap check itself —
+ * which is a limitation worth naming: the mock cannot demonstrate that
+ * concurrent booking is safe, only that the happy path works. That guarantee
+ * is tested against Postgres in the API suite, where it belongs.
+ */
+interface MockBooking {
+  id: string;
+  userId: string;
+  deviceId: string;
+  status: BookingStatus;
+  hours: number;
+  startsAt: string;
+  endsAt: string | null;
+  holdExpiresAt: string | null;
+  reservedUntil: string;
+  pricePaise: number;
+  currency: string;
+  rates: RateSnapshot;
+  overstaySettledAt: string | null;
+  overstayPaidPaise: number;
+  overstayWaivedAt: string | null;
+  completedAt: string | null;
+  completionReason: BookingCompletionReason | null;
+  adminNote: string | null;
+  createdAt: string;
+}
+
+const bookings: MockBooking[] = [];
+let bookingSequence = 0;
+
+const OCCUPYING: BookingStatus[] = ['PENDING_PAYMENT', 'ACTIVE', 'OVERSTAY'];
+
+/**
+ * The status the clock says a mock booking is in.
+ *
+ * The same derivation the API does, from the same shared function, for the
+ * same reason: a client that branched on the stored status would show a lapsed
+ * hold as a live booking, because there is no sweeper in mock mode at all.
+ */
+function mockEffectiveStatus(booking: MockBooking, now = new Date()): BookingStatus {
+  return effectiveBookingStatus({
+    status: booking.status,
+    endsAt: booking.endsAt ? new Date(booking.endsAt) : null,
+    holdExpiresAt: booking.holdExpiresAt ? new Date(booking.holdExpiresAt) : null,
+    overstaySettledAt: booking.overstaySettledAt
+      ? new Date(booking.overstaySettledAt)
+      : booking.overstayWaivedAt
+        ? new Date(booking.overstayWaivedAt)
+        : null,
+    snapshot: booking.rates,
+    now,
+  });
+}
+
+/** The fee outstanding on a mock booking right now. Zero once settled. */
+function mockOutstandingFee(booking: MockBooking, now = new Date()): number {
+  if (booking.overstaySettledAt || booking.overstayWaivedAt) return 0;
+  if (!booking.endsAt) return 0;
+  return overstayFeePaise(booking.rates, new Date(booking.endsAt), now);
+}
+
+/** The caller's live booking, by effective status rather than stored status. */
+function liveBookingFor(userId: string): MockBooking | null {
+  const candidate = bookings
+    .filter((row) => row.userId === userId && OCCUPYING.includes(row.status))
+    .at(-1);
+
+  if (!candidate) return null;
+
+  const effective = mockEffectiveStatus(candidate);
+  if (effective === 'EXPIRED_UNPAID' || effective === 'COMPLETED') return null;
+
+  return candidate;
+}
+
+function mockDeviceFor(booking: MockBooking): MockDevice | undefined {
+  return devices.find((device) => device.id === booking.deviceId);
+}
+
+function toMockBookingSummary(booking: MockBooking, now = new Date()): BookingSummary {
+  const device = mockDeviceFor(booking);
+  const settledAt = booking.overstaySettledAt ?? booking.overstayWaivedAt;
+
+  return {
+    id: booking.id,
+    status: booking.status,
+    effectiveStatus: mockEffectiveStatus(booking, now),
+    serialNumber: device?.serialNumber ?? 'UNKNOWN',
+    deviceId: booking.deviceId,
+    startsAt: booking.startsAt,
+    endsAt: booking.endsAt,
+    holdExpiresAt: booking.holdExpiresAt,
+    hours: booking.hours,
+    pricePaise: booking.pricePaise,
+    currency: booking.currency,
+    rates: booking.rates,
+    overstayFeePaise: mockOutstandingFee(booking, now),
+    overstayHours: booking.endsAt
+      ? overstayHoursAccrued(booking.rates, new Date(booking.endsAt), now)
+      : 0,
+    overstaySettledAt: booking.overstaySettledAt,
+    collectBy: settledAt
+      ? collectByFrom(booking.rates, new Date(settledAt)).toISOString()
+      : null,
+    completionReason: booking.completionReason,
+    createdAt: booking.createdAt,
+  };
+}
+
+function mockQuote(): BookingQuote {
+  const options: Array<{ hours: number; pricePaise: number }> = [];
+  for (let hours = MOCK_MIN_HOURS; hours <= MOCK_MAX_HOURS; hours += 1) {
+    options.push({ hours, pricePaise: bookingPricePaise(MOCK_RATES, hours) });
+  }
+
+  return {
+    rates: MOCK_RATES,
+    minHours: MOCK_MIN_HOURS,
+    maxHours: MOCK_MAX_HOURS,
+    options,
+    overstayHourlyPaise: overstayHourlyPaise(MOCK_RATES),
   };
 }
 
@@ -363,10 +547,6 @@ export async function mockRequest<T>(
       return handleMockRequestPhoneVerification(body) as T;
     case 'POST /account/phone/confirm':
       return handleMockConfirmPhoneVerification(body) as T;
-    case 'GET /payments/me':
-      return handlePaymentMe() as T;
-    case 'POST /payments/order':
-      return handleCreateOrder() as T;
     case 'POST /payments/verify':
       return handleVerifyPayment(body) as T;
     case 'GET /devices/mine':
@@ -383,14 +563,18 @@ export async function mockRequest<T>(
       return handleMockUnlockRequest() as T;
     case 'POST /devices/unlock/confirm':
       return handleMockUnlockConfirm(body) as T;
+    case 'GET /bookings/current':
+      return handleMockCurrentBooking() as T;
+    case 'POST /bookings':
+      return handleMockCreateBooking(body) as T;
     case 'GET /admin/devices':
       return handleAdminDevices(query) as T;
     case 'POST /admin/devices':
       return handleAdminCreateDevice(body) as T;
     case 'POST /admin/devices/bulk':
       return handleAdminBulkCreate(body) as T;
-    case 'POST /admin/allocate-next':
-      return handleAdminAllocate(body, undefined) as T;
+    case 'GET /admin/bookings':
+      return handleAdminBookings(query) as T;
     case 'GET /admin/users':
       return handleAdminUsers(query) as T;
     case 'GET /admin/payments':
@@ -401,14 +585,45 @@ export async function mockRequest<T>(
       break;
   }
 
-  // Parameterised admin device routes.
-  const deviceAction = /^\/admin\/devices\/([^/]+)\/(allocate|unassign|retire)$/.exec(pathname);
-  if (method === 'POST' && deviceAction) {
-    const [, deviceId, action] = deviceAction as unknown as [string, string, string];
+  // Parameterised booking routes.
+  const bookingAction =
+    /^\/bookings\/([^/]+)(?:\/(order|extend\/order|overstay\/order|collect|cancel))?$/.exec(
+      pathname,
+    );
+  if (bookingAction) {
+    const [, bookingId = '', action] = bookingAction;
 
-    if (action === 'allocate') return handleAdminAllocate(body, deviceId) as T;
-    if (action === 'unassign') return handleAdminUnassign(deviceId) as T;
+    if (method === 'GET' && !action) return handleMockGetBooking(bookingId) as T;
+    if (method === 'POST') {
+      if (action === 'order') return handleMockBookingOrder(bookingId) as T;
+      if (action === 'extend/order') return handleMockExtensionOrder(bookingId, body) as T;
+      if (action === 'overstay/order') return handleMockOverstayOrder(bookingId) as T;
+      if (action === 'collect') return handleMockCollect(bookingId) as T;
+      if (action === 'cancel') return handleMockCancel(bookingId) as T;
+    }
+  }
+
+  // Parameterised admin routes.
+  const deviceAction = /^\/admin\/devices\/([^/]+)\/(clear-inspection|retire)$/.exec(pathname);
+  if (method === 'POST' && deviceAction) {
+    const [, deviceId = '', action] = deviceAction;
+
+    if (action === 'clear-inspection') return handleAdminClearInspection(deviceId, body) as T;
     return handleAdminRetire(deviceId) as T;
+  }
+
+  const adminBookingAction =
+    /^\/admin\/bookings\/([^/]+)\/(force-complete|waive-overstay)$/.exec(pathname);
+  if (method === 'POST' && adminBookingAction) {
+    const [, bookingId = '', action] = adminBookingAction;
+
+    if (action === 'force-complete') return handleAdminForceComplete(bookingId, body) as T;
+    return handleAdminWaiveOverstay(bookingId, body) as T;
+  }
+
+  const paymentReview = /^\/admin\/payments\/([^/]+)\/clear-review$/.exec(pathname);
+  if (method === 'POST' && paymentReview) {
+    return handleAdminClearReview(paymentReview[1] ?? '', body) as T;
   }
 
   return fail(
@@ -486,8 +701,6 @@ function handleSignup(body: unknown): AuthResponse {
     phone,
     role: 'USER',
     createdAt: new Date().toISOString(),
-    hasPaid: false,
-    deviceAllocated: false,
     phoneVerified: false,
   };
 
@@ -886,45 +1099,157 @@ function handleMockConfirmPhoneVerification(body: unknown): AuthResponse {
   return { user: account.user };
 }
 
-// --- Payments ----------------------------------------------------------------
+// --- Bookings ----------------------------------------------------------------
 
-function latestPayment(account: MockAccount): PaymentSummary | null {
-  return account.payments.at(-1) ?? null;
-}
-
-function handlePaymentMe(): PaymentMeResponse {
+function handleMockCurrentBooking(): CurrentBookingResponse {
   const account = requireAccount();
+  const live = liveBookingFor(account.user.id);
 
   return {
-    hasPaid: account.user.hasPaid,
-    payment: latestPayment(account),
-    priceInPaise: MOCK_PRICE_PAISE,
-    currency: 'INR',
+    booking: live ? toMockBookingSummary(live) : null,
+    quote: mockQuote(),
   };
 }
 
-function handleCreateOrder(): CreateOrderResponse {
+function handleMockGetBooking(bookingId: string): { booking: BookingSummary } {
   const account = requireAccount();
+  const booking = requireMockBooking(bookingId, account.user.id);
 
-  if (account.user.hasPaid) {
+  return { booking: toMockBookingSummary(booking) };
+}
+
+/**
+ * Ownership folded into the not-found answer.
+ *
+ * A booking belonging to someone else must not be distinguishable from one
+ * that does not exist, exactly as in the API.
+ */
+function requireMockBooking(bookingId: string, userId: string): MockBooking {
+  const booking = bookings.find((row) => row.id === bookingId);
+  if (!booking || booking.userId !== userId) {
+    return fail(404, ERROR_CODES.BOOKING_NOT_FOUND, 'No booking with that id.');
+  }
+  return booking;
+}
+
+/**
+ * Picks a bookable safe for a window.
+ *
+ * The mock's stand-in for `FOR UPDATE SKIP LOCKED` plus the exclusion
+ * constraint. It can only be an approximation: there is no concurrency in a
+ * single browser tab, so this demonstrates the rule rather than enforcing it.
+ */
+function pickMockDevice(from: Date, until: Date): MockDevice | undefined {
+  return devices
+    .filter((device) => device.status === 'AVAILABLE')
+    .filter(
+      (device) =>
+        !bookings.some(
+          (booking) =>
+            booking.deviceId === device.id &&
+            OCCUPYING.includes(booking.status) &&
+            new Date(booking.startsAt).getTime() < until.getTime() &&
+            new Date(booking.reservedUntil).getTime() > from.getTime(),
+        ),
+    )
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+}
+
+function handleMockCreateBooking(body: unknown): CreateBookingResponse {
+  const account = requireAccount();
+  const input = (body ?? {}) as { hours?: unknown };
+
+  const parsed = createBookingSchema.safeParse({ hours: input.hours });
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Choose how long you need the safe for.',
+    );
+  }
+  const { hours } = parsed.data;
+
+  if (liveBookingFor(account.user.id)) {
     return fail(
       409,
-      ERROR_CODES.ALREADY_PAID,
-      'This account has already been activated. No further payment is needed.',
+      ERROR_CODES.BOOKING_ALREADY_EXISTS,
+      'You already have a booking. Collect your items and complete it before booking again.',
     );
   }
 
+  const now = new Date();
+  // `endsAt` stays null until the money lands, so the hold reserves the whole
+  // intended window from a *provisional* end.
+  const provisionalEnd = new Date(now.getTime() + hours * MS_PER_HOUR);
+  const reservedUntil = reservedUntilFrom(MOCK_RATES, provisionalEnd);
+
+  const device = pickMockDevice(now, reservedUntil);
+  if (!device) {
+    return fail(
+      409,
+      ERROR_CODES.NO_DEVICES_AVAILABLE,
+      'Every safe is booked for that period. Please try a shorter booking or come back later.',
+    );
+  }
+
+  bookingSequence += 1;
+  const booking: MockBooking = {
+    id: `bkg_mock_${bookingSequence}`,
+    userId: account.user.id,
+    deviceId: device.id,
+    status: 'PENDING_PAYMENT',
+    hours,
+    startsAt: now.toISOString(),
+    endsAt: null,
+    holdExpiresAt: new Date(now.getTime() + MOCK_HOLD_MINUTES * MS_PER_MINUTE).toISOString(),
+    reservedUntil: reservedUntil.toISOString(),
+    pricePaise: bookingPricePaise(MOCK_RATES, hours),
+    currency: MOCK_RATES.currency,
+    rates: MOCK_RATES,
+    overstaySettledAt: null,
+    overstayPaidPaise: 0,
+    overstayWaivedAt: null,
+    completedAt: null,
+    completionReason: null,
+    adminNote: null,
+    createdAt: now.toISOString(),
+  };
+  bookings.push(booking);
+
+  recordAudit('booking.created', {
+    userId: account.user.id,
+    deviceId: device.id,
+    metadata: { bookingId: booking.id, hours, pricePaise: booking.pricePaise },
+  });
+
+  return { booking: toMockBookingSummary(booking) };
+}
+
+/** Builds a mock order row and the Checkout payload for it. */
+function createMockOrder(input: {
+  account: MockAccount;
+  bookingId: string;
+  purpose: PaymentPurpose;
+  amount: number;
+  quoteExpiresAt: string | null;
+}): BookingOrderResponse {
   const suffix = Math.random().toString(36).slice(2, 12);
-  const payment: PaymentSummary = {
+
+  const payment: MockPayment = {
     id: `pay_row_mock_${suffix}`,
-    amount: MOCK_PRICE_PAISE,
-    currency: 'INR',
+    amount: input.amount,
+    currency: MOCK_RATES.currency,
     status: 'CREATED',
     razorpayOrderId: `order_mock${suffix}`,
     createdAt: new Date().toISOString(),
     paidAt: null,
+    purpose: input.purpose,
+    bookingId: input.bookingId,
+    quoteExpiresAt: input.quoteExpiresAt,
+    reviewReason: null,
+    reviewClearedAt: null,
   };
-  account.payments.push(payment);
+  input.account.payments.push(payment);
 
   return {
     orderId: payment.razorpayOrderId,
@@ -934,9 +1259,250 @@ function handleCreateOrder(): CreateOrderResponse {
     // the key *secret* exists only on the server in either mode.
     keyId: 'rzp_test_mock_key_id',
     paymentId: payment.id,
+    purpose: input.purpose,
+    quoteExpiresAt: input.quoteExpiresAt,
   };
 }
 
+function handleMockBookingOrder(bookingId: string): BookingOrderResponse {
+  const account = requireAccount();
+  const booking = requireMockBooking(bookingId, account.user.id);
+
+  if (booking.status !== 'PENDING_PAYMENT') {
+    return fail(409, ERROR_CODES.BOOKING_STATE_INVALID, 'This booking is not awaiting payment.');
+  }
+
+  if (mockEffectiveStatus(booking) === 'EXPIRED_UNPAID') {
+    return fail(
+      409,
+      ERROR_CODES.BOOKING_STATE_INVALID,
+      'This booking’s hold has expired. Please book again.',
+    );
+  }
+
+  return createMockOrder({
+    account,
+    bookingId: booking.id,
+    purpose: 'BOOKING',
+    amount: booking.pricePaise,
+    quoteExpiresAt: null,
+  });
+}
+
+function handleMockExtensionOrder(bookingId: string, body: unknown): BookingOrderResponse {
+  const account = requireAccount();
+  const booking = requireMockBooking(bookingId, account.user.id);
+
+  const input = (body ?? {}) as { hours?: unknown };
+  const parsed = extendBookingSchema.safeParse({ hours: input.hours });
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Choose how many hours to add.',
+    );
+  }
+
+  if (!booking.endsAt || (booking.status !== 'ACTIVE' && booking.status !== 'OVERSTAY')) {
+    return fail(
+      409,
+      ERROR_CODES.BOOKING_STATE_INVALID,
+      'Only a paid, running booking can be extended.',
+    );
+  }
+
+  // Allowed during the grace period; refused once a fee is actually owed.
+  if (mockOutstandingFee(booking) > 0) {
+    return fail(
+      409,
+      ERROR_CODES.EXTENSION_NOT_AVAILABLE,
+      'An overstay fee is outstanding, so this booking cannot be extended. Pay the fee and collect your items.',
+    );
+  }
+
+  if (booking.overstaySettledAt || booking.overstayWaivedAt) {
+    return fail(
+      409,
+      ERROR_CODES.EXTENSION_NOT_AVAILABLE,
+      'This booking is in its collection window and cannot be extended.',
+    );
+  }
+
+  const newEndsAt = new Date(new Date(booking.endsAt).getTime() + parsed.data.hours * MS_PER_HOUR);
+  const newReservedUntil = reservedUntilFrom(booking.rates, newEndsAt);
+
+  const clash = bookings.some(
+    (other) =>
+      other.id !== booking.id &&
+      other.deviceId === booking.deviceId &&
+      OCCUPYING.includes(other.status) &&
+      new Date(other.startsAt).getTime() < newReservedUntil.getTime() &&
+      new Date(other.reservedUntil).getTime() > new Date(booking.startsAt).getTime(),
+  );
+
+  if (clash) {
+    return fail(
+      409,
+      ERROR_CODES.EXTENSION_NOT_AVAILABLE,
+      'This safe is booked by someone else after you, so it cannot be extended.',
+    );
+  }
+
+  return createMockOrder({
+    account,
+    bookingId: booking.id,
+    purpose: 'EXTENSION',
+    // Priced from the booking's snapshot, never the live config.
+    amount: bookingPricePaise(booking.rates, parsed.data.hours),
+    quoteExpiresAt: null,
+  });
+}
+
+function handleMockOverstayOrder(bookingId: string): BookingOrderResponse {
+  const account = requireAccount();
+  const booking = requireMockBooking(bookingId, account.user.id);
+
+  const fee = mockOutstandingFee(booking);
+  if (fee <= 0) {
+    return fail(
+      409,
+      ERROR_CODES.NOTHING_TO_PAY,
+      'There is no overstay fee outstanding on this booking.',
+    );
+  }
+
+  const quoteExpiresAt = new Date(
+    Date.now() + MOCK_QUOTE_TTL_MINUTES * MS_PER_MINUTE,
+  ).toISOString();
+
+  return createMockOrder({
+    account,
+    bookingId: booking.id,
+    purpose: 'OVERSTAY',
+    amount: fee,
+    quoteExpiresAt,
+  });
+}
+
+function handleMockCollect(bookingId: string): { booking: BookingSummary } {
+  const account = requireAccount();
+  const booking = requireMockBooking(bookingId, account.user.id);
+
+  const effective = mockEffectiveStatus(booking);
+  if (effective !== 'ACTIVE' && effective !== 'OVERSTAY') {
+    return fail(
+      409,
+      ERROR_CODES.BOOKING_STATE_INVALID,
+      'This booking is not running, so there is nothing to collect.',
+    );
+  }
+
+  /**
+   * Refused while a fee is owed, like the API.
+   *
+   * The fee is the product's only leverage, and letting someone take their
+   * things while owing it would discard it.
+   */
+  const fee = mockOutstandingFee(booking);
+  if (fee > 0) {
+    return fail(
+      402,
+      ERROR_CODES.OVERSTAY_PAYMENT_REQUIRED,
+      `An overstay fee of ${formatInr(fee)} is outstanding. Pay it to unlock and collect your items.`,
+    );
+  }
+
+  completeMockBooking(booking, 'COLLECTED', { needsInspection: false });
+
+  recordAudit('booking.collected', {
+    userId: account.user.id,
+    deviceId: booking.deviceId,
+    metadata: { bookingId: booking.id },
+  });
+
+  return { booking: toMockBookingSummary(booking) };
+}
+
+function handleMockCancel(bookingId: string): { booking: BookingSummary } {
+  const account = requireAccount();
+  const booking = requireMockBooking(bookingId, account.user.id);
+
+  if (booking.status !== 'PENDING_PAYMENT') {
+    return fail(409, ERROR_CODES.BOOKING_STATE_INVALID, 'Only an unpaid booking can be cancelled.');
+  }
+
+  const now = new Date().toISOString();
+  booking.status = 'CANCELLED';
+  booking.completedAt = now;
+  booking.reservedUntil = now;
+
+  recordAudit('booking.cancelled', {
+    userId: account.user.id,
+    deviceId: booking.deviceId,
+    metadata: { bookingId: booking.id },
+  });
+
+  return { booking: toMockBookingSummary(booking) };
+}
+
+/**
+ * Ends a booking and decides what happens to the safe.
+ *
+ * **Only `COLLECTED` returns it to the pool.** The other two reasons mean the
+ * booking ended with the contents unknown, and a safe whose contents are
+ * unknown must not be handed to the next renter — who would be able to unlock
+ * it. Mirrors the API exactly, because this is the rule most worth being able
+ * to see working in the clickable version.
+ */
+function completeMockBooking(
+  booking: MockBooking,
+  reason: BookingCompletionReason,
+  options: { needsInspection?: boolean; adminNote?: string } = {},
+): void {
+  const now = new Date().toISOString();
+  const needsInspection = options.needsInspection ?? reason !== 'COLLECTED';
+
+  booking.status = 'COMPLETED';
+  booking.completedAt = now;
+  booking.completionReason = reason;
+  booking.reservedUntil = now;
+  if (options.adminNote) booking.adminNote = options.adminNote;
+
+  const device = mockDeviceFor(booking);
+  if (device) {
+    if (needsInspection) {
+      device.status = 'NEEDS_INSPECTION';
+      device.inspectionNote =
+        reason === 'COLLECTION_WINDOW_LAPSED'
+          ? 'Collection window lapsed with no confirmation — check for belongings'
+          : (options.adminNote ?? 'Force-completed by an admin — check for belongings');
+      device.inspectionNotedAt = now;
+    } else {
+      device.status = 'AVAILABLE';
+      device.inspectionNote = null;
+      device.inspectionNotedAt = null;
+    }
+
+    // The safe is commanded locked after a booking ends.
+    device.lockState = 'LOCKED';
+    device.lockStateUpdatedAt = now;
+  }
+
+  // Any open unlock code dies with the booking.
+  if (mockChallenge && mockChallenge.userId === booking.userId) {
+    mockChallenge.consumed = true;
+  }
+}
+
+// --- Payments ----------------------------------------------------------------
+
+/**
+ * Verifies a mock Checkout callback and applies it to its booking.
+ *
+ * The two halves land together, as they do in the API's transaction: a booking
+ * is never active without the money, and money is never taken without either
+ * an effect or a review flag.
+ */
 function handleVerifyPayment(body: unknown): VerifyPaymentResponse {
   const account = requireAccount();
   const input = (body ?? {}) as {
@@ -959,7 +1525,7 @@ function handleVerifyPayment(body: unknown): VerifyPaymentResponse {
 
   // Idempotent, like the API: a repeat call returns the settled row.
   if (payment.status === 'PAID') {
-    return { payment, hasPaid: true };
+    return { payment, needsReview: payment.reviewReason !== null };
   }
 
   if (input.razorpay_signature !== MOCK_CHECKOUT_SIGNATURE) {
@@ -972,23 +1538,167 @@ function handleVerifyPayment(body: unknown): VerifyPaymentResponse {
 
   payment.status = 'PAID';
   payment.paidAt = new Date().toISOString();
-  // hasPaid is derived from payments on the server; the mock mirrors that by
-  // updating the user object the UI reads.
-  account.user = { ...account.user, hasPaid: true };
 
-  return { payment, hasPaid: true };
+  const needsReview = applyMockPayment(account, payment);
+
+  return { payment, needsReview };
+}
+
+/**
+ * Applies a captured mock payment. Returns true when it had to be flagged.
+ *
+ * A flagged payment **stays PAID** — the mock does not rewrite history either —
+ * and shows up on the admin refund queue, so the "we took your money and could
+ * not use it" path is clickable rather than theoretical.
+ */
+function applyMockPayment(account: MockAccount, payment: MockPayment): boolean {
+  const booking = bookings.find((row) => row.id === payment.bookingId);
+
+  const flag = (reason: PaymentReviewReason): boolean => {
+    payment.reviewReason = reason;
+    recordAudit('payment.needs_review', {
+      userId: account.user.id,
+      metadata: { paymentRowId: payment.id, purpose: payment.purpose, reason },
+    });
+    return true;
+  };
+
+  if (!booking) return flag('BOOKING_NO_LONGER_PAYABLE');
+
+  if (payment.purpose === 'BOOKING') {
+    if (booking.status === 'ACTIVE' || booking.status === 'OVERSTAY') return false;
+
+    if (booking.status === 'CANCELLED' || booking.status === 'COMPLETED') {
+      return flag('BOOKING_NO_LONGER_PAYABLE');
+    }
+
+    const now = new Date();
+    const endsAt = new Date(now.getTime() + booking.hours * MS_PER_HOUR);
+    const reservedUntil = reservedUntilFrom(booking.rates, endsAt);
+
+    /**
+     * The safe may have gone to someone else while the hold was lapsing, and
+     * an admin may have retired it or flagged it for inspection.
+     */
+    const taken = bookings.some(
+      (other) =>
+        other.id !== booking.id &&
+        other.deviceId === booking.deviceId &&
+        OCCUPYING.includes(other.status) &&
+        new Date(other.startsAt).getTime() < reservedUntil.getTime() &&
+        new Date(other.reservedUntil).getTime() > now.getTime(),
+    );
+    const device = mockDeviceFor(booking);
+
+    if (taken || device?.status !== 'AVAILABLE') {
+      return flag('BOOKING_EXPIRED_DEVICE_TAKEN');
+    }
+
+    // The clock starts here, not at creation.
+    booking.status = 'ACTIVE';
+    booking.startsAt = now.toISOString();
+    booking.endsAt = endsAt.toISOString();
+    booking.reservedUntil = reservedUntil.toISOString();
+    booking.holdExpiresAt = null;
+
+    recordAudit('booking.activated', {
+      userId: account.user.id,
+      deviceId: booking.deviceId,
+      metadata: { bookingId: booking.id, hours: booking.hours },
+    });
+
+    // Mock-only: gives /history something to page through immediately. The
+    // real API has no equivalent — a new renter's history starts empty.
+    const serial = mockDeviceFor(booking)?.serialNumber;
+    if (serial) seedMockHistory(account.user.id, serial);
+
+    return false;
+  }
+
+  if (payment.purpose === 'EXTENSION') {
+    if (booking.status !== 'ACTIVE' && booking.status !== 'OVERSTAY') {
+      return flag('BOOKING_NO_LONGER_PAYABLE');
+    }
+    if (mockOutstandingFee(booking) > 0) return flag('BOOKING_NO_LONGER_PAYABLE');
+    if (!booking.endsAt) return flag('BOOKING_NO_LONGER_PAYABLE');
+
+    const hours = Math.round(payment.amount / booking.rates.hourlyRatePaise);
+    if (hours < 1) return flag('BOOKING_NO_LONGER_PAYABLE');
+
+    const newEndsAt = new Date(new Date(booking.endsAt).getTime() + hours * MS_PER_HOUR);
+    booking.hours += hours;
+    booking.endsAt = newEndsAt.toISOString();
+    booking.reservedUntil = reservedUntilFrom(booking.rates, newEndsAt).toISOString();
+    booking.pricePaise += payment.amount;
+    booking.status = 'ACTIVE';
+
+    recordAudit('booking.extended', {
+      userId: account.user.id,
+      deviceId: booking.deviceId,
+      metadata: { bookingId: booking.id, hours },
+    });
+    return false;
+  }
+
+  // OVERSTAY.
+  if (booking.overstaySettledAt || booking.overstayWaivedAt) return false;
+  if (booking.status === 'COMPLETED' || booking.status === 'CANCELLED') {
+    return flag('BOOKING_NO_LONGER_PAYABLE');
+  }
+
+  const now = new Date();
+  const feeNow = mockOutstandingFee(booking, now);
+  const quoteExpired =
+    payment.quoteExpiresAt !== null && now.getTime() > new Date(payment.quoteExpiresAt).getTime();
+
+  /**
+   * An expired quote whose fee has outgrown it is **not settled**.
+   *
+   * Settling would quietly accept less than is owed and open the collection
+   * window on a part payment. The money is flagged and the user is told to ask
+   * for a fresh quote.
+   */
+  if (quoteExpired && feeNow > payment.amount) {
+    return flag('OVERSTAY_QUOTE_EXPIRED');
+  }
+
+  // Accrual stops at capture; growth during the checkout is absorbed.
+  booking.status = 'OVERSTAY';
+  booking.overstaySettledAt = now.toISOString();
+  booking.overstayPaidPaise += payment.amount;
+
+  recordAudit('booking.overstay.settled', {
+    userId: account.user.id,
+    deviceId: booking.deviceId,
+    metadata: {
+      bookingId: booking.id,
+      paidPaise: payment.amount,
+      absorbedPaise: Math.max(0, feeNow - payment.amount),
+    },
+  });
+
+  return false;
 }
 
 // --- Devices -----------------------------------------------------------------
 
-function deviceOwner(device: MockDevice): { id: string; name: string; email: string } | null {
-  if (!device.ownerId) return null;
-  const account = accounts.find((candidate) => candidate.user.id === device.ownerId);
+/** The live booking occupying a safe, for the admin device row. */
+function mockDeviceBooking(device: MockDevice): DeviceCurrentBooking | null {
+  const booking = bookings
+    .filter((row) => row.deviceId === device.id && OCCUPYING.includes(row.status))
+    .at(-1);
+
+  if (!booking) return null;
+
+  const account = accounts.find((candidate) => candidate.user.id === booking.userId);
   if (!account) return null;
+
   return {
-    id: account.user.id,
-    name: account.user.name,
-    email: account.user.email,
+    id: booking.id,
+    status: booking.status,
+    effectiveStatus: mockEffectiveStatus(booking),
+    endsAt: booking.endsAt,
+    user: { id: account.user.id, name: account.user.name, email: account.user.email },
   };
 }
 
@@ -1002,9 +1712,10 @@ function toAdminDevice(device: MockDevice): AdminDeviceRow {
     lockStateUpdatedAt: device.lockStateUpdatedAt,
     online: device.online,
     lastSeenAt: device.lastSeenAt,
-    allocatedAt: device.allocatedAt,
     createdAt: device.createdAt,
-    owner: deviceOwner(device),
+    currentBooking: mockDeviceBooking(device),
+    inspectionNote: device.inspectionNote,
+    inspectionNotedAt: device.inspectionNotedAt,
   };
 }
 
@@ -1022,27 +1733,20 @@ function paginateMock<T>(items: T[], query: URLSearchParams): Paginated<T> {
   };
 }
 
-/** Recomputes `deviceAllocated` on the cached user object the UI reads. */
-function syncAllocationFlag(userId: string): void {
-  const account = accounts.find((candidate) => candidate.user.id === userId);
-  if (!account) return;
-
-  const owns = devices.some((device) => device.ownerId === userId);
-  account.user = { ...account.user, deviceAllocated: owns };
-}
-
+/**
+ * The safe the caller currently has, or null between bookings.
+ *
+ * No eligibility gate — `requirePaid` is gone — and null during
+ * `PENDING_PAYMENT`, because a held safe is not yet one you can operate.
+ */
 function handleMyDevice(): MyDeviceResponse {
   const account = requireAccount();
+  const booking = liveBookingFor(account.user.id);
 
-  // Same gate as the real API's requirePaid on this route.
-  if (!account.user.hasPaid) {
-    return fail(402, ERROR_CODES.PAYMENT_REQUIRED, 'Complete your payment to activate your safe.');
-  }
+  if (!booking || booking.status === 'PENDING_PAYMENT') return { device: null };
 
-  const device = devices.find((candidate) => candidate.ownerId === account.user.id);
-  if (!device) return { device: null };
-
-  return { device: toDeviceSummary(device) };
+  const device = mockDeviceFor(booking);
+  return { device: device ? toDeviceSummary(device) : null };
 }
 
 function toDeviceSummary(device: MockDevice): DeviceSummary {
@@ -1053,7 +1757,6 @@ function toDeviceSummary(device: MockDevice): DeviceSummary {
     lockStateUpdatedAt: device.lockStateUpdatedAt,
     online: device.online,
     lastSeenAt: device.lastSeenAt,
-    allocatedAt: device.allocatedAt,
   };
 }
 
@@ -1088,29 +1791,66 @@ export function peekMockUnlockCode(): string | null {
   return mockChallenge.code;
 }
 
-/** Mirrors assertCanOperate, including the order the states are checked in. */
-function requireOperableDevice(): { account: MockAccount; device: MockDevice } {
+/**
+ * Mirrors `assertCanOperate`, including the order the checks run in.
+ *
+ * Phone verification comes first because it is the one thing a user can fix at
+ * any moment, including with no booking at all. Then the booking, derived from
+ * the clock. Then any outstanding fee — which refuses **unlock only**: locking
+ * stays available, because refusing to let someone secure a safe they are
+ * standing at would punish them in the one direction that creates risk.
+ */
+function requireOperableDevice(
+  options: { requirePhoneVerified?: boolean; requireUnlockable?: boolean } = {},
+): { account: MockAccount; device: MockDevice; booking: MockBooking } {
   const account = requireAccount();
-  const device = devices.find((candidate) => candidate.ownerId === account.user.id);
 
-  if (!account.user.hasPaid) {
-    if (device) {
-      return fail(
-        403,
-        ERROR_CODES.REFUNDED_CONTACT_SUPPORT,
-        'Your payment was refunded, so remote access is disabled. Please contact support about returning your safe.',
-      );
-    }
-    return fail(402, ERROR_CODES.NOT_PAID, 'Complete your payment to activate your safe.');
-  }
-
-  if (!device || device.status !== 'ASSIGNED') {
+  if (options.requirePhoneVerified && !account.user.phoneVerified) {
     return fail(
-      409,
-      ERROR_CODES.NO_DEVICE,
-      'No safe is allocated to your account yet. You will be notified once one is assigned.',
+      403,
+      ERROR_CODES.PHONE_NOT_VERIFIED,
+      'Verify your phone number before unlocking your safe — that is where your one-time code is sent.',
     );
   }
+
+  const booking = liveBookingFor(account.user.id);
+  const noBooking = () =>
+    fail(
+      409,
+      ERROR_CODES.NO_ACTIVE_BOOKING,
+      'You have no running booking. Book a safe to use one.',
+    );
+
+  if (!booking || booking.status === 'PENDING_PAYMENT') return noBooking();
+
+  if (options.requireUnlockable) {
+    const eligibility = unlockEligibility({
+      status: booking.status,
+      endsAt: booking.endsAt ? new Date(booking.endsAt) : null,
+      holdExpiresAt: booking.holdExpiresAt ? new Date(booking.holdExpiresAt) : null,
+      overstaySettledAt: booking.overstaySettledAt
+        ? new Date(booking.overstaySettledAt)
+        : booking.overstayWaivedAt
+          ? new Date(booking.overstayWaivedAt)
+          : null,
+      snapshot: booking.rates,
+      now: new Date(),
+    });
+
+    if (!eligibility.allowed) {
+      if (eligibility.reason === 'OVERSTAY_FEE_DUE') {
+        return fail(
+          402,
+          ERROR_CODES.OVERSTAY_PAYMENT_REQUIRED,
+          `An overstay fee of ${formatInr(mockOutstandingFee(booking))} is outstanding. Pay it to unlock your safe and collect your items.`,
+        );
+      }
+      return noBooking();
+    }
+  }
+
+  const device = mockDeviceFor(booking);
+  if (!device) return noBooking();
 
   if (device.lockState === 'UNKNOWN') {
     return fail(
@@ -1120,7 +1860,7 @@ function requireOperableDevice(): { account: MockAccount; device: MockDevice } {
     );
   }
 
-  return { account, device };
+  return { account, device, booking };
 }
 
 function handleMockLock(): LockResponse {
@@ -1465,21 +2205,19 @@ function handleAdminDevices(query: URLSearchParams): Paginated<AdminDeviceRow> {
   requireAdminAccount();
 
   const status = query.get('status');
+  const occupied = query.get('occupied');
   const q = (query.get('q') ?? '').trim().toLowerCase();
 
   const filtered = devices
     .filter((device) => (status ? device.status === status : true))
-    .filter((device) => {
-      if (!q) return true;
-      const owner = deviceOwner(device);
-      return (
-        device.serialNumber.toLowerCase().includes(q) ||
-        (owner?.name.toLowerCase().includes(q) ?? false) ||
-        (owner?.email.toLowerCase().includes(q) ?? false)
-      );
-    })
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .map(toAdminDevice);
+    .map(toAdminDevice)
+    .filter((row) =>
+      occupied === null ? true : (row.currentBooking !== null) === (occupied === 'true'),
+    )
+    // Serial only: there is no owner to search by any more. A safe's renter is
+    // found through the Bookings tab instead.
+    .filter((row) => (q ? row.serialNumber.toLowerCase().includes(q) : true))
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
   return paginateMock(filtered, query);
 }
@@ -1582,122 +2320,68 @@ function handleAdminBulkCreate(body: unknown): BulkCreateResult {
   };
 }
 
-function handleAdminAllocate(body: unknown, deviceId?: string): { device: AdminDeviceRow } {
+/**
+ * Returns an inspected safe to the pool.
+ *
+ * Replaces allocate/unassign, which have nothing left to do. Requires a note,
+ * and the note is the point: it is the record that a human looked inside.
+ */
+function handleAdminClearInspection(deviceId: string, body: unknown): { device: AdminDeviceRow } {
   requireAdminAccount();
 
-  const input = (body ?? {}) as { userId?: string };
-  const target = accounts.find((candidate) => candidate.user.id === input.userId);
+  const device = devices.find((candidate) => candidate.id === deviceId);
+  if (!device) return fail(404, ERROR_CODES.NOT_FOUND, 'No safe with that id.');
 
-  if (!target) return fail(404, ERROR_CODES.USER_NOT_FOUND, 'No user with that id.');
-
-  if (!target.user.hasPaid) {
+  const input = (body ?? {}) as { note?: unknown };
+  const parsed = clearInspectionSchema.safeParse({ note: input.note });
+  if (!parsed.success) {
     return fail(
-      402,
-      ERROR_CODES.NOT_PAID,
-      'This user has no verified payment, so no safe can be allocated.',
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Say what you found when you checked it.',
     );
   }
 
-  if (devices.some((device) => device.ownerId === target.user.id)) {
+  if (device.status !== 'NEEDS_INSPECTION') {
     return fail(
       409,
-      ERROR_CODES.ALREADY_HAS_DEVICE,
-      'This user already has a safe allocated. Unassign it first.',
+      ERROR_CODES.DEVICE_NOT_AVAILABLE,
+      `That safe is ${device.status.toLowerCase().replace('_', ' ')}, so it cannot be changed that way.`,
     );
   }
 
-  let device: MockDevice | undefined;
+  device.status = 'AVAILABLE';
+  device.inspectionNote = parsed.data.note;
+  device.inspectionNotedAt = new Date().toISOString();
+  device.lockState = 'LOCKED';
 
-  if (deviceId) {
-    device = devices.find((candidate) => candidate.id === deviceId);
-    if (!device) return fail(404, ERROR_CODES.NOT_FOUND, 'No safe with that id.');
-    if (device.status !== 'UNASSIGNED') {
-      return fail(
-        409,
-        ERROR_CODES.DEVICE_NOT_AVAILABLE,
-        `That safe is ${device.status.toLowerCase()}, so it cannot be allocated.`,
-      );
-    }
-  } else {
-    // Oldest in stock first, matching the API's ordering.
-    device = devices
-      .filter((candidate) => candidate.status === 'UNASSIGNED')
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
-
-    if (!device) {
-      return fail(
-        409,
-        ERROR_CODES.NO_DEVICES_IN_STOCK,
-        'No unassigned safes left in stock. Add more devices to the inventory.',
-      );
-    }
-  }
-
-  device.status = 'ASSIGNED';
-  device.ownerId = target.user.id;
-  device.allocatedAt = new Date().toISOString();
-  syncAllocationFlag(target.user.id);
-  // Mock-only: gives /history something to page through immediately. The real
-  // API has no equivalent — a new owner's history starts empty.
-  seedMockHistory(target.user.id, device.serialNumber);
-  recordAudit('device.allocated', {
-    userId: target.user.id,
+  recordAudit('device.inspection.cleared', {
     deviceId: device.id,
-    metadata: { serialNumber: device.serialNumber, mode: deviceId ? 'specific' : 'next' },
+    metadata: { serialNumber: device.serialNumber, note: parsed.data.note },
   });
 
   return { device: toAdminDevice(device) };
 }
 
-interface MockDeviceMutation {
-  device: AdminDeviceRow;
-  previousOwnerId: string | null;
-}
-
-function handleAdminUnassign(deviceId: string): MockDeviceMutation {
+function handleAdminRetire(deviceId: string): { device: AdminDeviceRow } {
   requireAdminAccount();
 
   const device = devices.find((candidate) => candidate.id === deviceId);
   if (!device) return fail(404, ERROR_CODES.NOT_FOUND, 'No safe with that id.');
 
-  if (device.status !== 'ASSIGNED' || !device.ownerId) {
-    return fail(
-      409,
-      ERROR_CODES.DEVICE_NOT_AVAILABLE,
-      'That safe is not currently assigned to anyone.',
-    );
-  }
-
-  const previousOwnerId = device.ownerId;
-  device.status = 'UNASSIGNED';
-  device.ownerId = null;
-  device.allocatedAt = null;
-  device.lockState = 'UNKNOWN';
-  syncAllocationFlag(previousOwnerId);
-  recordAudit('device.unassigned', {
-    userId: previousOwnerId,
-    deviceId: device.id,
-    metadata: { serialNumber: device.serialNumber },
-  });
-
-  return { device: toAdminDevice(device), previousOwnerId };
-}
-
-function handleAdminRetire(deviceId: string): MockDeviceMutation {
-  requireAdminAccount();
-
-  const device = devices.find((candidate) => candidate.id === deviceId);
-  if (!device) return fail(404, ERROR_CODES.NOT_FOUND, 'No safe with that id.');
-
-  if (device.status === 'ASSIGNED') {
-    return fail(
-      409,
-      ERROR_CODES.DEVICE_STILL_ASSIGNED,
-      'That safe is still assigned to a user. Unassign it before retiring it.',
-    );
-  }
   if (device.status === 'RETIRED') {
     return fail(409, ERROR_CODES.DEVICE_NOT_AVAILABLE, 'That safe is already retired.');
+  }
+
+  const live = bookings.some(
+    (booking) => booking.deviceId === device.id && OCCUPYING.includes(booking.status),
+  );
+  if (live) {
+    return fail(
+      409,
+      ERROR_CODES.DEVICE_HAS_LIVE_BOOKING,
+      'That safe has a live booking. Wait for it to end, or force-complete it first.',
+    );
   }
 
   device.status = 'RETIRED';
@@ -1707,19 +2391,226 @@ function handleAdminRetire(deviceId: string): MockDeviceMutation {
     metadata: { serialNumber: device.serialNumber },
   });
 
-  return { device: toAdminDevice(device), previousOwnerId: null };
+  return { device: toAdminDevice(device) };
+}
+
+// --- Admin bookings ----------------------------------------------------------
+
+function toAdminBookingRow(booking: MockBooking, now = new Date()): AdminBookingRow {
+  const account = accounts.find((candidate) => candidate.user.id === booking.userId);
+  const device = mockDeviceFor(booking);
+  const fee = mockOutstandingFee(booking, now);
+
+  return {
+    id: booking.id,
+    status: booking.status,
+    effectiveStatus: mockEffectiveStatus(booking, now),
+    serialNumber: device?.serialNumber ?? 'UNKNOWN',
+    user: {
+      id: account?.user.id ?? booking.userId,
+      name: account?.user.name ?? 'Unknown',
+      email: account?.user.email ?? 'unknown',
+    },
+    startsAt: booking.startsAt,
+    endsAt: booking.endsAt,
+    hours: booking.hours,
+    pricePaise: booking.pricePaise,
+    currency: booking.currency,
+    overstayFeePaise: fee,
+    overstaySettledAt: booking.overstaySettledAt,
+    completionReason: booking.completionReason,
+    // Needs a human: money owed, or a safe nobody has looked inside.
+    flagged: fee > 0 || device?.status === 'NEEDS_INSPECTION',
+    createdAt: booking.createdAt,
+  };
+}
+
+function handleAdminBookings(query: URLSearchParams): Paginated<AdminBookingRow> {
+  requireAdminAccount();
+
+  const status = query.get('status');
+  const flagged = query.get('flagged');
+  const q = (query.get('q') ?? '').trim().toLowerCase();
+
+  const rows = bookings
+    .map((booking) => toAdminBookingRow(booking))
+    .filter((row) => (status ? row.status === status : true))
+    .filter((row) => (flagged === null ? true : row.flagged === (flagged === 'true')))
+    .filter((row) => {
+      if (!q) return true;
+      return (
+        row.serialNumber.toLowerCase().includes(q) ||
+        row.user.name.toLowerCase().includes(q) ||
+        row.user.email.toLowerCase().includes(q)
+      );
+    })
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+  return paginateMock(rows, query);
+}
+
+function handleAdminForceComplete(
+  bookingId: string,
+  body: unknown,
+): { booking: BookingSummary; needsInspection: boolean; deviceId: string } {
+  const admin = requireAdminAccount();
+
+  const booking = bookings.find((row) => row.id === bookingId);
+  if (!booking) return fail(404, ERROR_CODES.BOOKING_NOT_FOUND, 'No booking with that id.');
+
+  const input = (body ?? {}) as { reason?: unknown; needsInspection?: unknown };
+  const parsed = forceCompleteBookingSchema.safeParse({
+    reason: input.reason,
+    ...(input.needsInspection === undefined ? {} : { needsInspection: input.needsInspection }),
+  });
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Give a reason for ending this booking.',
+    );
+  }
+
+  if (!OCCUPYING.includes(booking.status)) {
+    return fail(409, ERROR_CODES.BOOKING_STATE_INVALID, 'That booking has already ended.');
+  }
+
+  completeMockBooking(booking, 'ADMIN_FORCE_COMPLETED', {
+    needsInspection: parsed.data.needsInspection,
+    adminNote: parsed.data.reason,
+  });
+
+  recordAudit('booking.force_completed', {
+    deviceId: booking.deviceId,
+    metadata: {
+      bookingId: booking.id,
+      completedByAdminId: admin.user.id,
+      needsInspection: parsed.data.needsInspection,
+      reason: parsed.data.reason,
+    },
+  });
+
+  return {
+    booking: toMockBookingSummary(booking),
+    needsInspection: parsed.data.needsInspection,
+    deviceId: booking.deviceId,
+  };
+}
+
+function handleAdminWaiveOverstay(
+  bookingId: string,
+  body: unknown,
+): { booking: BookingSummary; deviceId: string; waivedPaise: number } {
+  const admin = requireAdminAccount();
+
+  const booking = bookings.find((row) => row.id === bookingId);
+  if (!booking) return fail(404, ERROR_CODES.BOOKING_NOT_FOUND, 'No booking with that id.');
+
+  const input = (body ?? {}) as { reason?: unknown };
+  const parsed = waiveOverstaySchema.safeParse({ reason: input.reason });
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Give a reason for waiving this fee.',
+    );
+  }
+
+  if (booking.overstaySettledAt || booking.overstayWaivedAt) {
+    return fail(
+      409,
+      ERROR_CODES.BOOKING_STATE_INVALID,
+      'That overstay has already been settled or waived.',
+    );
+  }
+
+  const waivedPaise = mockOutstandingFee(booking);
+  if (waivedPaise <= 0) {
+    return fail(
+      409,
+      ERROR_CODES.NOTHING_TO_PAY,
+      'There is no overstay fee outstanding on that booking.',
+    );
+  }
+
+  // A waive leaves `overstayPaidPaise` at zero: it must not look like revenue.
+  booking.status = 'OVERSTAY';
+  booking.overstayWaivedAt = new Date().toISOString();
+  booking.adminNote = parsed.data.reason;
+
+  recordAudit('booking.overstay.waived', {
+    deviceId: booking.deviceId,
+    metadata: {
+      bookingId: booking.id,
+      waivedByAdminId: admin.user.id,
+      waivedPaise,
+      reason: parsed.data.reason,
+    },
+  });
+
+  return {
+    booking: toMockBookingSummary(booking),
+    deviceId: booking.deviceId,
+    waivedPaise,
+  };
+}
+
+/**
+ * Records that flagged money has been refunded by hand.
+ *
+ * It never touches `status`: a payment is PAID until Razorpay says otherwise,
+ * and ticking a box here is not Razorpay saying otherwise.
+ */
+function handleAdminClearReview(paymentId: string, body: unknown): { payment: PaymentSummary } {
+  const admin = requireAdminAccount();
+
+  const owner = accounts.find((account) =>
+    account.payments.some((payment) => payment.id === paymentId),
+  );
+  const payment = owner?.payments.find((candidate) => candidate.id === paymentId);
+  if (!payment) return fail(404, ERROR_CODES.NOT_FOUND, 'No payment with that id.');
+
+  const input = (body ?? {}) as { note?: unknown };
+  const parsed = clearInspectionSchema.safeParse({ note: input.note });
+  if (!parsed.success) {
+    return fail(
+      400,
+      ERROR_CODES.VALIDATION_ERROR,
+      parsed.error.issues[0]?.message ?? 'Say how this was refunded.',
+    );
+  }
+
+  if (!payment.reviewReason) {
+    return fail(409, ERROR_CODES.BOOKING_STATE_INVALID, 'That payment is not flagged for review.');
+  }
+  if (payment.reviewClearedAt) {
+    return fail(409, ERROR_CODES.BOOKING_STATE_INVALID, 'That payment has already been cleared.');
+  }
+
+  payment.reviewClearedAt = new Date().toISOString();
+
+  recordAudit('payment.review_cleared', {
+    metadata: {
+      paymentRowId: payment.id,
+      clearedByAdminId: admin.user.id,
+      amount: payment.amount,
+      note: parsed.data.note,
+    },
+  });
+
+  return { payment };
 }
 
 function handleAdminUsers(query: URLSearchParams): Paginated<AdminUserRow> {
   requireAdminAccount();
 
-  const paid = query.get('paid');
-  const allocated = query.get('allocated');
+  const booked = query.get('booked');
   const q = (query.get('q') ?? '').trim().toLowerCase();
+  const now = new Date();
 
   const rows: AdminUserRow[] = accounts.map((account) => {
-    const device = devices.find((candidate) => candidate.ownerId === account.user.id);
-    const deviceSerial = device?.serialNumber ?? null;
+    const live = liveBookingFor(account.user.id);
+    const device = live ? mockDeviceFor(live) : undefined;
 
     return {
       id: account.user.id,
@@ -1728,17 +2619,22 @@ function handleAdminUsers(query: URLSearchParams): Paginated<AdminUserRow> {
       phone: account.user.phone,
       role: account.user.role,
       createdAt: account.user.createdAt,
-      hasPaid: account.user.hasPaid,
-      deviceSerial,
-      refundedWithDevice: !account.user.hasPaid && deviceSerial !== null,
+      phoneVerified: account.user.phoneVerified,
+      currentBooking: live
+        ? {
+            id: live.id,
+            status: live.status,
+            effectiveStatus: mockEffectiveStatus(live, now),
+            serialNumber: device?.serialNumber ?? 'UNKNOWN',
+            endsAt: live.endsAt,
+            overstayFeePaise: mockOutstandingFee(live, now),
+          }
+        : null,
     };
   });
 
   const filtered = rows
-    .filter((row) => (paid === null ? true : row.hasPaid === (paid === 'true')))
-    .filter((row) =>
-      allocated === null ? true : (row.deviceSerial !== null) === (allocated === 'true'),
-    )
+    .filter((row) => (booked === null ? true : (row.currentBooking !== null) === (booked === 'true')))
     .filter((row) => {
       if (!q) return true;
       return (
@@ -1748,10 +2644,10 @@ function handleAdminUsers(query: URLSearchParams): Paginated<AdminUserRow> {
       );
     });
 
-  // Same work-queue ordering as the API.
+  // Same work-queue ordering as the API: trouble first.
   const rank = (row: AdminUserRow): number => {
-    if (row.refundedWithDevice) return 0;
-    if (row.hasPaid && !row.deviceSerial) return 1;
+    if ((row.currentBooking?.overstayFeePaise ?? 0) > 0) return 0;
+    if (row.currentBooking) return 1;
     return 2;
   };
   filtered.sort((a, b) => rank(a) - rank(b));
@@ -1763,6 +2659,8 @@ function handleAdminPayments(query: URLSearchParams): Paginated<AdminPaymentRow>
   requireAdminAccount();
 
   const status = query.get('status');
+  const purpose = query.get('purpose');
+  const needsReview = query.get('needsReview');
 
   const rows: AdminPaymentRow[] = accounts.flatMap((account) =>
     account.payments.map((payment) => ({
@@ -1778,11 +2676,21 @@ function handleAdminPayments(query: URLSearchParams): Paginated<AdminPaymentRow>
         name: account.user.name,
         email: account.user.email,
       },
+      purpose: payment.purpose,
+      bookingId: payment.bookingId,
+      reviewReason: payment.reviewReason,
+      reviewClearedAt: payment.reviewClearedAt,
     })),
   );
 
   const filtered = rows
     .filter((row) => (status ? row.status === status : true))
+    .filter((row) => (purpose ? row.purpose === purpose : true))
+    .filter((row) => {
+      if (needsReview === null) return true;
+      const flagged = row.reviewReason !== null && row.reviewClearedAt === null;
+      return flagged === (needsReview === 'true');
+    })
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
   return paginateMock(filtered, query);

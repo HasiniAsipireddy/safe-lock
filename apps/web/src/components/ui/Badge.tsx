@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import type { DeviceStatus, LockState } from '@safelock/shared';
+import type { BookingStatus, DeviceStatus, LockState } from '@safelock/shared';
 import { cn } from '@/lib/cn';
 
 /**
@@ -75,17 +75,49 @@ export function OnlineBadge({ online }: { online: boolean }) {
 }
 
 const DEVICE_STATUS_TONE: Record<DeviceStatus, Tone> = {
-  UNASSIGNED: 'info',
-  ASSIGNED: 'positive',
+  AVAILABLE: 'info',
+  // Warning, not neutral: this is a safe that may contain somebody else's
+  // property and must not be rented until a human has looked inside.
+  NEEDS_INSPECTION: 'warning',
   RETIRED: 'neutral',
 };
 
 const DEVICE_STATUS_LABEL: Record<DeviceStatus, string> = {
-  UNASSIGNED: 'In stock',
-  ASSIGNED: 'Assigned',
+  AVAILABLE: 'In pool',
+  NEEDS_INSPECTION: 'Needs inspection',
   RETIRED: 'Retired',
 };
 
 export function DeviceStatusBadge({ status }: { status: DeviceStatus }) {
   return <Badge tone={DEVICE_STATUS_TONE[status]}>{DEVICE_STATUS_LABEL[status]}</Badge>;
 }
+
+/**
+ * A booking's **effective** status — the one derived from the clock.
+ *
+ * Never the stored status: a lapsed hold shown as "awaiting payment" is a
+ * badge telling the user they still have a safe they do not have.
+ */
+const BOOKING_STATUS_TONE: Record<BookingStatus, Tone> = {
+  PENDING_PAYMENT: 'info',
+  ACTIVE: 'positive',
+  OVERSTAY: 'warning',
+  COMPLETED: 'neutral',
+  CANCELLED: 'neutral',
+  EXPIRED_UNPAID: 'neutral',
+};
+
+const BOOKING_STATUS_LABEL: Record<BookingStatus, string> = {
+  PENDING_PAYMENT: 'Awaiting payment',
+  ACTIVE: 'Running',
+  OVERSTAY: 'Overstaying',
+  COMPLETED: 'Completed',
+  CANCELLED: 'Cancelled',
+  EXPIRED_UNPAID: 'Hold expired',
+};
+
+export function BookingStatusBadge({ status }: { status: BookingStatus }) {
+  return <Badge tone={BOOKING_STATUS_TONE[status]}>{BOOKING_STATUS_LABEL[status]}</Badge>;
+}
+
+export { BOOKING_STATUS_LABEL };

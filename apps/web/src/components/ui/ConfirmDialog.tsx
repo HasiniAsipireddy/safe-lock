@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
 import { Button } from './Button';
 
 /**
@@ -9,6 +9,12 @@ import { Button } from './Button';
  * Uses the native `<dialog>` element so focus trapping, Escape handling and
  * the backdrop come from the platform rather than from hand-written key
  * listeners.
+ *
+ * `children` and `confirmDisabled` exist for the three rental overrides that
+ * **require a reason** — force-complete, waive a fee, clear an inspection.
+ * Those are a human overriding a safety rule, and an override with no stated
+ * reason is indistinguishable afterwards from a misclick, so the field lives
+ * inside the confirmation rather than being a separate step somebody can skip.
  */
 export function ConfirmDialog({
   open,
@@ -17,6 +23,8 @@ export function ConfirmDialog({
   confirmLabel,
   destructive = false,
   pending = false,
+  confirmDisabled = false,
+  children,
   onConfirm,
   onCancel,
 }: {
@@ -26,6 +34,10 @@ export function ConfirmDialog({
   confirmLabel: string;
   destructive?: boolean;
   pending?: boolean;
+  /** Blocks confirmation until a required field is filled in. */
+  confirmDisabled?: boolean;
+  /** An extra field rendered between the description and the buttons. */
+  children?: ReactNode;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -56,11 +68,14 @@ export function ConfirmDialog({
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">{description}</p>
         </div>
 
+        {children}
+
         <div className="flex flex-col gap-2 sm:flex-row-reverse">
           <Button
             variant={destructive ? 'primary' : 'primary'}
             loading={pending}
             loadingText="Working…"
+            disabled={confirmDisabled}
             onClick={onConfirm}
             className={
               destructive

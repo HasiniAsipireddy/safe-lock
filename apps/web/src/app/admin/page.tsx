@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { AdminOnly } from '@/components/RouteGuard';
 import { ToastProvider } from '@/components/ui/Toast';
 import { DevicesTab } from '@/components/admin/DevicesTab';
+import { BookingsTab } from '@/components/admin/BookingsTab';
 import { UsersTab } from '@/components/admin/UsersTab';
 import { PaymentsTab } from '@/components/admin/PaymentsTab';
 import { AuditTab } from '@/components/admin/AuditTab';
@@ -26,6 +27,10 @@ export default function AdminPage() {
 }
 
 const TABS = [
+  // Bookings first: it opens on "needs attention", which is the only list in
+  // this panel that nothing else will surface. An unpaid overstay is never
+  // completed automatically, on purpose.
+  { id: 'bookings', label: 'Bookings' },
   { id: 'devices', label: 'Devices' },
   { id: 'users', label: 'Users' },
   { id: 'payments', label: 'Payments' },
@@ -35,10 +40,10 @@ const TABS = [
 type TabId = (typeof TABS)[number]['id'];
 
 function AdminPanel() {
-  const [tab, setTab] = useState<TabId>('devices');
+  const [tab, setTab] = useState<TabId>('bookings');
   /**
-   * Bumped when the inventory changes, so the Users tab re-reads allocation
-   * state instead of showing a stale "Awaiting allocation" badge.
+   * Bumped when a booking or the inventory changes, so the Users tab re-reads
+   * its current-booking column instead of showing a stale one.
    */
   const [inventoryVersion, setInventoryVersion] = useState(0);
 
@@ -49,7 +54,7 @@ function AdminPanel() {
           Admin
         </h1>
         <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-          Device inventory, allocation and activity.
+          Bookings, device inventory and activity.
         </p>
       </header>
 
@@ -90,6 +95,9 @@ function AdminPanel() {
         // rows from a previous visit.
         key={tab}
       >
+        {tab === 'bookings' && (
+          <BookingsTab onChanged={() => setInventoryVersion((value) => value + 1)} />
+        )}
         {tab === 'devices' && (
           <DevicesTab onInventoryChange={() => setInventoryVersion((value) => value + 1)} />
         )}
