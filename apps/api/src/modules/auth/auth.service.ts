@@ -7,7 +7,7 @@ import {
 import { prisma } from '../../lib/prisma';
 import { HttpError, conflict, unauthenticated } from '../../lib/httpError';
 import { hashPassword, verifyPassword } from './password';
-import { toPublicUser, userHasDevice, userHasPaid } from '../users/user.mapper';
+import { toPublicUser } from '../users/user.mapper';
 import {
   issueRefreshToken,
   revokeAllForUser,
@@ -59,9 +59,8 @@ export async function signup(input: {
     select: SELECT,
   });
 
-  // A brand-new account cannot have a payment or a device yet, and its phone
-  // is unverified until a code is confirmed.
-  return toPublicUser(user, { hasPaid: false, deviceAllocated: false });
+  // A new account has no booking and an unverified phone.
+  return toPublicUser(user);
 }
 
 /**
@@ -104,11 +103,7 @@ export async function login(input: {
   }
 
   const { passwordHash: _ignored, ...row } = user;
-  const [hasPaid, deviceAllocated] = await Promise.all([
-    userHasPaid(row.id),
-    userHasDevice(row.id),
-  ]);
-  return toPublicUser(row, { hasPaid, deviceAllocated });
+  return toPublicUser(row);
 }
 
 /**
@@ -175,12 +170,7 @@ export async function changePassword(input: {
   });
 
   const { passwordHash: _ignored, ...row } = user;
-  const [hasPaid, deviceAllocated] = await Promise.all([
-    userHasPaid(row.id),
-    userHasDevice(row.id),
-  ]);
-
-  return { user: toPublicUser(row, { hasPaid, deviceAllocated }), refresh };
+  return { user: toPublicUser(row), refresh };
 }
 
 /**
@@ -197,10 +187,5 @@ export async function updateProfile(input: {
     select: SELECT,
   });
 
-  const [hasPaid, deviceAllocated] = await Promise.all([
-    userHasPaid(user.id),
-    userHasDevice(user.id),
-  ]);
-
-  return toPublicUser(user, { hasPaid, deviceAllocated });
+  return toPublicUser(user);
 }

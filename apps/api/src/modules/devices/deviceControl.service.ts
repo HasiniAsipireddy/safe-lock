@@ -15,7 +15,13 @@ import type { SendOutcome } from '../../lib/whatsapp/send';
 import { deviceGateway } from '../../lib/deviceGateway';
 import { logger } from '../../lib/logger';
 import { notifier } from '../../lib/notifier';
-import { userHasPaid } from '../users/user.mapper';
+import { unlockEligibility } from '@safelock/shared';
+import {
+  BOOKING_SELECT,
+  outstandingFeePaise,
+  snapshotOf,
+  type BookingRow,
+} from '../bookings/booking.mapper';
 import { DEVICE_SUMMARY_SELECT, toDeviceSummary } from './device.mapper';
 import { deliverOtp, generateOtp, hashOtp, verifyOtp } from './otp.service';
 
@@ -25,9 +31,10 @@ import { deliverOtp, generateOtp, hashOtp, verifyOtp } from './otp.service';
  * Three invariants hold throughout this module:
  *
  * 1. **Eligibility is re-derived on every call** by {@link assertCanOperate},
- *    never trusted from the client and never cached. Paid and allocated are
- *    independent facts and both are required — a refunded user can still be
- *    holding hardware, and a paid user may be waiting for one.
+ *    never trusted from the client and never cached — and for `confirm`, again
+ *    inside the transaction with the device row locked. It is derived from the
+ *    **server clock**, not from a booking's stored status, so a sweeper that is
+ *    late, wedged or has never run cannot leave a safe unlockable.
  * 2. **Unlocking always costs a valid OTP.** There is no flag, no environment
  *    variable and no admin override in this file that skips it.
  * 3. **The stored lock state only moves on an ack.** A sent command that is
@@ -37,33 +44,31 @@ import { deliverOtp, generateOtp, hashOtp, verifyOtp } from './otp.service';
 
 // --- Errors ------------------------------------------------------------------
 
-const notPaid = () =>
+const noActiveBooking = () =>
+  conflict(
+    ERROR_CODES.NO_ACTIVE_BOOKING,
+    'You have no running booking. Book a safe to use one.',
+  );
+
+/**
+ * An overstay fee is outstanding.
+ *
+ * **402, and unlock-only.** Locking stays available: refusing to let someone
+ * secure a safe they are standing at would punish them in the one direction
+ * that creates risk rather than recovering money.
+ */
+const overstayDue = (feePaise: number) =>
   new HttpError({
     status: 402,
-    code: ERROR_CODES.NOT_PAID,
-    message: 'Complete your payment to activate your safe.',
+    code: ERROR_CODES.OVERSTAY_PAYMENT_REQUIRED,
+    message: `An overstay fee of ${feePaise} paise is outstanding. Pay it to unlock your safe and collect your items.`,
   });
-
-const refunded = () =>
-  new HttpError({
-    status: 403,
-    code: ERROR_CODES.REFUNDED_CONTACT_SUPPORT,
-    message:
-      'Your payment was refunded, so remote access is disabled. Please contact support about returning your safe.',
-  });
-
-const noDevice = () =>
-  conflict(
-    ERROR_CODES.NO_DEVICE,
-    'No safe is allocated to your account yet. You will be notified once one is assigned.',
-  );
 
 /**
  * Unlock needs a verified number because that is where the code goes.
  *
- * **403, not 402**: this is not about money. A distinct code too — the
- * dashboard shows a "verify your phone" prompt for it, which is useless for
- * `NOT_PAID` or `NO_DEVICE`.
+ * Checked **before** the booking, because it is the one thing a user can fix
+ * at any time — including while they have no booking at all.
  */
 const phoneNotVerified = () =>
   new HttpError({
@@ -153,74 +158,117 @@ export interface OperableDevice {
   deviceId: string;
   serialNumber: string;
   lockState: 'LOCKED' | 'UNLOCKED' | 'UNKNOWN';
+  bookingId: string;
 }
 
 /**
- * Resolves the device this user may operate, or throws.
+ * Resolves the safe this user may operate right now, or throws.
+ *
+ * Eligibility under the rental model is: **a verified phone, plus a live
+ * booking whose effective status allows the action.** Device ownership no
+ * longer exists.
  *
  * Checked in this order, which matters:
- * - **refunded while holding hardware** first, so that state gets its own
- *   message instead of being flattened into "you have not paid". It is a real
- *   state (see docs/decisions.md) and paying again is not the remedy.
- * - then unpaid,
- * - then — for unlock only — **an unverified phone**,
- * - then no device allocated.
+ * 1. **Verified phone** — the one thing the user can fix at any moment, and
+ *    pointless to discover after choosing a safe.
+ * 2. **A live booking** — derived from the server clock, never from the stored
+ *    status, so a missed sweep cannot leave a safe unlockable.
+ * 3. **An outstanding overstay fee** — its own code, because the dashboard
+ *    shows a pay button for it and nothing else.
+ * 4. **Unknown lock state** — refuse rather than guess.
  *
- * Why the phone check sits where it does: paid and refunded are facts about
- * the account that the user may be unable to change right now, so they come
- * first. An unverified number is something they can fix in a minute, and
- * telling them so is more useful than "no safe is allocated yet" — which they
- * can do nothing about. It is also checked before the device lookup so a user
- * waiting on allocation still learns they should verify in the meantime.
- *
- * This is why the lock/unlock routes do **not** mount `requirePaid`: that
- * middleware answers 402 PAYMENT_REQUIRED for both the never-paid and the
- * refunded user, and the two need different answers here.
+ * `requirePhoneVerified` and `requireUnlockable` are separate because
+ * **locking is deliberately less gated than unlocking**: locking needs no
+ * one-time code and no settled fee. The asymmetry is the point.
  */
 export async function assertCanOperate(
   userId: string,
   client: PrismaTransaction | typeof prisma = prisma,
-  options: { requirePhoneVerified?: boolean } = {},
+  options: { requirePhoneVerified?: boolean; requireUnlockable?: boolean; now?: Date } = {},
 ): Promise<OperableDevice> {
-  const [paid, user, device] = await Promise.all([
-    userHasPaid(userId, client),
+  const now = options.now ?? new Date();
+
+  const [user, booking] = await Promise.all([
     client.user.findUnique({
       where: { id: userId },
       select: { phoneVerifiedAt: true },
     }),
-    client.device.findUnique({
-      where: { ownerId: userId },
-      select: { id: true, serialNumber: true, lockState: true, status: true },
+    client.booking.findFirst({
+      where: { userId, status: { in: ['ACTIVE', 'OVERSTAY'] } },
+      orderBy: { createdAt: 'desc' },
+      select: BOOKING_SELECT,
     }),
   ]);
 
-  if (!paid) throw device ? refunded() : notPaid();
-
-  /**
-   * **Unlock requires a verified number; lock does not.**
-   *
-   * Unlocking needs somewhere to send the one-time code, so without a
-   * verified number the flow cannot complete at all — better to say so up
-   * front than to generate a code that goes nowhere.
-   *
-   * Locking is deliberately left open. It is the safe direction, needs no
-   * code, and blocking it would mean an unverified user could not secure
-   * their own safe — which would make the gate actively harmful.
-   */
   if (options.requirePhoneVerified && !user?.phoneVerifiedAt) throw phoneNotVerified();
 
-  if (!device || device.status !== 'ASSIGNED') throw noDevice();
+  if (!booking) throw noActiveBooking();
 
-  // Should be unreachable: allocation sets LOCKED and only unassign sets
-  // UNKNOWN, which also clears ownerId. Refusing rather than guessing — the
-  // alternative is sending a bolt command on a state we cannot reason about.
+  const row = booking as BookingRow;
+  const eligibility = unlockEligibility({
+    status: row.status,
+    endsAt: row.endsAt,
+    holdExpiresAt: row.holdExpiresAt,
+    overstaySettledAt: row.overstaySettledAt ?? row.overstayWaivedAt,
+    snapshot: snapshotOf(row),
+    now,
+  });
+
+  /**
+   * Locking is allowed in any live booking state, including an unpaid
+   * overstay. Only unlocking consults `unlockEligibility`.
+   */
+  if (options.requireUnlockable && !eligibility.allowed) {
+    if (eligibility.reason === 'OVERSTAY_FEE_DUE') {
+      throw overstayDue(outstandingFeePaise(row, now));
+    }
+    throw noActiveBooking();
+  }
+
+  const device = await client.device.findUnique({
+    where: { id: row.deviceId },
+    select: { id: true, serialNumber: true, lockState: true },
+  });
+
+  if (!device) throw noActiveBooking();
+
+  // Should be unreachable for a booked safe. Refusing rather than guessing —
+  // the alternative is sending a bolt command on a state we cannot reason
+  // about.
   if (device.lockState === 'UNKNOWN') throw stateUnknown();
 
   return {
     deviceId: device.id,
     serialNumber: device.serialNumber,
     lockState: device.lockState,
+    bookingId: row.id,
   };
+}
+
+/**
+ * The safe the caller currently has, or null.
+ *
+ * A **read**, so it answers null rather than throwing: a user between bookings
+ * is not an error, and `GET /devices/mine` has no eligibility gate for exactly
+ * that reason. It is also null during `PENDING_PAYMENT` — a held safe is not
+ * yet a safe you can operate, and showing one before the money lands would
+ * imply controls that `assertCanOperate` would refuse.
+ */
+export async function currentDeviceFor(userId: string): Promise<DeviceSummary | null> {
+  const booking = await prisma.booking.findFirst({
+    where: { userId, status: { in: ['ACTIVE', 'OVERSTAY'] } },
+    orderBy: { createdAt: 'desc' },
+    select: { deviceId: true },
+  });
+
+  if (!booking) return null;
+
+  const device = await prisma.device.findUnique({
+    where: { id: booking.deviceId },
+    select: DEVICE_SUMMARY_SELECT,
+  });
+
+  return device ? toDeviceSummary(device) : null;
 }
 
 // --- Shared helpers ----------------------------------------------------------
@@ -303,6 +351,8 @@ export interface LockInput {
  * which is exactly what that deferred table is for (see docs/decisions.md).
  */
 export async function lockDevice(input: LockInput): Promise<LockResponse> {
+  // Neither gate: locking needs no one-time code and no settled fee. An
+  // unverified user mid-overstay must still be able to secure their safe.
   const target = await assertCanOperate(input.userId);
 
   return prisma.$transaction(async (tx) => {
@@ -386,6 +436,7 @@ export async function requestUnlock(
 ): Promise<UnlockRequestResponse> {
   const target = await assertCanOperate(input.userId, prisma, {
     requirePhoneVerified: true,
+    requireUnlockable: true,
   });
 
   const code = generateOtp();
@@ -511,11 +562,13 @@ export class UnlockFailed extends Error {
 export async function confirmUnlock(
   input: UnlockConfirmInput,
 ): Promise<UnlockConfirmResponse> {
-  // Re-checked here too, not just on request: a number could have been
-  // unverified between the two calls, and the second call is the one that
-  // moves the bolt.
+  // Re-checked here, not just on request: a number could have been unverified
+  // and a booking could have ended between the two calls, and this is the call
+  // that moves the bolt. Re-checked **again** inside the transaction below,
+  // with the device row locked.
   const target = await assertCanOperate(input.userId, prisma, {
     requirePhoneVerified: true,
+    requireUnlockable: true,
   });
 
   const challenge = await prisma.unlockChallenge.findFirst({
@@ -609,6 +662,23 @@ export async function confirmUnlock(
     }
 
     await lockDeviceRow(tx, target.deviceId);
+
+    /**
+     * Eligibility, again, **inside the transaction and under the row lock**.
+     *
+     * Everything checked before the transaction was checked on data that could
+     * have changed since: a booking can end, a collection window can lapse, or
+     * an overstay fee can start accruing between the code being verified and
+     * the bolt moving. This is the check that is actually load-bearing; the
+     * earlier one exists to fail fast with a good message.
+     *
+     * A throw here rolls back the challenge claim too, so the user's code is
+     * not burned by a refusal that was not their fault.
+     */
+    await assertCanOperate(input.userId, tx, {
+      requirePhoneVerified: true,
+      requireUnlockable: true,
+    });
 
     const current = await tx.device.findUniqueOrThrow({
       where: { id: target.deviceId },

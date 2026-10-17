@@ -11,16 +11,15 @@ import {
   type UnlockRequestResponse,
 } from '@safelock/shared';
 import { requireAuth } from '../../middleware/auth';
-import { requirePaid } from '../../middleware/requirePaid';
 import { validateBody, validateQuery } from '../../middleware/validate';
 import type { Limiters } from '../../middleware/rateLimit';
 import { HttpError } from '../../lib/httpError';
 import { AUDIT_ACTIONS, auditContext, writeAudit } from '../audit/audit.service';
-import { getDeviceForUser } from './device.service';
 import { getHistoryPage } from './history.service';
 import {
   UnlockFailed,
   confirmUnlock,
+  currentDeviceFor,
   lockDevice,
   recordUnlockFailure,
   requestUnlock,
@@ -29,17 +28,13 @@ import {
 /**
  * User-facing device routes, mounted at `/api/v1/devices`.
  *
- * Note which routes do and do not carry `requirePaid`:
- *
- * - `GET /mine` keeps it. It is a read, and 402 PAYMENT_REQUIRED is the right
- *   answer for anyone without a settled payment.
- * - The three **write** routes do not. Eligibility there is
- *   `assertCanOperate`, which separates "never paid" (402 `NOT_PAID`) from
- *   "refunded while still holding the hardware" (403
- *   `REFUNDED_CONTACT_SUPPORT`) from "paid, awaiting allocation" (409
- *   `NO_DEVICE`). `requirePaid` collapses the first two into one answer, and
- *   the dashboard needs to tell them apart. The check is no weaker — it is
- *   the same `userHasPaid` rule plus an ownership check.
+ * **`requirePaid` is gone, along with the middleware itself.** Paying *is*
+ * booking now, so there is no account-level paid flag to gate on: eligibility
+ * is `assertCanOperate`, which derives it from the caller's live booking and
+ * distinguishes "no booking" (409 `NO_ACTIVE_BOOKING`) from "an overstay fee is
+ * owed" (402 `OVERSTAY_PAYMENT_REQUIRED`) from "phone not verified" (403). The
+ * dashboard shows a different thing for each, which a single collapsed
+ * payment-required answer could not support.
  *
  * Unlocking is two calls on purpose. `request` proves nothing and opens
  * nothing; only `confirm`, with a code the requester had to receive out of
@@ -49,14 +44,17 @@ export function createDevicesRouter(limiters: Limiters): Router {
   const router = Router();
 
   /**
-   * The caller's own device, or `null` while they are waiting for allocation.
+   * The safe the caller currently has, or `null` between bookings.
    *
-   * Authorisation is the query itself: the lookup is by `ownerId`, so there is
-   * no device id a user could substitute to read someone else's safe.
+   * `requireAuth` only, and null rather than an error: a user with no booking
+   * is not a failure, and the dashboard reads `GET /bookings/current` to find
+   * out what to offer them. Authorisation is the query itself — the device is
+   * resolved from the caller's own booking, so there is no id a user could
+   * substitute to read someone else's safe.
    */
-  router.get('/mine', requireAuth, requirePaid, async (req, res, next) => {
+  router.get('/mine', requireAuth, async (req, res, next) => {
     try {
-      const device = await getDeviceForUser(req.user!.id);
+      const device = await currentDeviceFor(req.user!.id);
       const response: MyDeviceResponse = { device };
       res.status(200).json(response);
     } catch (error) {
@@ -67,12 +65,12 @@ export function createDevicesRouter(limiters: Limiters): Router {
   /**
    * The caller's lock/unlock activity, newest first, cursor-paginated.
    *
-   * `requireAuth` only — deliberately **no** `requirePaid` and no eligibility
-   * check. This is a read of the user's own record: someone waiting for
-   * allocation has no events and gets an empty list, and someone whose payment
-   * was refunded can still see what happened to the safe they were holding.
-   * Refusing either would be withholding their own data, and an empty list is
-   * the honest answer rather than an error.
+   * `requireAuth` only — deliberately no eligibility check. This is a read of
+   * the user's own record: someone who has never booked has no events and gets
+   * an empty list, and someone whose booking ended last week can still see
+   * what happened to the safe they had. Refusing either would be withholding
+   * their own data, and an empty list is the honest answer rather than an
+   * error.
    */
   router.get(
     '/history',
@@ -226,7 +224,9 @@ async function auditOperationFailure(
 ): Promise<void> {
   const code = error instanceof HttpError ? error.code : 'INTERNAL_ERROR';
   const eligibility =
-    code === 'NOT_PAID' || code === 'REFUNDED_CONTACT_SUPPORT' || code === 'NO_DEVICE';
+    code === 'NO_ACTIVE_BOOKING' ||
+    code === 'OVERSTAY_PAYMENT_REQUIRED' ||
+    code === 'PHONE_NOT_VERIFIED';
 
   await writeAudit({
     action: eligibility ? AUDIT_ACTIONS.DEVICE_OPERATION_DENIED : fallbackAction,
