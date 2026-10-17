@@ -33,7 +33,7 @@ describe('unlock code delivery', () => {
     const { user } = await createUserWithDevice();
     fake.reset();
 
-    const { code } = await withCapturedOtp(() => post(REQUEST_URL, user.cookie).send({}));
+    await withCapturedOtp(() => post(REQUEST_URL, user.cookie).send({}));
 
     expect(fake.sent()).toHaveLength(1);
     expect(fake.last()).toMatchObject({

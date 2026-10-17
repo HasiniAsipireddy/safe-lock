@@ -2483,6 +2483,15 @@ function toAdminBookingRow(booking: MockBooking, now = new Date()): AdminBooking
     overstayFeePaise: fee,
     overstaySettledAt: booking.overstaySettledAt,
     completionReason: booking.completionReason,
+    /**
+     * Always zero in the mock.
+     *
+     * The mock has no outbox: there is no worker, no send budget and nothing
+     * that could drop a message, so inventing a count here would be fiction
+     * dressed as data. The field exists so the admin table renders the same
+     * shape against both backends.
+     */
+    undeliveredMessages: 0,
     // Needs a human: money owed, or a safe nobody has looked inside.
     flagged: fee > 0 || device?.status === 'NEEDS_INSPECTION',
     createdAt: booking.createdAt,

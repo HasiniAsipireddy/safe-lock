@@ -236,7 +236,19 @@ export interface AdminBookingRow {
   overstayFeePaise: number;
   overstaySettledAt: string | null;
   completionReason: BookingCompletionReason | null;
-  /** True when this row needs a human: unpaid overstay, or inspection due. */
+  /**
+   * Lifecycle messages that were dropped rather than withdrawn — spent send
+   * budget, or claimed too late to be true.
+   *
+   * Surfaced because the alternative is silence: a dropped overstay notice
+   * means a renter was never told a fee had started, and the first anyone
+   * would hear of it is the renter disputing the fee.
+   */
+  undeliveredMessages: number;
+  /**
+   * True when this row needs a human: unpaid overstay, inspection due, or a
+   * notice the renter should have had and did not.
+   */
   flagged: boolean;
   createdAt: string;
 }

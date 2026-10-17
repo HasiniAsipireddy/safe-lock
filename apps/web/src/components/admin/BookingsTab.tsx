@@ -152,6 +152,19 @@ export function BookingsTab({ onChanged }: { onChanged?: () => void }) {
               as "awaiting payment" would be an admin chasing a ghost. */}
           <BookingStatusBadge status={booking.effectiveStatus} />
           {booking.flagged ? <Badge tone="danger">Needs attention</Badge> : null}
+          {/*
+            A message this renter should have had and did not — a spent send
+            budget, or one claimed too late to still be true. Shown next to the
+            booking rather than in a log of its own, because the admin's
+            question is "is anything wrong here?", and a renter who was never
+            warned about a fee is about to dispute it.
+          */}
+          {booking.undeliveredMessages > 0 ? (
+            <span className="text-xs font-semibold text-amber-700 dark:text-amber-300">
+              {booking.undeliveredMessages} message
+              {booking.undeliveredMessages === 1 ? '' : 's'} not delivered
+            </span>
+          ) : null}
           {booking.completionReason ? (
             <span className="text-xs text-slate-500 dark:text-slate-400">
               {booking.completionReason.toLowerCase().replace(/_/g, ' ')}

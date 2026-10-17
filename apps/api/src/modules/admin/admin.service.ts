@@ -223,6 +223,24 @@ export async function listBookings(
         adminNote: true,
         user: { select: { id: true, name: true, email: true } },
         device: { select: { serialNumber: true, status: true } },
+        /**
+         * Lifecycle messages this booking was meant to send and did not.
+         *
+         * `CAP_REACHED` and `STALE` only — the two reasons a message was
+         * *dropped* rather than deliberately withdrawn. A dropped
+         * `OVERSTAY_STARTED` is a renter who was never told a fee had
+         * started, which is a fee someone may dispute and a conversation an
+         * admin needs to know they are about to have. `CANCELLED` and
+         * `NOT_APPLICABLE` are excluded: those are the system correctly
+         * deciding not to say something.
+         */
+        outboundMessages: {
+          where: {
+            status: 'SKIPPED' as const,
+            failureCategory: { in: ['CAP_REACHED', 'STALE'] as const },
+          },
+          select: { kind: true },
+        },
       },
       orderBy: { createdAt: 'desc' },
       skip: (query.page - 1) * query.pageSize,
@@ -234,6 +252,7 @@ export async function listBookings(
     adminNote: string | null;
     user: { id: string; name: string; email: string };
     device: { serialNumber: string; status: string };
+    outboundMessages: Array<{ kind: string }>;
   };
 
   let items = (rows as Row[]).map((row): AdminBookingRow => {
@@ -248,6 +267,7 @@ export async function listBookings(
     });
 
     const fee = outstandingFeePaise(row, now);
+    const undeliveredMessages = row.outboundMessages.length;
 
     return {
       id: row.id,
@@ -263,8 +283,18 @@ export async function listBookings(
       overstayFeePaise: fee,
       overstaySettledAt: row.overstaySettledAt ? row.overstaySettledAt.toISOString() : null,
       completionReason: row.completionReason,
-      // Needs a human: money owed, or a safe nobody has looked inside.
-      flagged: fee > 0 || row.device.status === 'NEEDS_INSPECTION',
+      undeliveredMessages,
+      /**
+       * Needs a human: money owed, a safe nobody has looked inside, or a
+       * notice this renter should have had and did not.
+       *
+       * The third is new and belongs here rather than in a message log of its
+       * own: the question an admin actually has is "is anything wrong with
+       * this booking?", and a fee the renter was never warned about is wrong
+       * with the booking, not with the outbox.
+       */
+      flagged:
+        fee > 0 || row.device.status === 'NEEDS_INSPECTION' || undeliveredMessages > 0,
       createdAt: row.createdAt.toISOString(),
     };
   });
