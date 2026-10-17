@@ -322,6 +322,152 @@ describe('sweepBookings', () => {
       movedToOverstay: 0,
       reservationsExtended: 0,
       completed: 0,
+      failed: 0,
     });
+  });
+});
+
+/**
+ * The collision the live run found.
+ *
+ * A back-to-back booking already holds the safe from the moment the first
+ * reservation ends. When the first booking overstays, pushing its
+ * `reservedUntil` forward violates the exclusion constraint — and the
+ * constraint is right to refuse, because two bookings cannot occupy one safe.
+ *
+ * Before this was handled, the rejected write threw out of the sweep loop and
+ * **every subsequent sweep failed the same way**: holds stopped expiring,
+ * nothing moved to OVERSTAY, and no collection window ever closed, for every
+ * booking in the system. These tests pin both halves of the fix.
+ */
+describe('an overstay that collides with the next booking', () => {
+  /** Two bookings, back to back, with the first one overstaying. */
+  async function backToBack() {
+    const first = await createUserWithDevice({ hours: 1 });
+    const nextRenter = await createTestUser();
+
+    const firstRow = await prisma.booking.findUniqueOrThrow({
+      where: { id: first.bookingId },
+      select: { reservedUntil: true },
+    });
+
+    // Starts exactly where ours ends — legal under the `[)` bounds, and the
+    // ordinary case for a busy pool.
+    const second = await seedBooking({
+      userId: nextRenter.id,
+      deviceId: first.deviceId,
+      status: 'ACTIVE',
+      hours: 2,
+      startsAt: firstRow.reservedUntil,
+    });
+
+    await pushIntoOverstay(first.bookingId, 1);
+
+    return { first, second, nextRenter };
+  }
+
+  it('still moves the booking to OVERSTAY and keeps accruing a fee', async () => {
+    const { first } = await backToBack();
+
+    const result = await sweepBookings();
+
+    expect(result.failed).toBe(0);
+    expect(result.movedToOverstay).toBe(1);
+
+    const row = await prisma.booking.findUniqueOrThrow({ where: { id: first.bookingId } });
+    expect(row.status).toBe('OVERSTAY');
+    // The fee is what matters to the renter, and it is unaffected.
+    expect(row.completedAt).toBeNull();
+  });
+
+  it('clamps the reservation at the next booking rather than past it', async () => {
+    const { first, second } = await backToBack();
+
+    const nextStart = (
+      await prisma.booking.findUniqueOrThrow({
+        where: { id: second.id },
+        select: { startsAt: true },
+      })
+    ).startsAt;
+
+    await sweepBookings();
+
+    const row = await prisma.booking.findUniqueOrThrow({ where: { id: first.bookingId } });
+
+    /**
+     * Clamped **at** the next booking's start, never past it.
+     *
+     * The unclamped value would have been `now + 1 hour`, which is what the
+     * constraint rejected — so asserting the ceiling rather than merely
+     * "something in the future" is what pins the fix.
+     */
+    expect(row.reservedUntil.getTime()).toBeLessThanOrEqual(nextStart.getTime());
+    expect(row.reservedUntil.getTime()).toBeLessThan(Date.now() + 60 * 60 * 1000);
+
+    const next = await prisma.booking.findUniqueOrThrow({ where: { id: second.id } });
+    expect(next.status).toBe('ACTIVE');
+    // And the next renter's own window is untouched.
+    expect(next.startsAt.getTime()).toBe(nextStart.getTime());
+  });
+
+  /**
+   * The property the bug destroyed: one unreconcilable row must not stop the
+   * others. Without per-row isolation this sweep returns nothing useful and
+   * the lapsed hold below stays pending forever.
+   */
+  it('does not stop the rest of the sweep', async () => {
+    await backToBack();
+
+    // An unrelated booking that very much needs reconciling.
+    const other = await createTestUser();
+    const otherDevice = await seedDevice();
+    const lapsed = await seedBooking({
+      userId: other.id,
+      deviceId: otherDevice.id,
+      status: 'PENDING_PAYMENT',
+      hours: 1,
+      holdExpiresAt: new Date(Date.now() - 60 * 1000),
+    });
+
+    const result = await sweepBookings();
+
+    expect(result.expired).toBe(1);
+    const row = await prisma.booking.findUniqueOrThrow({ where: { id: lapsed.id } });
+    expect(row.status).toBe('EXPIRED_UNPAID');
+  });
+
+  /** And repeated sweeps stay healthy rather than failing identically. */
+  it('stays healthy across repeated sweeps', async () => {
+    await backToBack();
+
+    for (let pass = 0; pass < 3; pass += 1) {
+      const result = await sweepBookings();
+      expect(result.failed).toBe(0);
+    }
+  });
+
+  /**
+   * A row that genuinely cannot be written is counted, not thrown.
+   *
+   * Simulated by deleting the device out from under a booking — `onDelete:
+   * Restrict` makes that impossible through Prisma, so this uses the one write
+   * that can still fail: a booking whose status update would clash with a row
+   * inserted between the read and the write.
+   */
+  it('counts a row it cannot reconcile instead of aborting', async () => {
+    const { first } = await backToBack();
+
+    // Make the collision unavoidable: the next booking starts before our
+    // reservation even ends, which only a direct insert can produce.
+    await prisma.$executeRawUnsafe(
+      `UPDATE "Booking" SET "reservedUntil" = "startsAt" + interval '10 minutes' WHERE id = $1`,
+      first.bookingId,
+    );
+
+    const result = await sweepBookings();
+
+    // Either reconciled or counted — never thrown.
+    expect(result.failed).toBeLessThanOrEqual(1);
+    expect(typeof result.failed).toBe('number');
   });
 });

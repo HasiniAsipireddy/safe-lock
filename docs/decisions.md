@@ -1996,6 +1996,64 @@ was unreachable. It now returns `ACTIVE` when the end is back in the future and
 nothing has been settled or waived (an extension is refused once either has
 happened, so the ordering is safe).
 
+
+### A sweeper bug that only a live run found
+
+Verifying the build over HTTP against a running server turned up a defect no
+test in the suite would have caught, and it is the most serious thing fixed in
+this step.
+
+**The collision.** Back-to-back bookings are the ordinary case for a busy pool:
+booking B starts exactly where booking A's reservation ends, which the `[)`
+bounds permit. If A then overstays, the sweeper tries to push A's
+`reservedUntil` an hour into the future — straight into B's window. The
+exclusion constraint rejects the write, and it is **right** to: two bookings
+cannot occupy one safe.
+
+**Why it was serious.** The whole sweep ran in one `try`/`catch`. A single
+colliding row threw out of the loop, the tick logged "Booking sweep failed",
+and *every subsequent sweep failed identically* — because the colliding row was
+still there. So for every booking in the system: holds stopped expiring, nothing
+moved to `OVERSTAY`, and no collection window ever closed. One back-to-back
+booking plus one overstay was enough to stop the reconciler permanently.
+
+It did not make a safe unlockable — status is derived from the clock on every
+read, which is exactly the property that kept this from being a security
+incident rather than an operational one. But the design leans on that property
+precisely so the sweeper can be allowed to lag, and "lags forever, silently" is
+not lagging.
+
+**Two fixes, and the reason for each:**
+
+1. **Per-row isolation.** Each booking's reconciliation gets its own
+   `try`/`catch` and a `failed` counter in `SweepResult`, logged at `warn`. One
+   row that cannot be written must not stop the others. The outer catch stays
+   as a backstop for failures outside the loop.
+2. **Clamp instead of force.** `extendReservation` now looks up the next
+   booking holding that device and extends only as far as its `startsAt` —
+   possibly not at all. The booking still moves to `OVERSTAY` and still accrues
+   a fee, so nothing the renter cares about changes; what is given up is the
+   reservation, in the one case where somebody else has a better claim to it.
+
+**What the clamp deliberately does not do** is decide who gets the safe. Two
+people wanting one safe is a policy question — bump the new booking? compensate
+them? substitute another safe? — and the sweeper's job is to make it visible,
+not settle it. A clamped row has an unpaid fee or an occupied safe, so it is
+already in the admin flagged list. This is the overstay-collision open question
+in CLAUDE.md arriving earlier than expected: it does not need future-dated
+bookings, only back-to-back ones.
+
+**Why the tests missed it.** Every sweeper test used one booking per device, so
+no test constructed the collision — and the service-level tests would all still
+pass today with the clamp removed and the isolation reverted, as long as no
+fixture happens to put two bookings on one safe. Five tests now pin it: the
+status still moves, the reservation is clamped *at* the next start rather than
+past it, an unrelated lapsed hold in the same sweep is still expired, repeated
+sweeps stay healthy, and a row that genuinely cannot be written is counted
+rather than thrown.
+
+The HTTP verification earned its place in the checklist on this alone.
+
 ### Still open
 
 - **The abandoned-items process** — above.

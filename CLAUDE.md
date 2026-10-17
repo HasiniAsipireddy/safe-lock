@@ -640,12 +640,19 @@ portable to PowerShell, so use two terminals.
   the one outcome worth avoiding at any cost. **Needs deciding:** how long to
   hold an abandoned safe, how to contact the renter, what disposal is lawful,
   and who signs it off. Probably a legal question as much as a product one.
-- **Future-dated bookings — not built, and they change the overstay rules.**
-  Bookings are "from now" only. Once someone can book next Tuesday, an overstay
-  will be able to collide with a reservation that was legitimately sold. Today
-  that is handled by refusing the extension and leaving the overstayer in place,
-  which is right for back-to-back but is not a policy for a future collision
-  (bump? compensate? substitute safe?).
+- **Who gets the safe when an overstay collides with the next booking? — open,
+  and reachable today.** It does not need future-dated bookings, only
+  back-to-back ones. The sweeper now **clamps** the overstaying booking's
+  reservation at the next booking's start rather than forcing past it (which
+  the exclusion constraint rightly refused, and which used to abort every
+  sweep — see `docs/decisions.md`). The overstayer keeps the safe physically
+  and keeps accruing a fee; the next renter keeps their booking. **Needs
+  deciding:** bump the new booking, compensate them, substitute another safe,
+  or refuse back-to-back bookings tighter than the turnaround. The flagged
+  list surfaces it; nothing resolves it.
+- **Future-dated bookings — not built.** Bookings are "from now" only. Adding
+  them widens the collision above from "the next hour" to "next Tuesday", and
+  would want a real answer to it first.
 - **Serial number format is provisional** (`^SAFE-[0-9A-Z]{4,12}$`). Confirm what the
   units are actually stamped with, and whether the serial is also the device's MQTT
   identity, **before ordering hardware** — changing it later means a migration plus
