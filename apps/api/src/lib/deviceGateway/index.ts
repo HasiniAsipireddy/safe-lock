@@ -1,5 +1,6 @@
 import { env } from '../../config/env';
 import { MockDeviceGateway } from './mock.gateway';
+import { MqttDeviceGateway } from './mqtt.gateway';
 import type { DeviceGateway } from './gateway';
 
 export {
@@ -10,6 +11,7 @@ export {
   type PublishResult,
 } from './gateway';
 export { MockDeviceGateway } from './mock.gateway';
+export { MqttDeviceGateway } from './mqtt.gateway';
 
 /**
  * The gateway the application talks to.
@@ -28,6 +30,8 @@ function resolveGateway(): DeviceGateway {
   switch (env.DEVICE_GATEWAY) {
     case 'mock':
       return new MockDeviceGateway();
+    case 'mqtt':
+      return new MqttDeviceGateway();
     default:
       // Unreachable: the env schema is an enum. Kept so adding a value to that
       // enum without an implementation fails loudly at boot.

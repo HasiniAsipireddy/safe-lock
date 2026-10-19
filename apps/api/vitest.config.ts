@@ -55,6 +55,20 @@ export default defineConfig({
        */
       DEVICE_COMMAND_HMAC_SECRET: 'test_device_command_secret_for_vitest_32+chars',
       DEVICE_COMMAND_KEY_VERSION: '1',
+
+      /**
+       * Broker settings, so `MqttDeviceGateway` can be *constructed and
+       * started* in its unit test against a stubbed `mqtt.connect` — exactly
+       * as the Cloud API WhatsApp client is unit-tested against a stubbed
+       * `fetch`.
+       *
+       * `DEVICE_GATEWAY` stays `mock`, so nothing in the suite resolves to
+       * this gateway and no test can reach a broker. These values are
+       * throwaway strings and are never dialled.
+       */
+      MQTT_URL: 'mqtt://localhost:1883',
+      MQTT_USERNAME: 'vitest-api-client',
+      MQTT_PASSWORD: 'vitest_mqtt_password_do_not_use',
       RAZORPAY_KEY_ID: 'rzp_test_vitest',
       RAZORPAY_KEY_SECRET: 'vitest_key_secret_do_not_use_anywhere',
       RAZORPAY_WEBHOOK_SECRET: 'vitest_webhook_secret_do_not_use_anywhere',

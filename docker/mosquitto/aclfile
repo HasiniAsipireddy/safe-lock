@@ -1,0 +1,40 @@
+# Topic permissions, mirroring what production enforces.
+#
+# This file is the local expression of docs/device-protocol.md §1.3. HiveMQ
+# Cloud and EMQX express the same thing as per-credential permissions with
+# identity substitution; AWS IoT Core expresses it as a policy attached to the
+# certificate, with `${iot:Connection.Thing.ThingName}` — which is the
+# strongest version, because a stolen certificate used from a different client
+# id fails to connect at all.
+
+# --- The API: one privileged server client, never a device identity ----------
+#
+# Note the asymmetry. The server may write to any command topic and read any
+# report, and **cannot write** to ack/state/status. There is no reason for the
+# server to forge a device report, so it is denied the ability — which means a
+# compromised API credential cannot fabricate the security record of a physical
+# safe, only issue commands it could issue anyway.
+user safelock-api-local
+topic write safelock/v1/+/cmd
+topic read safelock/v1/+/ack
+topic read safelock/v1/+/state
+topic read safelock/v1/+/status
+
+# --- Devices -----------------------------------------------------------------
+#
+# A device may publish ONLY to its own ack/state/status and subscribe ONLY to
+# its own cmd. `%u` is Mosquitto's substitution for the authenticated username,
+# which for a device is its serial number — the same value as its client id and
+# (in production) its certificate CN, so one identity drives the whole ACL and
+# there is no lookup table to get out of sync.
+#
+# Expressed as a pattern rather than per-device stanzas, so adding a device to
+# the local fleet is a password-file entry and not an ACL edit.
+#
+# This is what signatures alone would not give us: device A holds a valid key
+# of its own and could otherwise publish a correctly-signed message to device
+# B's ack topic.
+pattern read safelock/v1/%u/cmd
+pattern write safelock/v1/%u/ack
+pattern write safelock/v1/%u/state
+pattern write safelock/v1/%u/status

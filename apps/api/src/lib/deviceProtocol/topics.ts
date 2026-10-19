@@ -28,6 +28,15 @@ const ROOT = `safelock/v${PROTOCOL_VERSION}`;
 
 export type DeviceTopicKind = 'cmd' | 'ack' | 'state' | 'status';
 
+/**
+ * The kinds a *device* may publish — which is every kind except `cmd`.
+ *
+ * A separate type rather than a runtime check at the handler, so the compiler
+ * knows that nothing arriving from a device can be a command. The ACL says the
+ * same thing at the broker; this says it to the type system.
+ */
+export type InboundTopicKind = Exclude<DeviceTopicKind, 'cmd'>;
+
 export function deviceTopic(serialNumber: string, kind: DeviceTopicKind): string {
   return `${ROOT}/${serialNumber}/${kind}`;
 }
@@ -55,7 +64,7 @@ export const INBOUND_TOPIC_FILTERS = [
  */
 export function parseDeviceTopic(
   topic: string,
-): { serialNumber: string; kind: DeviceTopicKind } | null {
+): { serialNumber: string; kind: InboundTopicKind } | null {
   const segments = topic.split('/');
   if (segments.length !== 4) return null;
 

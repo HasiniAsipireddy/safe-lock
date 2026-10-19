@@ -57,11 +57,17 @@ phone still has no password-reset channel — the one real gap, tracked in
 ```bash
 npm install
 
-# Start PostgreSQL 16 in Docker.
+# Start PostgreSQL 16 and the development MQTT broker in Docker.
 #
-# It binds host port 5433, NOT the default 5432, so it cannot clash with a
+# Postgres binds host port 5433, NOT the default 5432, so it cannot clash with a
 # PostgreSQL service already installed on your machine. The container creates
 # two databases on first start: `safelock` and `safelock_test`.
+#
+# Mosquitto binds 1883 and is only needed for the device protocol
+# (`DEVICE_GATEWAY=mqtt`). It enforces the same per-device topic ACLs
+# production does — see docs/device-protocol.md §9. The default
+# `DEVICE_GATEWAY=mock` ignores it entirely, and the test suite never
+# connects to it.
 npm run db:up
 
 # Backend config. The committed example already points at the Docker database.

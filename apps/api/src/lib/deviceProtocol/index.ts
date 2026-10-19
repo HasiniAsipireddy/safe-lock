@@ -53,4 +53,5 @@ export {
   parseDeviceTopic,
   PROTOCOL_VERSION,
   type DeviceTopicKind,
+  type InboundTopicKind,
 } from './topics';

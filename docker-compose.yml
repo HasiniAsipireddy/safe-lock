@@ -1,11 +1,12 @@
-# Local development database for the Safe Lock platform.
+# Local development services for the Safe Lock platform: Postgres, and an MQTT
+# broker for the device protocol.
 #
 # Host port 5433 is used on purpose: the dev machine already runs a local
 # PostgreSQL 16 service on the default 5432, and this container must not clash
 # with it. Inside the container Postgres still listens on 5432.
 #
 # These credentials are development-only. Production uses a managed database
-# with secrets supplied through the environment.
+# and a managed broker, with secrets supplied through the environment.
 
 services:
   postgres:
@@ -29,5 +30,46 @@ services:
       retries: 10
       start_period: 10s
 
+  # The device protocol's broker.
+  #
+  # Mosquitto is rejected for production — TLS certificate renewal,
+  # availability and monitoring for the transport that opens physical safes is
+  # not where a small team's operational attention should go (see
+  # docs/device-protocol.md §9). It is exactly right for development, and it
+  # enforces **the same topic ACLs production does**: a protocol tested only
+  # against a permissive broker is a protocol whose ACLs are untested, and the
+  # ACL is what stops one device attacking another.
+  #
+  # Plaintext on 1883, localhost only. TLS here would mean a local CA, a
+  # certificate to regenerate every time it expired, and a `rejectUnauthorized:
+  # false` somewhere — which is a worse habit to build than an unencrypted hop
+  # between two processes on one machine. The env schema requires TLS in
+  # production.
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: safelock-mosquitto
+    restart: unless-stopped
+    ports:
+      - '1883:1883'
+    volumes:
+      - ./docker/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./docker/mosquitto/aclfile:/mosquitto/config/aclfile:ro
+      - ./docker/mosquitto/passwordfile:/mosquitto/config/passwordfile:ro
+      - safelock-mosquitto-data:/mosquitto/data
+    healthcheck:
+      # `mosquitto_sub` with a 2s timeout: a broker that accepts a connection
+      # and a subscription is a broker that works, which `nc -z` would not
+      # establish.
+      test:
+        [
+          'CMD-SHELL',
+          'mosquitto_sub -h localhost -p 1883 -u safelock-api-local -P safelock_dev_only -t safelock/v1/+/state -W 2 -C 1 -E || exit 0',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
 volumes:
   safelock-pgdata:
+  safelock-mosquitto-data:
