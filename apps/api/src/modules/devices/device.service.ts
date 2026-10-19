@@ -274,8 +274,12 @@ export async function listDevices(query: ListDevicesQuery): Promise<Paginated<Ad
     }),
   ]);
 
+  // One clock reading for the whole page, so two rows cannot disagree about
+  // whether the same moment counts as offline.
+  const now = new Date();
+
   return {
-    items: rows.map(toAdminDeviceRow),
+    items: rows.map((row) => toAdminDeviceRow(row, now)),
     page: query.page,
     pageSize: query.pageSize,
     total,

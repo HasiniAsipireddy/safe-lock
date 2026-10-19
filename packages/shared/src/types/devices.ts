@@ -1,6 +1,13 @@
 import type { PaymentStatus } from './payments';
 import type { UserRole } from './auth';
 import type { BookingStatus, PaymentPurpose, PaymentReviewReason } from './bookings';
+import type {
+  CommandActor,
+  CommandFailureCategory,
+  CommandStatus,
+  CommandType,
+  DoorState,
+} from './commands';
 
 /**
  * Mirrors the Prisma `DeviceStatus` enum.
@@ -30,9 +37,26 @@ export interface DeviceSummary {
   lockState: LockState;
   /** ISO timestamp of the last confirmed lock-state change, or null. */
   lockStateUpdatedAt: string | null;
+  /**
+   * Whether we can reach the safe right now.
+   *
+   * **Derived on read** from the age of the last verified device message, not
+   * served from a stored boolean — a retained status flag is a claim about a
+   * moment, and the question the dashboard is asking is about now. False
+   * disables the controls with a reason rather than letting someone tap a
+   * button that cannot work.
+   */
   online: boolean;
   /** ISO timestamp of the last device heartbeat, or null if never seen. */
   lastSeenAt: string | null;
+  /**
+   * Whether the door is shut, as last measured by the safe's own sensor.
+   *
+   * Separate from `lockState` because a bolt can be extended with the door
+   * standing open, and a renter is entitled to know the difference. `UNKNOWN`
+   * means the sensor did not report — a fault, never "no sensor fitted".
+   */
+  doorState: DoorState;
 }
 
 /**
@@ -117,6 +141,78 @@ export interface AdminDeviceRow {
    */
   inspectionNote: string | null;
   inspectionNotedAt: string | null;
+
+  // --- What the hardware reports about itself. Diagnostics, not authority. ---
+
+  firmwareVersion: string | null;
+  /**
+   * Wi-Fi signal strength in dBm, or null if never reported.
+   *
+   * Shown because a metal safe is a Faraday cage and the most likely field
+   * failure is a unit on the edge of range — a number in a list is an order of
+   * magnitude cheaper to act on than a site visit.
+   */
+  rssi: number | null;
+  /**
+   * Whether the device's clock synced. Gates nothing: replay protection comes
+   * from the sequence number, so a device with no time source still operates
+   * normally. Shown so a fleet-wide SNTP problem is visible.
+   */
+  clockSynced: boolean | null;
+  /** Whether a credential has been issued. Never the credential itself. */
+  credentialIssued: boolean;
+  credentialIssuedAt: string | null;
+  /** Set when a system lock exhausted its retries without an ack. */
+  lockCommandFailedAt: string | null;
+  /**
+   * Why this device needs attention, as a closed set. Empty for a healthy one.
+   *
+   * Surfaced the way the Bookings tab already opens on "needs attention": a
+   * safe somebody has paid for and we cannot reach must not require scrolling
+   * to discover.
+   */
+  flags: DeviceFlag[];
+}
+
+/**
+ * Why a device is flagged.
+ *
+ * A closed enum rather than a message so the UI owns the wording and the API
+ * owns the fact — and so a new reason cannot be added without a decision about
+ * how it reads.
+ */
+export type DeviceFlag =
+  /** Offline while somebody holds a live booking on it. They have paid. */
+  | 'OFFLINE_WITH_BOOKING'
+  /** `COMMAND_FAILURE_FLAG_THRESHOLD` consecutive failed or timed-out commands. */
+  | 'CONSECUTIVE_COMMAND_FAILURES'
+  /** A system lock exhausted its retries. The safe may be standing open. */
+  | 'LOCK_COMMAND_FAILED'
+  /** Reported `UNLOCKED` with no booking entitled to have it open (§8.3). */
+  | 'UNEXPECTED_UNLOCKED'
+  /** The door sensor is not reporting. Units ship with one; this is a fault. */
+  | 'DOOR_STATE_UNKNOWN';
+
+/**
+ * One row of a device's recent-commands expander.
+ *
+ * Carries no signature, no sequence number and no signing input. A sequence
+ * number is not a secret, but it is an input to a signed canonical string, and
+ * the rule for this codebase is that nothing feeding a signature is serialised
+ * to a client — the same discipline that keeps `credentialHash` out of every
+ * `select`.
+ */
+export interface AdminCommandRow {
+  id: string;
+  type: CommandType;
+  status: CommandStatus;
+  failureCategory: CommandFailureCategory | null;
+  /** `'USER'` when a person asked, otherwise which system actor did. */
+  actor: CommandActor | 'USER';
+  issuedAt: string;
+  /** Milliseconds from publish to ack, or null if it never acked. */
+  latencyMs: number | null;
+  lateAcked: boolean;
 }
 
 /** The occupying booking, as shown on a device or user row. */

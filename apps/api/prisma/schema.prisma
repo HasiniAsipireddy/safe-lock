@@ -1,9 +1,9 @@
 // Safe Lock platform — database schema.
 //
-// Scope note: users, payments, device inventory/allocation and the lock/unlock
-// flow are all here. `Command` (see CLAUDE.md "Data Model") is deliberately
-// absent — the mock gateway acks synchronously, so there is nothing to track
-// asynchronously or time out yet. It lands with the real MQTT gateway.
+// Scope note: users, payments, device inventory and the lock/unlock flow are
+// all here. `Command` landed with the MQTT gateway (docs/device-protocol.md):
+// a transport that can lose, delay or duplicate a message gives a command a
+// life of its own, so it needs a row, a sequence number and a timeout.
 
 generator client {
   provider = "prisma-client-js"
@@ -84,9 +84,122 @@ enum PaymentReviewReason {
 enum LockState {
   LOCKED
   UNLOCKED
-  /// Only for a device nobody owns. An allocated safe is never UNKNOWN —
-  /// allocation sets LOCKED, unassign sets it back to UNKNOWN.
+  /// We do not know. A device that has never reported, or one whose report we
+  /// could not verify. Refused rather than guessed at — `assertCanOperate`
+  /// throws `DEVICE_STATE_UNKNOWN` rather than sending a bolt command on a
+  /// state it cannot reason about.
   UNKNOWN
+}
+
+/// Whether the safe's door is shut, as measured by its sensor.
+///
+/// **Units ship with a door sensor, and a unit without one is not supported
+/// for rentals** (decided 2026-10-19, docs/device-protocol.md §11.8). Without
+/// it, "locked" cannot be distinguished from "bolt extended into thin air",
+/// which is the one check the completion flow actually needs.
+///
+/// `UNKNOWN` therefore means *we do not know* — a failed sensor
+/// (`SENSOR_FAULT`), or firmware that has not read it yet — and never "there
+/// is no sensor". It is a fault to surface, not a configuration to support.
+/// Not nullable, because a nullable column invites "absent means closed",
+/// which is the wrong direction to guess in when someone's property is inside.
+enum DoorState {
+  CLOSED
+  OPEN
+  UNKNOWN
+}
+
+/// The two things a safe can be told to do.
+///
+/// Two values rather than a parameterised command, mirroring the two
+/// `DeviceGateway` methods: unlocking has a precondition (a verified OTP) that
+/// locking does not, and that asymmetry should be visible at every call site.
+enum CommandType {
+  LOCK
+  UNLOCK
+}
+
+/// Where a command got to.
+///
+/// `EXPIRED` and `TIMED_OUT` are distinct because they fail differently.
+/// `TIMED_OUT` means the device did not answer — it may well have acted, so
+/// the physical state is genuinely unknown and needs reconciling. `EXPIRED`
+/// means the command never left the building (broker down, or the process died
+/// between commit and publish), so we know nothing moved and a retry is safe.
+/// Collapsing them would force one response to two opposite situations.
+enum CommandStatus {
+  /// Row committed, nothing published yet. Publishing happens after the
+  /// commit, never inside the transaction — a rollback cannot un-publish.
+  PENDING
+  /// The broker accepted the publish (PUBACK).
+  SENT
+  /// The device acked `OK`: it acted and the mechanism got there.
+  ACKED
+  /// The device refused it before acting. Nothing moved.
+  REJECTED
+  /// The device tried and the mechanism did not get there.
+  FAILED
+  /// Published, no ack by `expiresAt`.
+  TIMED_OUT
+  /// Never published before `expiresAt`.
+  EXPIRED
+  /// Withdrawn before it could settle, because its premise stopped being true
+  /// — a late ack proving the bolt already moved, or a device state change
+  /// that makes a queued system retry pointless.
+  CANCELLED
+}
+
+/// Why a command did not succeed, as a closed set.
+///
+/// The first group mirrors the device's ack `reason` enum
+/// (docs/device-protocol.md §4.1); the last three are server-side failures the
+/// device never saw. Never a broker or provider string — exactly the rule
+/// `OutboundFailureCategory` follows, and for the same reason: an unbounded,
+/// unversioned error string is the kind of thing that ends up quoted in a UI.
+enum CommandFailureCategory {
+  // --- The device refusing (REJECTED) ---
+  BAD_VERSION
+  BAD_KEY_VERSION
+  WRONG_DEVICE
+  BAD_SIGNATURE
+  SEQ_REPLAY
+  DUPLICATE
+  EXPIRED
+  /// A second command arrived while one was in flight. The device holds no
+  /// queue, by design.
+  UNSUPPORTED
+
+  // --- The mechanism failing (FAILED) ---
+  MOTOR_FAULT
+  JAMMED
+  DOOR_OBSTRUCTED
+  LOW_POWER
+  SENSOR_FAULT
+
+  // --- Our side ---
+  /// Published, never acked.
+  NO_ACK
+  /// The broker rejected or dropped the publish.
+  PUBLISH_FAILED
+  /// Still `PENDING` at its expiry: it never reached the broker at all.
+  NOT_PUBLISHED
+  /// Withdrawn deliberately. See `CommandStatus.CANCELLED`.
+  SUPERSEDED
+}
+
+/// Who asked for a command, when it was not a user.
+///
+/// Exactly one of `Command.userId` and `Command.systemActor` is set. A system
+/// command has nobody waiting on an answer, which is what licenses it to retry
+/// — see docs/device-protocol.md §6.2 and §8.
+enum CommandActor {
+  /// The completion lock, issued when a booking ends.
+  COMPLETION
+  /// The reconciler: a safe reported itself open with no booking entitled to
+  /// have it open (§8.3), or a timeout needed following up.
+  SWEEPER
+  /// An admin acting on a device directly.
+  ADMIN
 }
 
 /// What happened to a safe. Append-only; the /history page reads these.
@@ -116,6 +229,21 @@ enum UnlockFailureReason {
   TOO_MANY_ATTEMPTS
   /// No code was outstanding — never requested, already used, or superseded.
   NO_CHALLENGE
+
+  // --- The code was right and the safe still did not open. ------------------
+  // Four new ways to fail, all of them *after* a correct code, which the mock
+  // gateway could not produce: it acked synchronously and always. Existing
+  // rows and existing reasons are untouched.
+
+  /// The command was published and the device never answered. The physical
+  /// state is genuinely unknown — it may have opened. See §5.5 on late acks.
+  DEVICE_TIMEOUT
+  /// The device refused the command before acting. Nothing moved.
+  DEVICE_REJECTED
+  /// The device tried and the mechanism did not get there.
+  DEVICE_FAILED
+  /// We could not reach the device at all, so no command was issued.
+  DEVICE_OFFLINE
 }
 
 /// Why a refresh token was revoked.
@@ -309,8 +437,58 @@ model Device {
   /// which is set only when a command is *acked*, not when one is sent.
   lockState           LockState @default(LOCKED)
   lockStateUpdatedAt  DateTime?
+  /// The device's own claim, from its retained `/status` topic and its last
+  /// will. **Never the authority on its own** — `online` is derived on read
+  /// from `lastSeenAt` as well, so a stale retained flag or a broker that lost
+  /// a will cannot be the whole answer. Same reflex as
+  /// `effectiveBookingStatus`. See docs/device-protocol.md §6.1.
   online              Boolean   @default(false)
+  /// Advanced by **any** verified inbound message — ack, state or status.
   lastSeenAt          DateTime?
+
+  /// Whether the door is shut, as last measured. Distinct from `lockState`:
+  /// a bolt can be extended with the door standing open, and the completion
+  /// flow needs to tell those apart. See `DoorState`.
+  doorState           DoorState @default(UNKNOWN)
+
+  // --- What the device reports about itself. Diagnostics, never authority. ---
+
+  firmwareVersion String?
+  /// Wi-Fi signal strength in dBm. Present because the single most likely
+  /// field failure is a safe on the edge of range inside a metal box, and that
+  /// is far cheaper to diagnose from a number than from a site visit.
+  rssi            Int?
+  /// Whether the device's SNTP sync succeeded. A device with no time source
+  /// still operates normally — replay protection comes from `commandSeq`, not
+  /// from a clock — so this is shown to admins and gates nothing.
+  clockSynced     Boolean?
+  /// Random per boot. How the server notices a restart even if it missed the
+  /// `BOOT` state report.
+  bootId          String?
+
+  /// Next command sequence number, allocated under the device row lock.
+  ///
+  /// Strictly increasing per device, and the device persists the highest it has
+  /// seen, so a captured command cannot be replayed: its number is spent. A
+  /// rolled-back transaction leaves a gap, which is fine — the device requires
+  /// *increasing*, not contiguous.
+  commandSeq Int @default(0)
+
+  /// Set when a system LOCK exhausted its retries without an ack.
+  ///
+  /// The escalation the roadmap owed this path: today's best-effort version can
+  /// record a safe as closed while it stands physically open. A device carrying
+  /// this is flagged for admins and moved to `NEEDS_INSPECTION`.
+  lockCommandFailedAt DateTime?
+
+  /// Set when the device reported itself `UNLOCKED` with no booking entitled to
+  /// have it open, and cleared when a later report shows it `LOCKED`.
+  ///
+  /// Flagged **on issue** of the reconciling LOCK rather than on its failure: a
+  /// safe found open with nobody entitled to it is already an incident, and the
+  /// lock succeeding makes it a resolved one rather than a non-event. See
+  /// docs/device-protocol.md §8.3.
+  unexpectedUnlockAt DateTime?
 
   /// Set when a booking ended without the renter confirming collection, and
   /// cleared by an admin with an audited note. A device with this set is not
@@ -318,10 +496,25 @@ model Device {
   inspectionNote    String?
   inspectionNotedAt DateTime?
 
-  /// Reserved for the hardware phase: a hash or key-reference for per-device
-  /// credentials. **Never populated or returned by any endpoint today**, and
-  /// excluded from every `select` list. No device secrets are stored yet.
+  /// `sha256` of the device's MQTT password, set when a credential is minted
+  /// and nulled when the device is retired.
+  ///
+  /// **Never returned by any endpoint**, in no `select` list, and asserted
+  /// absent by the admin no-secrets test. The password itself is shown exactly
+  /// once, at issue, and there is no endpoint that reads one back.
+  ///
+  /// Note what is *not* here: the device's command key `K_d`. That is derived
+  /// on demand from one server-side master secret
+  /// (`DEVICE_COMMAND_HMAC_SECRET`) and the serial, so a database leak yields
+  /// no device key — because no device key is in the database. See
+  /// docs/device-protocol.md §2.2.
   credentialHash String?
+  /// When the credential was issued, for the admin panel. Null until provisioned.
+  credentialIssuedAt DateTime?
+  /// Which `keyVersion` this device's `K_d` was derived at, so the master
+  /// secret can be rotated without a flag day: the server signs with the
+  /// version the device actually holds. See §2.2.
+  commandKeyVersion Int @default(1)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -329,6 +522,7 @@ model Device {
   events           DeviceEvent[]
   unlockChallenges UnlockChallenge[]
   bookings         Booking[]
+  commands         Command[]
 
   /// Supports the "oldest AVAILABLE first" device pick.
   @@index([status, createdAt])
@@ -460,18 +654,144 @@ model UnlockChallenge {
   expiresAt DateTime
   /// Wrong guesses so far. At OTP_MAX_ATTEMPTS the challenge is dead.
   attempts  Int       @default(0)
-  /// Set when the code was accepted, or when the challenge was superseded by
-  /// a newer request. Either way it can never be used again.
+  /// Set when the code **opened a safe**, or when the challenge was superseded
+  /// by a newer request. Either way it can never be used again.
+  ///
+  /// Under MQTT a correct code no longer opens a safe by itself — it buys a
+  /// command, and a command can fail after the code was right. So this is
+  /// stamped when the device *acks*, not when the code is verified. See
+  /// `commandId` below and docs/device-protocol.md §5.6.
   consumedAt DateTime?
+
+  /// The command this code is currently backing, if any.
+  ///
+  /// **Bound at confirm, consumed at ack, released on a demonstrated
+  /// failure.** The conditional update that sets this from null is the
+  /// serialisation point: exactly one of N concurrent confirms wins, so exactly
+  /// one command is ever created and the loser sees `OTP_NOT_FOUND` — the same
+  /// property the old `consumedAt: null` claim had.
+  ///
+  /// Released (back to null) when the command demonstrably did not open
+  /// anything: `REJECTED`, `FAILED`, `EXPIRED`, or `TIMED_OUT` — the last in
+  /// the *same transaction* as the status change, so a finished command and a
+  /// reusable code become true together. Burning someone's code for our motor
+  /// fault would charge them for our hardware's mistake.
+  ///
+  /// Single-use stays literally true: what is reusable is a code that
+  /// demonstrably opened nothing, which is not a used code. And a release is
+  /// provisional — if a late ack later proves the bolt moved, `consumedAt` is
+  /// stamped and the code dies, whether or not it was handed out again (§5.5).
+  commandId String? @unique
+
+  /// How many commands this one code has backed. Capped at
+  /// `CHALLENGE_MAX_BINDS`, or a jammed motor and a determined user could spawn
+  /// commands until the code expired. Nothing about the code is *extended* to
+  /// make rebinding work: `expiresAt` and `attempts` are untouched, so five
+  /// guesses inside five minutes is still exactly what an attacker gets.
+  binds Int @default(0)
 
   createdAt DateTime @default(now())
 
-  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device  Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  command Command? @relation(fields: [commandId], references: [id], onDelete: SetNull)
 
   /// Finding the one open challenge for a user's device.
   @@index([userId, deviceId, consumedAt])
   @@index([expiresAt])
+}
+
+/// One instruction sent to one safe.
+///
+/// ## Why this table exists now and did not before
+/// The mock gateway acked synchronously and always, so there was nothing in
+/// flight: a command was a function call that had already finished by the time
+/// it returned. MQTT is a different world — a publish can be lost, delayed,
+/// duplicated or answered after we gave up — so a command acquires a life of
+/// its own, and a life needs a row. See docs/decisions.md.
+///
+/// ## Three invariants it carries
+/// 1. **Nothing is published inside a transaction.** The row is committed
+///    `PENDING`, then published; a rollback cannot un-publish, and a
+///    transaction that waits on a radio makes a network outage fatal — and
+///    holds the device row lock across it, serialising the whole fleet behind
+///    one slow safe.
+/// 2. **`seq` is allocated under the device row lock**, so two concurrent taps
+///    cannot be handed the same number, and the device can reject anything at
+///    or below the highest it has seen. That, not the clock, is what makes a
+///    captured command unreplayable.
+/// 3. **`Device.lockState` moves on the ack this row records, never on the
+///    publish.** A safe recorded as locked has reported itself locked.
+///
+/// ## One constraint Prisma cannot express
+/// A raw-SQL partial unique index, `Command_one_live_system_per_device`, allows
+/// at most one live (`PENDING`/`SENT`) command per device **among system
+/// commands**. Without it a safe wedged open would spawn a fresh reconcile on
+/// every 60-second heartbeat — an unbounded fan-out aimed at the one device
+/// least able to answer. User commands are outside it on purpose: they are
+/// answered rather than retried, and two tabs racing are already serialised by
+/// the device row lock. See the migration.
+model Command {
+  id       String @id @default(cuid())
+  deviceId String
+
+  /// The booking this was issued for. Null for a system command — a completion
+  /// lock, a reconcile, an admin action — which is exactly the set of commands
+  /// nobody is waiting on, and therefore the set that may retry.
+  bookingId String?
+
+  type   CommandType
+  status CommandStatus @default(PENDING)
+
+  /// Monotonic per device. See invariant 2 above.
+  seq Int
+
+  /// Publish attempts. A user command gets one — a person is standing there,
+  /// and a silent retry would answer a question they have already stopped
+  /// asking. A system LOCK retries up to `COMMAND_MAX_ATTEMPTS`.
+  attempts Int @default(0)
+
+  issuedAt DateTime @default(now())
+  /// `issuedAt + COMMAND_TTL_MS`. The **server's** authority on "too late";
+  /// the device enforces its own `ttlMs` from a monotonic counter, because a
+  /// freshly booted ESP32 has no trusted wall clock.
+  expiresAt DateTime
+  sentAt    DateTime?
+  ackedAt   DateTime?
+
+  /// Set when the ack arrived after this row was already `TIMED_OUT`.
+  ///
+  /// The physical record is still updated from the measurement — the safe's
+  /// actual state is not in dispute just because our timer expired — but the
+  /// row remembers that we had already told the user it failed. A dashboard
+  /// showing "failed" and a database saying "acked", with nothing explaining
+  /// the gap, is an unexplainable contradiction. See §5.5.
+  lateAckedAt DateTime?
+
+  failureCategory CommandFailureCategory?
+
+  /// Who asked. **Exactly one of `userId` and `systemActor` is set**, which is
+  /// also the test for "is anyone waiting on this".
+  userId      String?
+  systemActor CommandActor?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  /// At most one challenge is ever bound to a command. The unique side of the
+  /// relation lives on `UnlockChallenge.commandId`.
+  challenge UnlockChallenge?
+
+  /// The database insisting on what the row lock computes.
+  @@unique([deviceId, seq])
+  /// The timeout sweeper's query.
+  @@index([status, expiresAt])
+  /// The admin "recent commands" expander, and the consecutive-failure count.
+  @@index([deviceId, issuedAt])
+  /// Finding a user's in-flight command for the status endpoint.
+  @@index([userId, issuedAt])
 }
 
 /// One row per issued refresh token.

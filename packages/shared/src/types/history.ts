@@ -22,7 +22,20 @@ export type UnlockFailureReason =
   | 'WRONG_CODE'
   | 'EXPIRED'
   | 'TOO_MANY_ATTEMPTS'
-  | 'NO_CHALLENGE';
+  | 'NO_CHALLENGE'
+  /**
+   * The four below are failures **after a correct code** — ways an unlock can
+   * fail that the mock gateway could not produce, because it acked
+   * synchronously and always.
+   *
+   * `DEVICE_TIMEOUT` is the one to word carefully: the device did not answer,
+   * which is not the same as the safe not opening. It may have. A late ack
+   * will write an `UNLOCK_CONFIRMED` after this row if it did.
+   */
+  | 'DEVICE_TIMEOUT'
+  | 'DEVICE_REJECTED'
+  | 'DEVICE_FAILED'
+  | 'DEVICE_OFFLINE';
 
 /**
  * One row of the `/history` page.

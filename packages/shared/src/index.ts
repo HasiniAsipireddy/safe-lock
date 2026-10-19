@@ -12,6 +12,7 @@ export * from './schemas/payments';
 export * from './schemas/phone';
 export * from './types/auth';
 export * from './types/bookings';
+export * from './types/commands';
 export * from './types/devices';
 export * from './types/history';
 export * from './types/payments';

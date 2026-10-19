@@ -102,6 +102,21 @@ export const UNLOCK_FAILURE_LABELS: Record<UnlockFailureReason, string> = {
   EXPIRED: 'Code had expired',
   TOO_MANY_ATTEMPTS: 'Too many incorrect codes',
   NO_CHALLENGE: 'No code was outstanding',
+
+  /**
+   * The four device failures. Worded to be true about a *physical* safe, which
+   * is harder than it looks.
+   *
+   * `DEVICE_TIMEOUT` says "did not respond" and pointedly does **not** say the
+   * safe stayed shut, because we do not know that — the device may have opened
+   * and lost its ack. If it did, a later `UNLOCK_CONFIRMED` appears above this
+   * row, and the two read consistently only if this one never claimed more
+   * than it knew.
+   */
+  DEVICE_TIMEOUT: 'Safe did not respond',
+  DEVICE_REJECTED: 'Safe refused the command',
+  DEVICE_FAILED: 'Safe could not open',
+  DEVICE_OFFLINE: 'Safe was offline',
 };
 
 /** Heading and supporting line for each notification type. */

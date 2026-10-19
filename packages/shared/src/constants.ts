@@ -171,6 +171,44 @@ export const ERROR_CODES = {
   /** The device gateway refused or failed to deliver the command. */
   DEVICE_COMMAND_FAILED: 'DEVICE_COMMAND_FAILED',
   /**
+   * We cannot reach the safe right now.
+   *
+   * **A 409, and it refuses rather than queues** — including a lock. That is
+   * not a weakening of "never block locking": that rule is about *policy*
+   * gates (no code, no settled fee, no verified phone needed to secure your
+   * safe) and it stands. This is physics. A queued lock firing forty minutes
+   * later would either show a safe as locked when it is not, or sit invisibly
+   * pending; "we cannot reach your safe right now" is the only honest answer,
+   * and the UI pairs it with the physical remedy.
+   *
+   * Returned by the unlock *request* too, before a code is sent: issuing an
+   * OTP for a safe that cannot receive a command spends the user's send cap
+   * and their three-codes-per-ten-minutes on a code that cannot work.
+   */
+  DEVICE_OFFLINE: 'DEVICE_OFFLINE',
+  /**
+   * The device is not in a state the server will send this command to.
+   *
+   * Specifically: no `UNLOCK` is ever issued to a safe that is not
+   * `AVAILABLE`. A `NEEDS_INSPECTION` device keeps its credential — it is
+   * still in the field and an admin needs to reach it — so the refusal lives
+   * here, in the issuer, rather than depending on broker state or on the
+   * booking pick having excluded it. `LOCK` is still permitted: a safe under
+   * inspection is exactly one an admin may need to close.
+   */
+  DEVICE_NOT_OPERABLE: 'DEVICE_NOT_OPERABLE',
+  /** No command with that id, or it does not belong to the caller. */
+  COMMAND_NOT_FOUND: 'COMMAND_NOT_FOUND',
+  /**
+   * The code was correct but has now backed `CHALLENGE_MAX_BINDS` commands,
+   * none of which opened anything. Request a new one.
+   *
+   * Its own code because the remedy differs from every other OTP failure:
+   * nothing the user typed was wrong, and the honest message is about the
+   * safe, not about them.
+   */
+  OTP_BIND_LIMIT_REACHED: 'OTP_BIND_LIMIT_REACHED',
+  /**
    * The device's lock state is UNKNOWN, so no command can be reasoned about.
    * Should not occur for an owned device — allocation sets LOCKED.
    */
@@ -223,6 +261,32 @@ export const COLLECTION_REMINDER_LEAD_MINUTES = 10;
  * never arrive. A minute past the boundary there is always a fee to name.
  */
 export const OVERSTAY_NOTICE_DELAY_SECONDS = 60;
+
+/**
+ * How many commands one unlock code may back before it is spent.
+ *
+ * A correct code buys a command, and a command can fail for reasons that are
+ * our fault — a jammed motor, a lost ack. Burning the code for those would
+ * charge the user for our hardware's mistake, so a demonstrated failure
+ * releases it. Unbounded, though, a jammed motor and a determined user could
+ * spawn commands until the code expired, so three.
+ *
+ * Shared rather than environment configuration because the UI counts down with
+ * it: "request a new code" has to appear at the same point the API starts
+ * refusing, and two copies of that number drift.
+ */
+export const CHALLENGE_MAX_BINDS = 3;
+
+/**
+ * How the client polls a pending command.
+ *
+ * Every second, giving up after 20 — which is deliberately *longer* than the
+ * server's 15s command TTL, so the client never stops waiting while the server
+ * is still deciding. The other order would show a timeout for a command that
+ * then succeeded.
+ */
+export const COMMAND_POLL_INTERVAL_MS = 1_000;
+export const COMMAND_POLL_TIMEOUT_MS = 20_000;
 
 /**
  * Generic message for any failed login. Deliberately does not say whether the

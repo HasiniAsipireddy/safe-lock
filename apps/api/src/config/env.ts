@@ -97,12 +97,134 @@ const envSchema = z
     OTP_HMAC_SECRET: secret('OTP_HMAC_SECRET'),
 
     /**
-     * Which hardware gateway to talk to. Only `mock` exists today; `mqtt`
-     * arrives with the real units. An enum rather than a free string so a
-     * typo is a boot failure, not a silent fallback to the mock in
-     * production.
+     * Which hardware gateway to talk to. An enum rather than a free string so
+     * a typo is a boot failure, not a silent fallback to the mock in
+     * production — which would look healthy and open nothing.
      */
-    DEVICE_GATEWAY: z.enum(['mock']).default('mock'),
+    DEVICE_GATEWAY: z.enum(['mock', 'mqtt']).default('mock'),
+
+    // --- Device command protocol (docs/device-protocol.md) -------------------
+
+    /**
+     * Master secret for per-device command keys.
+     *
+     * Every device's `K_d` is `HMAC-SHA256(this, "safelock:device-cmd:v1:" +
+     * keyVersion + ":" + serial)` — **one secret here, one key per device, no
+     * per-device key at rest anywhere**. The same move `OTP_HMAC_SECRET`
+     * makes, and for a stronger reason: HMAC verification needs the key
+     * itself, not a digest of it, so storing random per-device keys would mean
+     * either plaintext secrets in a table or an envelope-encryption
+     * dependency. A database leak yields no device key because no device key
+     * is in the database.
+     *
+     * Deliberately **separate** from `OTP_HMAC_SECRET`. These protect
+     * different things on different lifecycles, and one secret for both means
+     * rotating it breaks both at once — plus rotating this one is a fleet
+     * re-provisioning, which is not an operation anyone should trip into while
+     * rotating an OTP key.
+     *
+     * Optional while the gateway is `mock`, required for `mqtt` — see the
+     * superRefine. A mock has no signature to verify.
+     */
+    DEVICE_COMMAND_HMAC_SECRET: z.string().optional(),
+
+    /**
+     * The `keyVersion` new credentials are derived at.
+     *
+     * Part of the derivation *and* of every command on the wire, so the master
+     * secret can be rotated without a flag day: the server signs each device
+     * at the version that device actually holds (`Device.commandKeyVersion`)
+     * while this governs what the next provisioning hands out. Without a
+     * version in the message a device could not tell which key to verify
+     * against, and rotating the master would brick the fleet.
+     */
+    DEVICE_COMMAND_KEY_VERSION: z.coerce.number().int().min(1).max(1_000).default(1),
+
+    /**
+     * How long a command may take before the server gives up on it.
+     *
+     * 15 000 ms, the figure CLAUDE.md has carried since step 4, chosen to sit
+     * under the ~20s a person will stare at a spinner. Also the `ttlMs` the
+     * device is handed, which it enforces from its monotonic counter.
+     */
+    COMMAND_TTL_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
+
+    /**
+     * How long after a command's expiry an ack is still correlated to it.
+     *
+     * Past ten minutes the correlation is not worth trusting, so the ack is
+     * dropped *for command purposes* and audited — but the **state it reports
+     * is still applied**, because the measurement is trustworthy even when the
+     * correlation is not. The same shape of decision as the reminder staleness
+     * floor: late is false, but the underlying thing is still real.
+     */
+    COMMAND_LATE_ACK_MAX_MS: z.coerce
+      .number()
+      .int()
+      .min(60_000)
+      .max(3_600_000)
+      .default(600_000),
+
+    /** How often the command timeout sweeper runs. */
+    COMMAND_SWEEP_INTERVAL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(600_000)
+      .default(5_000),
+
+    /**
+     * Give-up point for a **system** command's retries. Backoff is 10s, 60s,
+     * 300s. A user command never retries: nobody is waiting on a system lock,
+     * and the correct end state for it is not a judgement call.
+     */
+    COMMAND_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(3),
+
+    /**
+     * Consecutive failed commands before a device is flagged for admins.
+     *
+     * One timeout is a lost packet; three in a row is a safe that needs a
+     * human. Flagging on the first would make the flagged list worthless,
+     * which is the same failure as a notification per mistyped digit.
+     */
+    COMMAND_FAILURE_FLAG_THRESHOLD: z.coerce.number().int().min(1).max(20).default(3),
+
+    /** How often a device publishes an unprompted state report, in seconds. */
+    DEVICE_HEARTBEAT_SECONDS: z.coerce.number().int().min(10).max(3_600).default(60),
+
+    /**
+     * How long since the last verified inbound message before a device counts
+     * as offline.
+     *
+     * Three missed heartbeats, so one lost packet is not an outage. `online`
+     * is derived from this on every read rather than trusted from the stored
+     * boolean — the same reflex as `effectiveBookingStatus`, and for the same
+     * reason: a stored flag is a claim about a moment, and the question is
+     * about now.
+     */
+    DEVICE_OFFLINE_AFTER_SECONDS: z.coerce
+      .number()
+      .int()
+      .min(30)
+      .max(86_400)
+      .default(180),
+
+    /**
+     * The broker, and the API's **own privileged credential** — never a
+     * device's. The server may write to any `cmd` and read any report, and is
+     * denied the ability to write to `ack`/`state`/`status`: there is no
+     * reason for it to forge a device report, so a compromised API credential
+     * cannot fabricate the security record, only issue commands it could issue
+     * anyway.
+     *
+     * All three required when `DEVICE_GATEWAY=mqtt`, so a half-configured
+     * deploy fails at boot rather than at the first unlock.
+     */
+    MQTT_URL: z.string().optional(),
+    MQTT_USERNAME: z.string().optional(),
+    MQTT_PASSWORD: z.string().optional(),
+    /** Per-publish timeout. A broker that hangs must not hold a request open. */
+    MQTT_TIMEOUT_MS: z.coerce.number().int().min(500).max(60_000).default(5_000),
 
     // --- WhatsApp (Meta Cloud API) -------------------------------------------
     /**
@@ -331,7 +453,114 @@ const envSchema = z
       }
     }
 
+    /**
+     * MQTT mode needs a broker, a credential and a command secret, in every
+     * environment.
+     *
+     * Checked outside the production block for the same reason as the WhatsApp
+     * credentials: someone pointing a staging box at a real broker deserves
+     * the same fail-fast. A missing `DEVICE_COMMAND_HMAC_SECRET` in particular
+     * would mean commands could not be signed — and an unsigned command is one
+     * a compromised broker could forge, which is the single thing the
+     * signature exists to prevent.
+     */
+    if (value.DEVICE_GATEWAY === 'mqtt') {
+      const required = [
+        ['MQTT_URL', value.MQTT_URL],
+        ['MQTT_USERNAME', value.MQTT_USERNAME],
+        ['MQTT_PASSWORD', value.MQTT_PASSWORD],
+      ] as const;
+
+      for (const [name, supplied] of required) {
+        if (!supplied?.trim()) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [name],
+            message: `${name} is required when DEVICE_GATEWAY=mqtt`,
+          });
+        }
+      }
+
+      const commandSecret = value.DEVICE_COMMAND_HMAC_SECRET?.trim();
+
+      if (!commandSecret) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['DEVICE_COMMAND_HMAC_SECRET'],
+          message: 'DEVICE_COMMAND_HMAC_SECRET is required when DEVICE_GATEWAY=mqtt',
+        });
+      } else if (commandSecret.length < 32) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['DEVICE_COMMAND_HMAC_SECRET'],
+          message: 'DEVICE_COMMAND_HMAC_SECRET must be at least 32 characters',
+        });
+      }
+
+      /**
+       * A plaintext broker would hand every command, every ack and every
+       * device credential to anyone on the path. The signature would survive
+       * that — it is designed to survive a fully compromised broker — but the
+       * credential would not, and a stolen credential is a device identity.
+       */
+      const url = value.MQTT_URL?.trim();
+      if (url && !/^(mqtts|wss|tls|ssl):/i.test(url) && value.NODE_ENV === 'production') {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['MQTT_URL'],
+          message: 'MQTT_URL must use TLS (mqtts:// or wss://) in production',
+        });
+      }
+    }
+
+    /**
+     * The device command secret must not be reused from the OTP secret.
+     *
+     * Domain separation in the derivation means an accidental overlap is not
+     * immediately exploitable, but it collapses two rotation schedules into
+     * one, and the whole point of a separate variable is that rotating a
+     * fleet's keys and rotating an OTP key are different operations.
+     */
+    if (
+      value.DEVICE_COMMAND_HMAC_SECRET &&
+      value.DEVICE_COMMAND_HMAC_SECRET === value.OTP_HMAC_SECRET
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['DEVICE_COMMAND_HMAC_SECRET'],
+        message:
+          'DEVICE_COMMAND_HMAC_SECRET must differ from OTP_HMAC_SECRET; they rotate independently',
+      });
+    }
+
     if (value.NODE_ENV !== 'production') return;
+
+    /**
+     * The mock gateway must be unreachable in production, exactly as the fake
+     * WhatsApp client is.
+     *
+     * A mock that acks every command would report every safe as locked without
+     * a single bolt moving — a deployment that looks perfectly healthy and
+     * secures nothing. For a product that physically opens safes this is the
+     * worst available silent failure, so it is a boot failure instead.
+     */
+    if (value.DEVICE_GATEWAY === 'mock') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['DEVICE_GATEWAY'],
+        message:
+          'DEVICE_GATEWAY=mock is not allowed in production; it acks every command without a device',
+      });
+    }
+
+    if (value.DEVICE_COMMAND_HMAC_SECRET?.includes('change_me')) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['DEVICE_COMMAND_HMAC_SECRET'],
+        message:
+          'DEVICE_COMMAND_HMAC_SECRET still holds its placeholder value; set a real secret',
+      });
+    }
 
     /**
      * The fake client must be unreachable in production.
@@ -494,6 +723,19 @@ export const WEB_ORIGINS: readonly string[] = (env.WEB_ORIGIN ?? env.CORS_ORIGIN
 export const PUBLIC_WEB_URL: string = (
   env.PUBLIC_WEB_URL?.trim() || 'http://localhost:3000'
 ).replace(/\/+$/, '');
+
+/** How long since the last verified device message before it counts offline. */
+export const DEVICE_OFFLINE_AFTER_MS = env.DEVICE_OFFLINE_AFTER_SECONDS * 1000;
+
+/**
+ * Backoff between retries of a **system** command, in milliseconds.
+ *
+ * In code rather than the environment: these are three numbers that only make
+ * sense together with `COMMAND_MAX_ATTEMPTS`, and a deployment that set a
+ * 5-second cap and a 300-second backoff would have configured a retry that
+ * never happens. Indexed by attempts already made.
+ */
+export const COMMAND_RETRY_BACKOFF_MS = [10_000, 60_000, 300_000] as const;
 
 /** Refresh token lifetime as milliseconds. */
 export const REFRESH_TOKEN_TTL_MS = env.REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;

@@ -75,7 +75,9 @@ import {
   type ExtensionRefusalReason,
   type DeviceCurrentBooking,
   type DeviceEventType,
+  type DeviceFlag,
   type DeviceStatus,
+  type DoorState,
   type DeviceSummary,
   type ForgotPasswordResponse,
   type HistoryEvent,
@@ -191,6 +193,13 @@ interface MockDevice {
   lockStateUpdatedAt: string | null;
   online: boolean;
   lastSeenAt: string | null;
+  doorState: DoorState;
+  firmwareVersion: string | null;
+  rssi: number | null;
+  clockSynced: boolean | null;
+  credentialIssuedAt: string | null;
+  lockCommandFailedAt: string | null;
+  unexpectedUnlockAt: string | null;
   inspectionNote: string | null;
   inspectionNotedAt: string | null;
   createdAt: string;
@@ -214,8 +223,25 @@ function makeMockDevice(serialNumber: string, ageIndex: number): MockDevice {
     // Mirrors the API: a safe in stock is locked, not of unknown state.
     lockState: 'LOCKED',
     lockStateUpdatedAt: null,
-    online: false,
+    /**
+     * Online, unlike the pre-hardware mock, which left every safe offline.
+     *
+     * The API now refuses to issue a command to an unreachable safe and
+     * excludes one from the booking pick, so a mock fleet that is permanently
+     * offline would present a dashboard on which nothing works — and would
+     * teach anyone using mock mode that the offline path is the normal one.
+     * `lastSeenAt` is stamped at read time so the age never goes stale.
+     */
+    online: true,
     lastSeenAt: null,
+    /** Units ship with a door sensor, so the mock reports one. */
+    doorState: 'CLOSED',
+    firmwareVersion: '1.0.3',
+    rssi: -58,
+    clockSynced: true,
+    credentialIssuedAt: new Date(Date.UTC(2026, 0, 1)).toISOString(),
+    lockCommandFailedAt: null,
+    unexpectedUnlockAt: null,
     inspectionNote: null,
     inspectionNotedAt: null,
     // Older index = created earlier, so the "oldest available first" pick is
@@ -1780,7 +1806,26 @@ function toAdminDevice(device: MockDevice): AdminDeviceRow {
     currentBooking: mockDeviceBooking(device),
     inspectionNote: device.inspectionNote,
     inspectionNotedAt: device.inspectionNotedAt,
+    firmwareVersion: device.firmwareVersion,
+    rssi: device.rssi,
+    clockSynced: device.clockSynced,
+    credentialIssued: device.credentialIssuedAt !== null,
+    credentialIssuedAt: device.credentialIssuedAt,
+    lockCommandFailedAt: device.lockCommandFailedAt,
+    flags: mockDeviceFlags(device),
   };
+}
+
+/** The same five flags the API derives, from the same inputs. */
+function mockDeviceFlags(device: MockDevice): DeviceFlag[] {
+  const flags: DeviceFlag[] = [];
+
+  if (!device.online && mockDeviceBooking(device)) flags.push('OFFLINE_WITH_BOOKING');
+  if (device.lockCommandFailedAt) flags.push('LOCK_COMMAND_FAILED');
+  if (device.unexpectedUnlockAt) flags.push('UNEXPECTED_UNLOCKED');
+  if (device.doorState === 'UNKNOWN' && device.lastSeenAt) flags.push('DOOR_STATE_UNKNOWN');
+
+  return flags;
 }
 
 function paginateMock<T>(items: T[], query: URLSearchParams): Paginated<T> {
@@ -1820,7 +1865,10 @@ function toDeviceSummary(device: MockDevice): DeviceSummary {
     lockState: device.lockState,
     lockStateUpdatedAt: device.lockStateUpdatedAt,
     online: device.online,
-    lastSeenAt: device.lastSeenAt,
+    // Stamped at read time for an online safe, so the "last seen 3 hours ago"
+    // the UI would otherwise render never drifts away from "online".
+    lastSeenAt: device.lastSeenAt ?? (device.online ? new Date().toISOString() : null),
+    doorState: device.doorState,
   };
 }
 

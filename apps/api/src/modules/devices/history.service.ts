@@ -2,8 +2,10 @@ import {
   DEVICE_EVENT_LABELS,
   ERROR_CODES,
   UNLOCK_FAILURE_LABELS,
+  type DeviceEventType,
   type HistoryEvent,
   type HistoryResponse,
+  type UnlockFailureReason,
 } from '@safelock/shared';
 import { prisma } from '../../lib/prisma';
 import { HttpError } from '../../lib/httpError';
@@ -41,8 +43,13 @@ const HISTORY_EVENT_SELECT = {
 
 interface HistoryEventRow {
   id: string;
-  type: 'LOCK' | 'UNLOCK_REQUESTED' | 'UNLOCK_CONFIRMED' | 'UNLOCK_FAILED';
-  failureReason: 'WRONG_CODE' | 'EXPIRED' | 'TOO_MANY_ATTEMPTS' | 'NO_CHALLENGE' | null;
+  type: DeviceEventType;
+  /**
+   * The shared type rather than a literal union spelled out here: the enum
+   * gained four device-failure reasons with the MQTT gateway, and a
+   * hand-copied list is a list that silently stops matching.
+   */
+  failureReason: UnlockFailureReason | null;
   createdAt: Date;
   device: { serialNumber: string };
 }
