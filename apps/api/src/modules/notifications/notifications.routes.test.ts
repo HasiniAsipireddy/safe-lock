@@ -6,7 +6,7 @@ import type {
   NotificationsResponse,
 } from '@safelock/shared';
 import { prisma } from '../../lib/prisma';
-import { deviceGateway } from '../../lib/deviceGateway';
+import { deviceGateway, drainDeviceAcks } from '../../lib/deviceGateway';
 import { notifier } from '../../lib/notifier';
 import {
   TEST_ORIGIN,
@@ -52,7 +52,16 @@ describe('notifications on unlock', () => {
     const code = await getCode(user.cookie);
 
     const response = await post(CONFIRM_URL, user.cookie).send({ otp: code });
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
+
+    /**
+     * The notification is written by the **ack handler** now, in the same
+     * transaction as the `UNLOCK_CONFIRMED` event — which preserves step 5's
+     * contract rather than weakening it: it is now atomic with the *true*
+     * event, the one that says the bolt moved.
+     */
+    expect(await prisma.notification.count({ where: { userId: user.id } })).toBe(0);
+    await drainDeviceAcks();
 
     const notifications = await prisma.notification.findMany({ where: { userId: user.id } });
     expect(notifications).toHaveLength(1);
@@ -71,10 +80,12 @@ describe('notifications on unlock', () => {
     const { user } = await createUserWithDevice();
     const code = await getCode(user.cookie);
     await post(CONFIRM_URL, user.cookie).send({ otp: code });
+    await drainDeviceAcks();
     await prisma.notification.deleteMany({ where: { userId: user.id } });
 
     const response = await post('/api/v1/devices/lock', user.cookie).send({});
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
+    await drainDeviceAcks();
 
     // Deliberate: locking is the safe state, and a notification for it would
     // be noise that trains people to ignore the bell. See docs/decisions.md.
@@ -151,50 +162,64 @@ describe('notification atomicity with UNLOCK_CONFIRMED', () => {
       throw new Error('notifier exploded after writing');
     });
 
-    const response = await post(CONFIRM_URL, user.cookie).send({ otp: code });
+    await post(CONFIRM_URL, user.cookie).send({ otp: code });
+    await drainDeviceAcks();
 
     expect(spy).toHaveBeenCalledOnce();
-    expect(response.status).toBe(500);
 
-    // Nothing survived: no orphan notification, no event, and the safe did
-    // not move.
+    // No orphan notification, and no event either — the two live and die
+    // together, which is the half of the step-5 contract that still means
+    // something once the bolt has already moved.
     expect(await prisma.notification.count({ where: { userId: user.id } })).toBe(0);
     expect(
       await prisma.deviceEvent.count({ where: { userId: user.id, type: 'UNLOCK_CONFIRMED' } }),
     ).toBe(0);
-
-    const device = await deviceHeldBy(user.id);
-    expect(device.lockState).toBe('LOCKED');
   });
 
-  it('rolls the unlock back when the notifier cannot record anything', async () => {
-    // The inverse direction, and the deliberate trade: we would rather refuse
-    // to open the safe than open it without telling the owner. The code is
-    // not burned either, so a retry still works.
+  /**
+   * The direction that **changed with hardware**, and the reasoning is worth
+   * stating in a test.
+   *
+   * Step 5 let a notifier failure roll the unlock back: better to refuse to
+   * open the safe than open it without telling the owner. By the time an ack
+   * arrives there is no unlock left to refuse — the bolt moved — so rolling
+   * back would record a physically open safe as locked, which is the one
+   * outcome the whole protocol is arranged to avoid.
+   *
+   * So the physical record survives a notifier outage. What is lost is a feed
+   * row, which is recoverable; what is not risked is a safe standing open and
+   * recorded shut, which is not.
+   */
+  it('keeps the physical record when the notifier cannot record anything', async () => {
     const { user } = await createUserWithDevice();
     const code = await getCode(user.cookie);
 
     vi.spyOn(notifier, 'notifyUnlock').mockRejectedValue(new Error('notifier unavailable'));
 
-    const failed = await post(CONFIRM_URL, user.cookie).send({ otp: code });
-    expect(failed.status).toBe(500);
+    const accepted = await post(CONFIRM_URL, user.cookie).send({ otp: code });
+    expect(accepted.status).toBe(202);
+    await drainDeviceAcks();
 
+    // The safe is open, and says so.
     const device = await deviceHeldBy(user.id);
-    expect(device.lockState).toBe('LOCKED');
+    expect(device.lockState).toBe('UNLOCKED');
 
+    // The command settled, so nothing will retry it or time it out.
+    const command = await prisma.command.findFirstOrThrow({ where: { userId: user.id } });
+    expect(command.status).toBe('ACKED');
+
+    // The code opened a safe, so it is spent — a notifier outage does not
+    // make a used code reusable.
     const challenge = await prisma.unlockChallenge.findFirstOrThrow({
       where: { userId: user.id },
     });
-    expect(challenge.consumedAt).toBeNull();
+    expect(challenge.consumedAt).not.toBeNull();
 
-    // With the notifier working again, the same code still opens the safe.
-    vi.restoreAllMocks();
-    const retried = await post(CONFIRM_URL, user.cookie).send({ otp: code });
-    expect(retried.status).toBe(200);
-    expect(await prisma.notification.count({ where: { userId: user.id } })).toBe(1);
+    // And nothing was half-written.
+    expect(await prisma.notification.count({ where: { userId: user.id } })).toBe(0);
   });
 
-  it('writes no notification when the device command fails', async () => {
+  it('writes no notification when the command never reaches the broker', async () => {
     const { user } = await createUserWithDevice();
     const code = await getCode(user.cookie);
 
@@ -202,9 +227,37 @@ describe('notification atomicity with UNLOCK_CONFIRMED', () => {
 
     const response = await post(CONFIRM_URL, user.cookie).send({ otp: code });
 
-    expect(response.status).toBe(502);
-    expect(response.body.error.code).toBe('DEVICE_COMMAND_FAILED');
+    /**
+     * Still a 202: the code was correct and a command row exists. What failed
+     * is the publish, and the client learns that by polling — which is the
+     * same way it learns about every other outcome, rather than a 502 for one
+     * particular failure and a poll for the rest.
+     */
+    expect(response.status).toBe(202);
+    expect(response.body.status).toBe('EXPIRED');
+
+    const command = await prisma.command.findFirstOrThrow({ where: { userId: user.id } });
+    // EXPIRED, not TIMED_OUT: the packet did not leave, so we know the bolt
+    // did not move. A timeout would mean we had no idea.
+    expect(command.status).toBe('EXPIRED');
+    expect(command.failureCategory).toBe('PUBLISH_FAILED');
+
+    const device = await deviceHeldBy(user.id);
+    expect(device.lockState).toBe('LOCKED');
+
+    // Nothing opened, so nothing to notify about — but it is in their feed.
     expect(await prisma.notification.count({ where: { userId: user.id } })).toBe(0);
+    const event = await prisma.deviceEvent.findFirstOrThrow({
+      where: { userId: user.id, type: 'UNLOCK_FAILED' },
+    });
+    expect(event.failureReason).toBe('DEVICE_OFFLINE');
+
+    // The code was not burned by our failure to reach the safe.
+    const challenge = await prisma.unlockChallenge.findFirstOrThrow({
+      where: { userId: user.id },
+    });
+    expect(challenge.consumedAt).toBeNull();
+    expect(challenge.commandId).toBeNull();
   });
 });
 

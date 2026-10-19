@@ -740,6 +740,18 @@ model Command {
   /// nobody is waiting on, and therefore the set that may retry.
   bookingId String?
 
+  /// Which unlock code bought this command. Historical, and never cleared.
+  ///
+  /// Deliberately **not** the inverse of `UnlockChallenge.commandId`, which is
+  /// a different fact: that column says which command a code is *currently*
+  /// backing and is cleared on release, because it is the serialisation point
+  /// for "exactly one concurrent confirm wins". This one says which code a
+  /// command *came from* and survives the release — which is what lets a late
+  /// ack find the code it must now consume, minutes after a timeout unbound
+  /// it. One column could not be both: a mutable claim and an immutable
+  /// record. See docs/device-protocol.md §5.5.
+  challengeId String?
+
   type   CommandType
   status CommandStatus @default(PENDING)
 

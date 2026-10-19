@@ -14,7 +14,7 @@ import { env } from '../../config/env';
 import { HttpError, conflict } from '../../lib/httpError';
 import { logger } from '../../lib/logger';
 import { prisma, type PrismaTransaction } from '../../lib/prisma';
-import { deviceGateway } from '../../lib/deviceGateway';
+import { createCommand, publishCommand } from '../commands/command.service';
 import {
   BOOKING_SELECT,
   outstandingFeePaise,
@@ -795,46 +795,71 @@ export async function completeBooking(input: {
 }
 
 /**
- * Sends the safe a lock command after a booking has ended.
+ * Locks the safe after a booking has ended.
  *
  * **After the commit, never inside the transaction** — the same rule the
- * outbox follows, for the same reason: a gateway call is a network round trip
- * and a transaction cannot un-send one.
+ * outbox follows, for the same reason: a publish is a network round trip and a
+ * transaction cannot un-send one.
  *
- * Best effort. A booking that has ended has ended whether or not the bolt
- * moved, and failing the request would leave the database and the user's view
- * disagreeing. A failure is logged loudly instead.
+ * ## No longer best effort
+ * It used to call the gateway, log a failure and shrug. That was tolerable
+ * against a mock that always acked and is not tolerable against hardware: a
+ * safe between renters could be recorded closed while standing physically
+ * open, which is the one outcome worth any amount of machinery to avoid, and
+ * is what the roadmap meant by owing this path a real guarantee.
  *
- * **Real hardware must confirm this** — `lockState` only moves on an ack, so
- * an unacked command leaves the stored state alone. See docs/decisions.md.
+ * Now it issues a **system** command (`systemActor: COMPLETION`, no `userId`),
+ * and the system half of the lifecycle takes over: no ack in 15s means a
+ * retry, three failed attempts means `lockCommandFailedAt`, an admin flag, an
+ * audit row and `NEEDS_INSPECTION`. Nobody is waiting on this command, which
+ * is exactly what licenses it to retry where a user's lock may not.
+ *
+ * Still does not throw. A booking that has ended has ended whether or not the
+ * bolt moved, and failing the user's request would leave the database and
+ * their view disagreeing about a booking that is definitely over.
  */
 export async function lockAfterCompletion(deviceId: string): Promise<void> {
   try {
-    const device = await prisma.device.findUnique({
-      where: { id: deviceId },
-      select: { serialNumber: true },
-    });
-    if (!device) return;
+    const issued = await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "Device" WHERE "id" = ${deviceId} FOR UPDATE`;
 
-    const result = await deviceGateway.sendLock(device.serialNumber);
-    if (!result.acked) {
-      logger.error({ deviceId }, 'Lock after booking completion was not acked');
-      return;
-    }
+      const device = await tx.device.findUnique({
+        where: { id: deviceId },
+        select: { id: true },
+      });
+      if (!device) return null;
 
-    await prisma.device.update({
-      where: { id: deviceId },
-      data: {
-        lockState: 'LOCKED',
-        lockStateUpdatedAt: result.ackedAt,
-        online: true,
-        lastSeenAt: result.ackedAt,
-      },
+      /**
+       * At most one live system command per device, which the partial unique
+       * index also enforces. Checked here so the ordinary case is a clean skip
+       * rather than a caught constraint violation — a completion lock racing a
+       * reconcile is two commands asking for the same end state, and the
+       * device would reject the second as a duplicate.
+       */
+      const inFlight = await tx.command.findFirst({
+        where: {
+          deviceId,
+          systemActor: { not: null },
+          status: { in: ['PENDING', 'SENT'] },
+        },
+        select: { id: true },
+      });
+      if (inFlight) return null;
+
+      return createCommand(tx, {
+        deviceId,
+        type: 'LOCK',
+        systemActor: 'COMPLETION',
+      });
     });
+
+    if (!issued) return;
+
+    await publishCommand(issued);
   } catch (cause) {
     logger.error(
       { deviceId, reason: cause instanceof Error ? cause.message : 'unknown' },
-      'Failed to lock a safe after its booking completed',
+      'Failed to issue a lock after a booking completed',
     );
   }
 }

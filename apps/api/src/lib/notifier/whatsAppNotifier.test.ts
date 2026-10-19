@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { OTP_MAX_ATTEMPTS } from '@safelock/shared';
 import { prisma } from '../prisma';
+import { drainDeviceAcks } from '../deviceGateway';
 import { fakeWhatsAppClient } from '../whatsapp';
 import { processPending } from '../outbox/outbox.service';
 import {
@@ -61,7 +62,10 @@ describe('a confirmed unlock', () => {
     const code = await getCode(user.cookie);
 
     const response = await post(CONFIRM_URL, user.cookie).send({ otp: code });
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
+    // Both halves are written by the ack handler now, in the transaction that
+    // records what the bolt actually did.
+    await drainDeviceAcks();
 
     const inApp = await prisma.notification.findMany({ where: { userId: user.id } });
     expect(inApp).toHaveLength(1);
@@ -100,8 +104,8 @@ describe('a confirmed unlock', () => {
 
     const response = await post(CONFIRM_URL, user.cookie).send({ otp: code });
 
-    expect(response.status).toBe(200);
-    expect(response.body.device.lockState).toBe('UNLOCKED');
+    expect(response.status).toBe(202);
+    await drainDeviceAcks();
 
     const device = await prisma.device.findUniqueOrThrow({ where: { id: deviceId } });
     expect(device.lockState).toBe('UNLOCKED');
@@ -125,13 +129,23 @@ describe('a confirmed unlock', () => {
     fake.reset();
     const code = await getCode(user.cookie);
 
-    // Fail the in-app half, which by contract rolls the unlock back.
+    /**
+     * Fail the in-app half. Both notifiers write through the event's
+     * transaction, so neither half survives — the composite is still
+     * all-or-nothing, which is what stops a WhatsApp alert existing about an
+     * event that does not.
+     *
+     * What no longer happens is the unlock rolling back with it: the bolt had
+     * already moved by the time this ran. See the ack handler on why the
+     * physical record commits in its own transaction first.
+     */
     vi.spyOn(InAppNotifier.prototype, 'notifyUnlock').mockRejectedValue(
       new Error('in-app unavailable'),
     );
 
     const response = await post(CONFIRM_URL, user.cookie).send({ otp: code });
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(202);
+    await drainDeviceAcks();
 
     // Neither half survives, and nothing was sent.
     expect(await prisma.notification.count({ where: { userId: user.id } })).toBe(0);
@@ -147,6 +161,7 @@ describe('a confirmed unlock', () => {
     // Verified at code time (it had to be), then revoked before the alert is
     // processed — the shape of a user who changed their number mid-flow.
     await post(CONFIRM_URL, user.cookie).send({ otp: code });
+    await drainDeviceAcks();
     await prisma.user.update({
       where: { id: user.id },
       data: { phoneVerifiedAt: null },

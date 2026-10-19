@@ -1,0 +1,16 @@
+-- Which unlock code bought this command, recorded immutably.
+--
+-- Deliberately NOT the inverse of "UnlockChallenge"."commandId". That column is
+-- a mutable claim -- which command a code is *currently* backing -- and it is
+-- the serialisation point that makes "exactly one concurrent confirm wins"
+-- true, so a release has to clear it.
+--
+-- This column is the historical record: which code a command came from. It
+-- survives the release, which is what lets a late ack find the code it must
+-- now consume, minutes after a timeout unbound it. Without it, a released code
+-- that turns out to have opened a safe would stay available for a second use
+-- -- and "single-use" has to mean exactly that.
+--
+-- Nullable because a system command (a completion lock, a reconcile) has no
+-- code behind it at all.
+ALTER TABLE "Command" ADD COLUMN "challengeId" TEXT;

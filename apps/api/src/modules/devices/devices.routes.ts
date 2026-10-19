@@ -4,17 +4,19 @@ import {
   historyQuerySchema,
   type ConfirmUnlockInput,
   type HistoryQuery,
+  type CommandAcceptedResponse,
+  type CommandStatusResponse,
   type HistoryResponse,
-  type LockResponse,
   type MyDeviceResponse,
-  type UnlockConfirmResponse,
   type UnlockRequestResponse,
 } from '@safelock/shared';
 import { requireAuth } from '../../middleware/auth';
 import { validateBody, validateQuery } from '../../middleware/validate';
 import type { Limiters } from '../../middleware/rateLimit';
 import { HttpError } from '../../lib/httpError';
+import { routeParam } from '../../lib/routeParam';
 import { AUDIT_ACTIONS, auditContext, writeAudit } from '../audit/audit.service';
+import { readCommandStatus } from '../commands/command.mapper';
 import { getHistoryPage } from './history.service';
 import {
   UnlockFailed,
@@ -94,27 +96,75 @@ export function createDevicesRouter(limiters: Limiters): Router {
     },
   );
 
-  /** Locks the safe. Idempotent — locking a locked safe is a 200, not a 409. */
+  /**
+   * Asks the safe to lock.
+   *
+   * **202, not 200**: the command has been accepted and the bolt has not moved
+   * yet. An already-locked safe is still a success — idempotent, with
+   * `alreadyInState` and no command to wait for.
+   *
+   * The audit row says a command was *issued*, not that the safe locked. What
+   * it actually did is audited by the ack handler, which is the only thing
+   * that knows.
+   */
   router.post('/lock', requireAuth, limiters.deviceLock, async (req, res, next) => {
     const userId = req.user!.id;
 
     try {
-      const result: LockResponse = await lockDevice({ userId, requestId: req.id ?? null });
-
-      await writeAudit({
-        action: AUDIT_ACTIONS.DEVICE_LOCKED,
+      const result: CommandAcceptedResponse = await lockDevice({
         userId,
-        deviceId: result.device.id,
-        ...auditContext(req),
-        metadata: { alreadyLocked: result.alreadyLocked },
+        requestId: req.id ?? null,
       });
 
-      res.status(200).json(result);
+      await writeAudit({
+        action: AUDIT_ACTIONS.DEVICE_COMMAND_ISSUED,
+        userId,
+        ...auditContext(req),
+        metadata: {
+          type: 'LOCK',
+          commandId: result.commandId,
+          alreadyLocked: result.alreadyInState ?? false,
+        },
+      });
+
+      res.status(202).json(result);
     } catch (error) {
       await auditOperationFailure(req, AUDIT_ACTIONS.DEVICE_LOCK_FAILED, error);
       next(error);
     }
   });
+
+  /**
+   * How a pending command ends.
+   *
+   * `requireAuth` plus a check that the command belongs to the caller, done in
+   * the service by `userId` — a command id must not be a handle on somebody
+   * else's safe. Another user's command is a 404, not a 403: a 403 would
+   * confirm the id exists.
+   *
+   * Polled rather than pushed, for the same reason the notification bell is:
+   * the dialog is open for at most twenty seconds, and a websocket to carry
+   * twenty messages is infrastructure to maintain forever.
+   */
+  router.get(
+    '/commands/:id',
+    requireAuth,
+    limiters.deviceHistory,
+    async (req, res, next) => {
+      try {
+        const commandId = routeParam(req, 'id');
+
+        const response: CommandStatusResponse = await readCommandStatus(
+          req.user!.id,
+          commandId,
+        );
+
+        res.status(200).json(response);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
 
   /**
    * Sends a one-time code. Two limiter limbs: per user and per IP.
@@ -152,7 +202,13 @@ export function createDevicesRouter(limiters: Limiters): Router {
     },
   );
 
-  /** Verifies a code and, only on success, opens the safe. */
+  /**
+   * Verifies a code and, only on success, asks the safe to open.
+   *
+   * **202 with a command id.** The code was right; the bolt has not moved yet,
+   * and the honest answer is "we have asked". `DEVICE_UNLOCKED` is audited by
+   * the ack handler, because that is where it becomes true.
+   */
   router.post(
     '/unlock/confirm',
     requireAuth,
@@ -163,20 +219,20 @@ export function createDevicesRouter(limiters: Limiters): Router {
       const { otp } = req.body as ConfirmUnlockInput;
 
       try {
-        const result: UnlockConfirmResponse = await confirmUnlock({
+        const result: CommandAcceptedResponse = await confirmUnlock({
           userId,
           otp,
           requestId: req.id ?? null,
         });
 
         await writeAudit({
-          action: AUDIT_ACTIONS.DEVICE_UNLOCKED,
+          action: AUDIT_ACTIONS.DEVICE_COMMAND_ISSUED,
           userId,
-          deviceId: result.device.id,
           ...auditContext(req),
+          metadata: { type: 'UNLOCK', commandId: result.commandId },
         });
 
-        res.status(200).json(result);
+        res.status(202).json(result);
       } catch (error) {
         if (error instanceof UnlockFailed) {
           // A failed attempt is still the owner's history, and still a

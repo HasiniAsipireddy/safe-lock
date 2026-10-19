@@ -7,6 +7,7 @@ import {
 } from '@safelock/shared';
 import { env } from '../../config/env';
 import { prisma } from '../../lib/prisma';
+import { drainDeviceAcks } from '../../lib/deviceGateway';
 import { fakeWhatsAppClient } from '../../lib/whatsapp';
 import {
   TEST_ORIGIN,
@@ -534,8 +535,13 @@ describe('PHONE_NOT_VERIFIED gates unlock only', () => {
 
     const response = await post(LOCK_URL, user.cookie).send({});
 
-    expect(response.status).toBe(200);
-    expect(response.body.device.lockState).toBe('LOCKED');
+    // Accepted, then confirmed by the device's ack — which is what moves the
+    // stored state. The point of the test is that nothing *refused* it.
+    expect(response.status).toBe(202);
+    await drainDeviceAcks();
+
+    const device = await prisma.device.findUniqueOrThrow({ where: { id: deviceId } });
+    expect(device.lockState).toBe('LOCKED');
   });
 
   it('lets the user unlock once verified', async () => {

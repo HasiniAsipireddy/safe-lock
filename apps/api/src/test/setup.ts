@@ -1,5 +1,6 @@
 import { afterAll, beforeEach } from 'vitest';
 import { prisma } from '../lib/prisma';
+import { drainDeviceAcks } from '../lib/deviceGateway';
 
 /**
  * Per-file test setup: a clean database before every test, and no network.
@@ -43,6 +44,7 @@ const TABLES = [
   'Notification',
   'DeviceEvent',
   'UnlockChallenge',
+  'Command',
   'Device',
   'Payment',
   'WebhookEvent',
@@ -56,6 +58,21 @@ export async function resetDatabase(): Promise<void> {
 }
 
 beforeEach(async () => {
+  /**
+   * Let the simulated device finish answering before the tables are emptied.
+   *
+   * A device ack is handled **after** the request that caused it has returned,
+   * which is the whole point of the asynchronous protocol — and means a test
+   * can end with one still in flight. Truncating underneath it produced a
+   * `deadlock detected` from `TRUNCATE` racing the ack's own transaction, and
+   * a failure attributed to whichever test happened to be next.
+   *
+   * A test that wants to assert on a settled world still calls
+   * `drainDeviceAcks()` itself; this is the safety net for every test that
+   * does not care, so an unawaited ack cannot become somebody else's problem.
+   */
+  await drainDeviceAcks();
+
   await resetDatabase();
 });
 

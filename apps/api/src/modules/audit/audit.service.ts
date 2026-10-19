@@ -157,6 +157,57 @@ export const AUDIT_ACTIONS = {
    * unpaid, refunded, or holding no device.
    */
   DEVICE_OPERATION_DENIED: 'device.operation.denied',
+
+  // --- Device commands and the wire protocol --------------------------------
+  /** A command row was created and handed to the gateway. */
+  DEVICE_COMMAND_ISSUED: 'device.command.issued',
+  /** The broker refused or dropped the publish. Nothing reached the device. */
+  DEVICE_COMMAND_PUBLISH_FAILED: 'device.command.publish_failed',
+  /** The device answered. Metadata carries the result and reason. */
+  DEVICE_COMMAND_ACKED: 'device.command.acked',
+  /** Published, no answer by the deadline. The physical state is unknown. */
+  DEVICE_COMMAND_TIMED_OUT: 'device.command.timed_out',
+  /**
+   * An ack arrived after we had already given up, and the record was updated
+   * from it.
+   *
+   * Audited separately because it is the one case where what the user was told
+   * and what the database says legitimately differ, and an investigation
+   * starting from "the dashboard said it failed" needs this row to make sense
+   * of the one that follows it.
+   */
+  DEVICE_COMMAND_LATE_ACK: 'device.command.late_ack',
+  /**
+   * An ack whose signature did not verify. Dropped and never applied.
+   *
+   * "Cannot verify" must never degrade to "accept" — the same rule the
+   * Razorpay and WhatsApp webhooks follow. A run of these is either a broken
+   * key rotation or somebody on the broker.
+   */
+  DEVICE_MESSAGE_SIGNATURE_INVALID: 'device.message.signature_invalid',
+  /**
+   * An ack for a command that does not exist, or that belongs to another
+   * device. A device may only ack its own commands, checked by joining the
+   * command to the serial the message arrived on rather than trusting the
+   * payload.
+   */
+  DEVICE_ACK_FOREIGN_COMMAND: 'device.ack.foreign_command',
+  /** An ack correlated to a command too old to trust. Its state still applied. */
+  DEVICE_ACK_TOO_LATE: 'device.ack.too_late',
+  /**
+   * A safe reported itself open with no booking entitled to have it open, and
+   * a reconciling lock was issued. See docs/device-protocol.md §8.3.
+   */
+  DEVICE_UNEXPECTED_UNLOCKED_RECONCILED: 'device.unexpected_unlocked.reconciled',
+  /**
+   * A system lock exhausted its retries. The safe may be standing open, so the
+   * device is flagged and sent for inspection.
+   */
+  DEVICE_LOCK_ESCALATED: 'device.lock.escalated',
+  /** An MQTT credential was minted for a device and shown once. */
+  DEVICE_CREDENTIAL_ISSUED: 'device.credential.issued',
+  /** A retired device's credential was revoked. */
+  DEVICE_CREDENTIAL_REVOKED: 'device.credential.revoked',
 } as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[keyof typeof AUDIT_ACTIONS];

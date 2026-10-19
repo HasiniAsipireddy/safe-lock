@@ -187,17 +187,51 @@ export function createTestAdmin(): Promise<TestUser> {
 
 let deviceSequence = 0;
 
-/** Adds an AVAILABLE device to the inventory. */
+/**
+ * Adds an AVAILABLE device to the inventory, **online and provisioned**.
+ *
+ * Online by default because that is the normal state of a rentable safe, and
+ * because the API now refuses to issue a command to one it cannot reach and
+ * excludes it from the booking pick. A helper that seeded offline devices
+ * would make the offline path the default every test exercised without
+ * meaning to, and the refusals it produces look like unrelated failures.
+ *
+ * `lastSeenAt` is stamped **now**, not at `createdAt`: liveness is derived from
+ * the age of the last message, so a device backdated for the booking pick's
+ * oldest-first ordering must not also be backdated into looking dead.
+ *
+ * Pass `{ online: false }` to build the state that must be refused.
+ */
 export async function seedDevice(
-  overrides: { serialNumber?: string; createdAt?: Date } = {},
+  overrides: {
+    serialNumber?: string;
+    createdAt?: Date;
+    online?: boolean;
+    lastSeenAt?: Date | null;
+    doorState?: 'CLOSED' | 'OPEN' | 'UNKNOWN';
+  } = {},
 ): Promise<{ id: string; serialNumber: string }> {
   deviceSequence += 1;
   const serialNumber =
     overrides.serialNumber ?? `SAFE-${String(deviceSequence).padStart(4, '0')}`;
 
+  const online = overrides.online ?? true;
+
   return prisma.device.create({
     data: {
       serialNumber,
+      online,
+      lastSeenAt:
+        overrides.lastSeenAt !== undefined
+          ? overrides.lastSeenAt
+          : online
+            ? new Date()
+            : null,
+      doorState: overrides.doorState ?? 'CLOSED',
+      // A device that has been provisioned, since every command is signed with
+      // a key derived for it. The hash is of nothing in particular: no test
+      // authenticates to a broker.
+      credentialIssuedAt: new Date(),
       ...(overrides.createdAt ? { createdAt: overrides.createdAt } : {}),
     },
     select: { id: true, serialNumber: true },

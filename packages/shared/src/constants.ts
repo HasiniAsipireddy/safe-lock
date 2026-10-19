@@ -200,6 +200,21 @@ export const ERROR_CODES = {
   /** No command with that id, or it does not belong to the caller. */
   COMMAND_NOT_FOUND: 'COMMAND_NOT_FOUND',
   /**
+   * A different command is already in flight to this safe.
+   *
+   * **The device holds no queue** — one command at a time, and a second
+   * arriving while one is in flight is rejected `UNSUPPORTED`. A queue in a
+   * device that must default to locked is a way to be surprised later. So the
+   * server anticipates the refusal rather than spending a sequence number to
+   * discover it: the gateway is the cheapest place to stop a command that
+   * cannot succeed.
+   *
+   * Only ever raised for a command of a *different* type. Tapping Lock twice
+   * is idempotent and returns the command already in flight, because the
+   * second tap is asking for something that is already happening.
+   */
+  DEVICE_BUSY: 'DEVICE_BUSY',
+  /**
    * The code was correct but has now backed `CHALLENGE_MAX_BINDS` commands,
    * none of which opened anything. Request a new one.
    *

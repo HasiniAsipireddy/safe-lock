@@ -2,11 +2,13 @@ import { API_PREFIX, createApp } from './app';
 import { WEB_ORIGINS, env } from './config/env';
 import { logger } from './lib/logger';
 import { disconnectPrisma } from './lib/prisma';
+import { deviceGateway } from './lib/deviceGateway';
 import { startOutboxWorker, stopOutboxWorker } from './lib/outbox/worker';
 import {
   startBookingSweeper,
   stopBookingSweeper,
 } from './modules/bookings/booking.sweeper';
+import { deviceInboundHandler } from './modules/commands/inbound.service';
 
 /**
  * Process entry point: listen, then shut down cleanly.
@@ -53,6 +55,29 @@ const server = app.listen(env.PORT, () => {
    * unlockable. It reconciles rows and releases devices.
    */
   startBookingSweeper();
+
+  /**
+   * Connect to the broker and register where device messages land.
+   *
+   * Here and not in `createApp()`, because this opens a network connection and
+   * a test suite must not. (The in-process mock *is* wired up by `createApp`,
+   * which is how the ack path stays reachable from tests — see the comment
+   * there. Calling `start` twice on the mock simply re-registers the same
+   * handler.)
+   *
+   * Failing to connect does not stop the server. The API has plenty to do
+   * without a broker — someone mid-booking can still see their dashboard and
+   * pay an overstay fee — and a gateway that reconnects on its own turns a
+   * broker restart into a blip rather than an outage. Commands issued
+   * meanwhile fail honestly as `EXPIRED`/`PUBLISH_FAILED`, which is the truth:
+   * nothing reached the device.
+   */
+  void deviceGateway.start(deviceInboundHandler).catch((error: unknown) => {
+    logger.error(
+      { reason: error instanceof Error ? error.message : 'unknown' },
+      'Device gateway failed to start; commands will not reach any safe until it connects',
+    );
+  });
 });
 
 let shuttingDown = false;
@@ -72,6 +97,16 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // pushed-out backoff, so the next process picks it up rather than losing it.
   stopOutboxWorker();
   stopBookingSweeper();
+
+  /**
+   * Disconnect from the broker, after in-flight acks have been handled.
+   *
+   * An ack arriving mid-shutdown is a bolt that moved, and dropping it would
+   * leave the record disagreeing with a physical safe. A command whose ack we
+   * never get times out and is reconciled by the next process, which is the
+   * designed behaviour rather than a loss.
+   */
+  void deviceGateway.stop();
 
   // Hard deadline. unref'd so it never by itself keeps the process alive.
   const forceExit = setTimeout(() => {

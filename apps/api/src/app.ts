@@ -3,6 +3,8 @@ import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import helmet from 'helmet';
 import { WEB_ORIGINS, env } from './config/env';
+import { deviceGateway } from './lib/deviceGateway';
+import { deviceInboundHandler } from './modules/commands/inbound.service';
 import { createApiRouter } from './routes';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { createOriginCheck } from './middleware/originCheck';
@@ -51,6 +53,25 @@ export interface CreateAppOptions {
  *  7. routes, 404, error handler
  */
 export function createApp(options: CreateAppOptions = {}): Express {
+  /**
+   * The in-process mock gateway is wired up here, unlike the workers.
+   *
+   * The outbox worker and the sweepers are started from `server.ts` only,
+   * because a *loop* that ticked during the test suite would race every
+   * assertion. This is not a loop: the mock produces one ack in response to
+   * one command a caller has just issued, and `drainDeviceAcks()` makes that
+   * deterministic. Leaving it unwired in tests would instead make the entire
+   * ack path — signature verification, command correlation, the state update,
+   * the event and the notification — unreachable from any test that goes
+   * through a route, which is the half of this feature most worth testing.
+   *
+   * A real gateway is **not** started here: `start` opens a broker connection,
+   * and a test suite must not. `server.ts` does that.
+   */
+  if (env.DEVICE_GATEWAY === 'mock') {
+    void deviceGateway.start(deviceInboundHandler);
+  }
+
   const app = express();
 
   const limiters = createLimiters({ ...DEFAULT_RATE_LIMITS, ...options.rateLimits });

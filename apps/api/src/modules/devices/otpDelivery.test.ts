@@ -153,7 +153,7 @@ describe('when delivery fails', () => {
     expect(result.status).toBe(200);
 
     const confirm = await post(CONFIRM_URL, user.cookie).send({ otp: code });
-    expect(confirm.status).toBe(200);
+    expect(confirm.status).toBe(202);
   });
 
   it('answers 429 WHATSAPP_SEND_CAP_REACHED only when the cap is the reason', async () => {

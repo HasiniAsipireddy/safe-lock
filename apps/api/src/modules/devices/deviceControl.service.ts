@@ -1,18 +1,18 @@
 import {
+  CHALLENGE_MAX_BINDS,
+  COMMAND_POLL_INTERVAL_MS,
   ERROR_CODES,
   OTP_MAX_ATTEMPTS,
   OTP_RESEND_COOLDOWN_SECONDS,
   OTP_TTL_MS,
+  type CommandAcceptedResponse,
   type DeviceSummary,
-  type LockResponse,
-  type UnlockConfirmResponse,
   type UnlockFailureReason as StoredUnlockFailureReason,
   type UnlockRequestResponse,
 } from '@safelock/shared';
 import { prisma, type PrismaTransaction } from '../../lib/prisma';
 import { HttpError, conflict } from '../../lib/httpError';
 import type { SendOutcome } from '../../lib/whatsapp/send';
-import { deviceGateway } from '../../lib/deviceGateway';
 import { logger } from '../../lib/logger';
 import { notifier } from '../../lib/notifier';
 import { unlockEligibility } from '@safelock/shared';
@@ -22,7 +22,15 @@ import {
   snapshotOf,
   type BookingRow,
 } from '../bookings/booking.mapper';
-import { DEVICE_SUMMARY_SELECT, toDeviceSummary } from './device.mapper';
+import {
+  assertNotBusyWith,
+  bindLimitReached,
+  createCommand,
+  publishCommand,
+  type CommandRecord,
+} from '../commands/command.service';
+import { DEVICE_SUMMARY_SELECT, isDeviceOnline, toDeviceSummary } from './device.mapper';
+import { recordEvent } from './deviceEvents';
 import { deliverOtp, generateOtp, hashOtp, verifyOtp } from './otp.service';
 
 /**
@@ -85,6 +93,27 @@ const stateUnknown = () =>
   );
 
 /**
+ * We cannot reach the safe.
+ *
+ * **Refused, not queued — including a lock.** That is not a weakening of
+ * "never block locking": that rule is about *policy* gates, and no code, no
+ * settled fee and no verified phone are needed to secure your safe. This is
+ * physics. A queued lock firing forty minutes later is a command whose premise
+ * has expired, and would either record a safe as locked when it is not — which
+ * "lockState moves only on an ack" forbids — or sit invisibly pending.
+ *
+ * Refused at the unlock *request* too, before a code is sent: issuing an OTP
+ * for a safe that cannot receive a command spends the user's WhatsApp send cap
+ * and their three-codes-per-ten-minutes on a code that cannot work. Refusing
+ * early with an accurate message costs them nothing.
+ */
+const deviceOffline = () =>
+  conflict(
+    ERROR_CODES.DEVICE_OFFLINE,
+    'We cannot reach your safe right now. Check that it has power, and use your key if you need your belongings immediately.',
+  );
+
+/**
  * Every OTP failure is a 400 carrying a distinct code.
  *
  * Not 429 for the attempt limit, even though it is a lockout: the client
@@ -95,12 +124,18 @@ const stateUnknown = () =>
 const otpFailure = (code: string, message: string) =>
   new HttpError({ status: 400, code, message });
 
-const commandFailed = () =>
-  new HttpError({
-    status: 502,
-    code: ERROR_CODES.DEVICE_COMMAND_FAILED,
-    message: 'Your safe did not respond. Please try again in a moment.',
-  });
+/**
+ * There is no `commandFailed` 502 any more, and its absence is the point.
+ *
+ * A command can no longer fail *during the request*: the request's job ends at
+ * "a command row exists and has been handed to the gateway". Everything that
+ * can go wrong afterwards — a refusal, a jam, silence — is reported on the
+ * command itself and read by polling `GET /devices/commands/:id`.
+ *
+ * One answer for every outcome rather than a 502 for one particular failure
+ * and a poll for the rest. `ERROR_CODES.DEVICE_COMMAND_FAILED` is kept for the
+ * clients still switching on it.
+ */
 
 /**
  * A code was generated but could not be delivered.
@@ -159,6 +194,8 @@ export interface OperableDevice {
   serialNumber: string;
   lockState: 'LOCKED' | 'UNLOCKED' | 'UNKNOWN';
   bookingId: string;
+  /** Derived from the age of the last verified message, never the stored flag. */
+  online: boolean;
 }
 
 /**
@@ -184,7 +221,20 @@ export interface OperableDevice {
 export async function assertCanOperate(
   userId: string,
   client: PrismaTransaction | typeof prisma = prisma,
-  options: { requirePhoneVerified?: boolean; requireUnlockable?: boolean; now?: Date } = {},
+  options: {
+    requirePhoneVerified?: boolean;
+    requireUnlockable?: boolean;
+    /**
+     * Whether an unreachable safe is a refusal.
+     *
+     * True for every action that sends a command, and for the unlock request
+     * that would otherwise spend a code on one. False for a plain read, which
+     * must still answer for an offline safe — a dashboard that 409s because a
+     * device is unplugged tells the user nothing about their booking.
+     */
+    requireOnline?: boolean;
+    now?: Date;
+  } = {},
 ): Promise<OperableDevice> {
   const now = options.now ?? new Date();
 
@@ -227,7 +277,7 @@ export async function assertCanOperate(
 
   const device = await client.device.findUnique({
     where: { id: row.deviceId },
-    select: { id: true, serialNumber: true, lockState: true },
+    select: { id: true, serialNumber: true, lockState: true, online: true, lastSeenAt: true },
   });
 
   if (!device) throw noActiveBooking();
@@ -237,11 +287,24 @@ export async function assertCanOperate(
   // about.
   if (device.lockState === 'UNKNOWN') throw stateUnknown();
 
+  const online = isDeviceOnline(device, now);
+
+  /**
+   * Checked last, after everything the user could do something about.
+   *
+   * A user whose booking has ended *and* whose safe is offline should be told
+   * about the booking: that is the one of the two they can act on. Ordering
+   * the other way would send someone to check a power cable over a rental that
+   * expired yesterday.
+   */
+  if (options.requireOnline && !online) throw deviceOffline();
+
   return {
     deviceId: device.id,
     serialNumber: device.serialNumber,
     lockState: device.lockState,
     bookingId: row.id,
+    online,
   };
 }
 
@@ -289,49 +352,6 @@ async function lockDeviceRow(tx: PrismaTransaction, deviceId: string): Promise<v
   await tx.$queryRaw`SELECT "id" FROM "Device" WHERE "id" = ${deviceId} FOR UPDATE`;
 }
 
-/**
- * Records a user-visible device event. Never carries a code or a hash.
- *
- * Returns the new row's id so a notification can point at it in the same
- * transaction.
- */
-async function recordEvent(
-  tx: PrismaTransaction | typeof prisma,
-  input: {
-    deviceId: string;
-    userId: string;
-    type: 'LOCK' | 'UNLOCK_REQUESTED' | 'UNLOCK_CONFIRMED' | 'UNLOCK_FAILED';
-    requestId: string | null;
-    failureReason?: StoredUnlockFailureReason | undefined;
-  },
-): Promise<string> {
-  const event = await tx.deviceEvent.create({
-    data: {
-      deviceId: input.deviceId,
-      userId: input.userId,
-      type: input.type,
-      source: 'WEB',
-      requestId: input.requestId,
-      ...(input.failureReason ? { failureReason: input.failureReason } : {}),
-    },
-    select: { id: true },
-  });
-
-  return event.id;
-}
-
-/** Reads the owner-facing view of a device. */
-async function readSummary(
-  client: PrismaTransaction | typeof prisma,
-  deviceId: string,
-): Promise<DeviceSummary> {
-  const device = await client.device.findUniqueOrThrow({
-    where: { id: deviceId },
-    select: DEVICE_SUMMARY_SELECT,
-  });
-  return toDeviceSummary(device);
-}
-
 // --- Lock --------------------------------------------------------------------
 
 export interface LockInput {
@@ -340,79 +360,112 @@ export interface LockInput {
 }
 
 /**
- * Locks the safe. Idempotent: an already-locked safe is a success, no command
- * is sent and no event is written — there was no state change to record.
+ * Asks the safe to lock, and answers before it has.
  *
- * The gateway call happens **inside** the transaction, while the device row is
- * locked. That holds a row lock across the gateway round trip, which is
- * acceptable while the gateway is an in-process mock and is the simplest thing
- * that makes two concurrent taps correct. The real MQTT gateway must not do
- * this: it needs a claim-then-ack model with a `Command` row and a timeout,
- * which is exactly what that deferred table is for (see docs/decisions.md).
+ * ## 202, not 200
+ * The old version called the gateway **inside** the transaction while holding
+ * the device row lock, and returned the device. That was correct for an
+ * in-process mock and is unacceptable over MQTT for two independent reasons: a
+ * transaction that waits on a radio makes a network outage fatal, and holding
+ * the device row lock across the round trip serialises the fleet behind one
+ * slow safe. So the row is committed, the lock is released, the command is
+ * published, and the client is handed a `commandId` to poll.
+ *
+ * Returning a device summary here would mean returning a lock state nobody has
+ * confirmed — which is the thing `lockState` moves only on an ack exists to
+ * prevent.
+ *
+ * ## Idempotent
+ * An already-locked safe is a success with no command issued. Nothing was sent
+ * and no event is written, because there was no state change to record.
  */
-export async function lockDevice(input: LockInput): Promise<LockResponse> {
-  // Neither gate: locking needs no one-time code and no settled fee. An
-  // unverified user mid-overstay must still be able to secure their safe.
-  const target = await assertCanOperate(input.userId);
+export async function lockDevice(input: LockInput): Promise<CommandAcceptedResponse> {
+  /**
+   * Neither policy gate: locking needs no one-time code and no settled fee. An
+   * unverified user mid-overstay must still be able to secure their safe.
+   * `requireOnline` is not a policy gate — it is whether the safe can hear us.
+   */
+  const target = await assertCanOperate(input.userId, prisma, { requireOnline: true });
 
-  return prisma.$transaction(async (tx) => {
+  /**
+   * Three outcomes, named: the safe is already locked, a lock is already on
+   * its way, or we are issuing one. Each answers the caller differently and
+   * none of them is an error.
+   */
+  type LockDecision =
+    | { kind: 'already-locked' }
+    | { kind: 'in-flight'; command: { id: string; expiresAt: Date } }
+    | { kind: 'issued'; command: CommandRecord };
+
+  const issued = await prisma.$transaction<LockDecision>(async (tx) => {
     await lockDeviceRow(tx, target.deviceId);
 
     // Re-read under the lock: another tab may have moved it since
     // assertCanOperate ran.
     const current = await tx.device.findUniqueOrThrow({
       where: { id: target.deviceId },
-      select: { lockState: true, serialNumber: true },
+      select: { lockState: true },
     });
 
-    if (current.lockState === 'LOCKED') {
-      return { device: await readSummary(tx, target.deviceId), alreadyLocked: true };
-    }
+    if (current.lockState === 'LOCKED') return { kind: 'already-locked' };
 
-    const result = await sendCommand(() => deviceGateway.sendLock(current.serialNumber));
+    /**
+     * A lock already on its way is the answer to a second tap.
+     *
+     * Returning the in-flight command rather than issuing another keeps the
+     * two taps idempotent *and* keeps the device's no-queue rule satisfied —
+     * it would reject the second as `UNSUPPORTED`, and the user would see a
+     * failure for a lock that was in fact succeeding. A different command in
+     * flight raises `DEVICE_BUSY` from here.
+     */
+    const live = await assertNotBusyWith(tx, target.deviceId, 'LOCK');
+    if (live) return { kind: 'in-flight', command: live };
 
-    await tx.device.update({
-      where: { id: target.deviceId },
-      data: {
-        lockState: 'LOCKED',
-        lockStateUpdatedAt: result.ackedAt,
-        online: true,
-        lastSeenAt: result.ackedAt,
-      },
-    });
-
-    await recordEvent(tx, {
-      deviceId: target.deviceId,
-      userId: input.userId,
-      type: 'LOCK',
-      requestId: input.requestId,
-    });
-
-    return { device: await readSummary(tx, target.deviceId), alreadyLocked: false };
+    return {
+      kind: 'issued',
+      command: await createCommand(tx, {
+        deviceId: target.deviceId,
+        type: 'LOCK',
+        userId: input.userId,
+        bookingId: target.bookingId,
+      }),
+    };
   });
-}
 
-/** Runs a gateway call and turns any transport failure into a clean 502. */
-async function sendCommand(
-  call: () => Promise<{ acked: boolean; ackedAt: Date }>,
-): Promise<{ acked: boolean; ackedAt: Date }> {
-  let result: { acked: boolean; ackedAt: Date };
-
-  try {
-    result = await call();
-  } catch (cause) {
-    logger.error(
-      { reason: cause instanceof Error ? cause.message : 'unknown' },
-      'Device gateway threw while sending a command',
-    );
-    throw commandFailed();
+  if (issued.kind === 'in-flight') {
+    return {
+      commandId: issued.command.id,
+      status: 'SENT',
+      pollAfterMs: COMMAND_POLL_INTERVAL_MS,
+      expiresAt: issued.command.expiresAt.toISOString(),
+    };
   }
 
-  // An unacked command is a command that did not happen. Fail rather than
-  // record a state the hardware never confirmed.
-  if (!result.acked) throw commandFailed();
+  if (issued.kind === 'already-locked') {
+    return {
+      commandId: null,
+      /**
+       * `ACKED` because the safe is in the requested state and has previously
+       * confirmed it — `alreadyInState` is what tells the client there is
+       * nothing to wait for. Inventing a sixth status for "no work to do"
+       * would put a value in the enum that no command row can ever hold.
+       */
+      status: 'ACKED',
+      pollAfterMs: 0,
+      expiresAt: new Date().toISOString(),
+      alreadyInState: true,
+    };
+  }
 
-  return result;
+  // Outside the transaction, after the commit, with no lock held.
+  const outcome = await publishCommand(issued.command);
+
+  return {
+    commandId: issued.command.id,
+    status: outcome.status,
+    pollAfterMs: COMMAND_POLL_INTERVAL_MS,
+    expiresAt: issued.command.expiresAt.toISOString(),
+  };
 }
 
 // --- Unlock: request ---------------------------------------------------------
@@ -434,9 +487,18 @@ export interface UnlockRequestInput {
 export async function requestUnlock(
   input: UnlockRequestInput,
 ): Promise<UnlockRequestResponse> {
+  /**
+   * `requireOnline` here, before a code exists.
+   *
+   * This is the most important of the offline refusals: issuing an OTP for a
+   * safe that cannot receive a command spends the user's WhatsApp send cap and
+   * one of their three codes per ten minutes on a code that cannot possibly
+   * work — and then fails at the confirm step anyway, after they have typed it.
+   */
   const target = await assertCanOperate(input.userId, prisma, {
     requirePhoneVerified: true,
     requireUnlockable: true,
+    requireOnline: true,
   });
 
   const code = generateOtp();
@@ -519,7 +581,17 @@ export type UnlockFailureReason =
   | 'no_challenge'
   | 'expired'
   | 'attempts_exhausted'
-  | 'wrong_code';
+  | 'wrong_code'
+  /**
+   * The code was never examined: we could not reach the safe.
+   *
+   * The only member of this union that is not about the code. Kept here rather
+   * than given its own path because the *recording* is identical — an
+   * `UNLOCK_FAILED` row in the owner's feed with a reason — and the three
+   * device-side failures that happen after a correct code are recorded by the
+   * ack handler instead, where their outcome is actually known.
+   */
+  | 'device_offline';
 
 /**
  * The same four reasons as the `UnlockFailureReason` enum column.
@@ -535,6 +607,7 @@ const STORED_REASON: Record<UnlockFailureReason, StoredUnlockFailureReason> = {
   expired: 'EXPIRED',
   attempts_exhausted: 'TOO_MANY_ATTEMPTS',
   wrong_code: 'WRONG_CODE',
+  device_offline: 'DEVICE_OFFLINE',
 };
 
 export class UnlockFailed extends Error {
@@ -561,7 +634,7 @@ export class UnlockFailed extends Error {
  */
 export async function confirmUnlock(
   input: UnlockConfirmInput,
-): Promise<UnlockConfirmResponse> {
+): Promise<CommandAcceptedResponse> {
   // Re-checked here, not just on request: a number could have been unverified
   // and a booking could have ended between the two calls, and this is the call
   // that moves the bolt. Re-checked **again** inside the transaction below,
@@ -570,6 +643,20 @@ export async function confirmUnlock(
     requirePhoneVerified: true,
     requireUnlockable: true,
   });
+
+  /**
+   * Offline raised as an `UnlockFailed` rather than a bare 409, so the owner's
+   * activity feed records the attempt.
+   *
+   * It is the one refusal at this point that is about the *safe* rather than
+   * about the code or the booking, and somebody looking at their history
+   * afterwards — wondering why their safe would not open — should find it
+   * there. The code is untouched: nothing was spent, so they can try again the
+   * moment the safe is back.
+   */
+  if (!target.online) {
+    throw new UnlockFailed(deviceOffline(), 'device_offline', target.deviceId);
+  }
 
   const challenge = await prisma.unlockChallenge.findFirst({
     where: { userId: input.userId, deviceId: target.deviceId, consumedAt: null },
@@ -643,24 +730,23 @@ export async function confirmUnlock(
     );
   }
 
-  const device = await prisma.$transaction(async (tx) => {
-    // The serialisation point. Exactly one concurrent confirm claims it.
-    const claimed = await tx.unlockChallenge.updateMany({
-      where: { id: challenge.id, consumedAt: null },
-      data: { consumedAt: new Date() },
-    });
+  /**
+   * Two outcomes, and the second one has to survive the rollback.
+   *
+   * A code at its bind limit must be *burned*, and a burn written inside a
+   * transaction that then throws is a burn that never happened.
+   */
+  type ConfirmDecision =
+    | { kind: 'issued'; command: CommandRecord }
+    | { kind: 'bind-limit' };
 
-    if (claimed.count !== 1) {
-      throw new UnlockFailed(
-        otpFailure(
-          ERROR_CODES.OTP_NOT_FOUND,
-          'That code has already been used. Request a new one.',
-        ),
-        'no_challenge',
-        target.deviceId,
-      );
-    }
-
+  const issued = await prisma.$transaction<ConfirmDecision>(async (tx) => {
+    /**
+     * The row lock first, so two concurrent confirms are serialised here
+     * rather than racing the bind below. The second one then reads a challenge
+     * that is already bound and loses cleanly, instead of both allocating a
+     * sequence number and one of them rolling back.
+     */
     await lockDeviceRow(tx, target.deviceId);
 
     /**
@@ -672,63 +758,128 @@ export async function confirmUnlock(
      * the bolt moving. This is the check that is actually load-bearing; the
      * earlier one exists to fail fast with a good message.
      *
-     * A throw here rolls back the challenge claim too, so the user's code is
-     * not burned by a refusal that was not their fault.
+     * A throw here rolls the whole transaction back — including the bind — so
+     * the user's code is not burned by a refusal that was not their fault.
      */
     await assertCanOperate(input.userId, tx, {
       requirePhoneVerified: true,
       requireUnlockable: true,
-    });
-
-    const current = await tx.device.findUniqueOrThrow({
-      where: { id: target.deviceId },
-      select: { serialNumber: true },
-    });
-
-    // If this throws, the whole transaction rolls back — including the claim,
-    // so the user's code still works and they can simply try again. Burning a
-    // valid code because the radio hiccuped would be a poor trade.
-    const result = await sendCommand(() => deviceGateway.sendUnlock(current.serialNumber));
-
-    await tx.device.update({
-      where: { id: target.deviceId },
-      data: {
-        lockState: 'UNLOCKED',
-        lockStateUpdatedAt: result.ackedAt,
-        online: true,
-        lastSeenAt: result.ackedAt,
-      },
-    });
-
-    const eventId = await recordEvent(tx, {
-      deviceId: target.deviceId,
-      userId: input.userId,
-      type: 'UNLOCK_CONFIRMED',
-      requestId: input.requestId,
+      requireOnline: true,
     });
 
     /**
-     * Tell the owner, in this transaction.
-     *
-     * Atomic with the event on purpose and in both directions: a rollback
-     * after this point takes the notification with it, so nobody is told their
-     * safe opened when it did not — and there is no path that opens the safe
-     * while silently failing to notify, because a notifier that cannot record
-     * throws and rolls the unlock back. For a product that physically opens a
-     * safe, "it opened but we never told you" is the worse of the two
-     * failures. See docs/decisions.md.
+     * Checked **before** the challenge is bound, so a refusal costs the user
+     * nothing: a completion lock or a reconcile already in flight means the
+     * device would reject this unlock as a duplicate, and burning a bind to
+     * find that out would be charging them for our timing.
      */
-    await notifier.notifyUnlock(tx, {
-      userId: input.userId,
-      type: 'UNLOCK_CONFIRMED',
-      deviceEventId: eventId,
-      serialNumber: current.serialNumber,
+    await assertNotBusyWith(tx, target.deviceId, 'UNLOCK');
+
+    const open = await tx.unlockChallenge.findUnique({
+      where: { id: challenge.id },
+      select: { consumedAt: true, commandId: true, binds: true },
     });
 
-    return readSummary(tx, target.deviceId);
+    // Consumed, or already backing a live command: either way this code is not
+    // available to spend, and the answer is the same one a reused code gets.
+    if (!open || open.consumedAt || open.commandId) {
+      throw new UnlockFailed(
+        otpFailure(
+          ERROR_CODES.OTP_NOT_FOUND,
+          'That code has already been used. Request a new one.',
+        ),
+        'no_challenge',
+        target.deviceId,
+      );
+    }
+
+    /**
+     * The bind limit. Without it, a jammed motor and a determined user could
+     * spawn commands until the code expired — each failure releasing the code
+     * for another attempt, indefinitely.
+     */
+    /**
+     * The bind limit. Without it, a jammed motor and a determined user could
+     * spawn commands until the code expired — each failure releasing the code
+     * for another attempt, indefinitely.
+     *
+     * The code is burned **outside** this transaction, below. Doing it here
+     * and then throwing would roll the burn back with everything else, leaving
+     * a code that refuses forever at the limit but never dies — and a user
+     * told to request a new one while the old one still occupies the "one live
+     * challenge" slot.
+     */
+    if (open.binds >= CHALLENGE_MAX_BINDS) return { kind: 'bind-limit' };
+
+    const command = await createCommand(tx, {
+      deviceId: target.deviceId,
+      type: 'UNLOCK',
+      userId: input.userId,
+      bookingId: target.bookingId,
+      // Recorded on the command, not only on the challenge: a timeout clears
+      // the challenge's link, and a late ack still has to find the code.
+      challengeId: challenge.id,
+    });
+
+    /**
+     * The serialisation point, now on `commandId` rather than `consumedAt`.
+     *
+     * The concurrency property is unchanged: exactly one of N concurrent
+     * confirms wins the conditional update, so exactly one command is ever
+     * created and the loser sees `OTP_NOT_FOUND`. What changed is *when the
+     * code dies* — at the ack, not here, because a command can fail after the
+     * code was right and burning it for our motor fault would charge the user
+     * for our hardware's mistake.
+     */
+    const bound = await tx.unlockChallenge.updateMany({
+      where: { id: challenge.id, consumedAt: null, commandId: null },
+      data: { commandId: command.id, binds: { increment: 1 } },
+    });
+
+    if (bound.count !== 1) {
+      throw new UnlockFailed(
+        otpFailure(
+          ERROR_CODES.OTP_NOT_FOUND,
+          'That code has already been used. Request a new one.',
+        ),
+        'no_challenge',
+        target.deviceId,
+      );
+    }
+
+    return { kind: 'issued', command };
   });
 
-  return { device };
+  /**
+   * The burn, in its own transaction, after the first one has committed.
+   *
+   * Past three failed commands the code is dead rather than merely refused:
+   * telling someone to request a new one while the old one still holds the
+   * "one live challenge" slot would be telling them to do something that
+   * cannot work.
+   */
+  if (issued.kind === 'bind-limit') {
+    await consume(challenge.id);
+    throw bindLimitReached();
+  }
+
+  /**
+   * No `DeviceEvent` is written here at all.
+   *
+   * `UNLOCK_CONFIRMED` belongs to the ack, because the fact worth recording is
+   * that the bolt moved — and a row saying "a command was sent" tells the
+   * owner nothing they did not just do. `/history` is better for not having
+   * one per unlock. The notification moves with it, and stays atomic with the
+   * event it describes: it is now atomic with the *true* event.
+   */
+  const outcome = await publishCommand(issued.command);
+
+  return {
+    commandId: issued.command.id,
+    status: outcome.status,
+    pollAfterMs: COMMAND_POLL_INTERVAL_MS,
+    expiresAt: issued.command.expiresAt.toISOString(),
+  };
 }
 
 /** Marks a challenge dead. Idempotent — only an open challenge is touched. */

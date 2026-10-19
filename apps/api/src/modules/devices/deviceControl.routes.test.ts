@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { OTP_MAX_ATTEMPTS, OTP_TTL_MS } from '@safelock/shared';
 import { prisma } from '../../lib/prisma';
+import { drainDeviceAcks } from '../../lib/deviceGateway';
 import {
   TEST_ORIGIN,
   app,
@@ -28,6 +29,32 @@ async function getCode(cookie: string): Promise<string> {
   const { result, code } = await withCapturedOtp(() => post(REQUEST_URL, cookie).send({}));
   expect(result.status).toBe(200);
   return code;
+}
+
+/**
+ * Issues a command and waits for the simulated device to answer it.
+ *
+ * Lock and unlock are **202s** now: the command has been accepted and the bolt
+ * has not moved. So a test that wants to assert on a *settled* world has to
+ * wait for the ack, and `drainDeviceAcks` is how it does that without sleeping
+ * — the mock knows exactly what it owes.
+ *
+ * Every assertion about `lockState`, a `DeviceEvent` or a notification belongs
+ * after this, because all three are now written by the ack handler. That is
+ * the point of the change: they describe what the safe did, not what we asked.
+ */
+async function sendCommand(url: string, cookie: string, body: object = {}) {
+  const response = await post(url, cookie).send(body);
+  await drainDeviceAcks();
+  return response;
+}
+
+/** The command row for an accepted 202, once it has settled. */
+async function commandOf(response: { body: { commandId: string | null } }) {
+  const commandId = response.body.commandId;
+  expect(commandId).toBeTruthy();
+
+  return prisma.command.findUniqueOrThrow({ where: { id: commandId as string } });
 }
 
 // --- Eligibility -------------------------------------------------------------
@@ -85,9 +112,9 @@ describe('lock/unlock eligibility', () => {
     expect(confirm.status).toBe(402);
     expect(confirm.body.error.code).toBe('OVERSTAY_PAYMENT_REQUIRED');
 
-    // Lock is allowed, and is a 200 whether or not it had to move the bolt.
+    // Lock is allowed, and is a 202 whether or not it had to move the bolt.
     const lock = await post(LOCK_URL, user.cookie).send({});
-    expect(lock.status).toBe(200);
+    expect(lock.status).toBe(202);
   });
 
   /** Paying the fee is what opens the collection window — and the safe. */
@@ -161,56 +188,95 @@ describe('lock/unlock eligibility', () => {
 // --- Lock --------------------------------------------------------------------
 
 describe('POST /devices/lock', () => {
-  it('locks an unlocked safe and records the state change', async () => {
+  /**
+   * The 202 contract: accepted, not done. The response carries a command to
+   * poll and deliberately **no device summary** — returning one would be
+   * returning a lock state nobody has confirmed.
+   */
+  it('accepts the command without claiming the bolt has moved', async () => {
     const { user, deviceId } = await createUserWithDevice();
     await prisma.device.update({ where: { id: deviceId }, data: { lockState: 'UNLOCKED' } });
 
     const response = await post(LOCK_URL, user.cookie).send({});
 
-    expect(response.status).toBe(200);
-    expect(response.body.alreadyLocked).toBe(false);
-    expect(response.body.device.lockState).toBe('LOCKED');
-    expect(response.body.device.lockStateUpdatedAt).not.toBeNull();
+    expect(response.status).toBe(202);
+    expect(response.body.commandId).toBeTruthy();
+    expect(response.body.status).toBe('SENT');
+    expect(response.body).not.toHaveProperty('device');
+
+    // Still UNLOCKED: the ack has not been handled yet, and the stored state
+    // moves on an ack and on nothing else.
+    const beforeAck = await prisma.device.findUnique({ where: { id: deviceId } });
+    expect(beforeAck?.lockState).toBe('UNLOCKED');
+  });
+
+  it('locks the safe once the device acks, and records the state change', async () => {
+    const { user, deviceId } = await createUserWithDevice();
+    await prisma.device.update({ where: { id: deviceId }, data: { lockState: 'UNLOCKED' } });
+
+    const response = await sendCommand(LOCK_URL, user.cookie);
+    const command = await commandOf(response);
+
+    expect(command.status).toBe('ACKED');
+    expect(command.ackedAt).not.toBeNull();
+    expect(command.lateAckedAt).toBeNull();
+    // Monotonic from zero, allocated under the device row lock.
+    expect(command.seq).toBe(1);
 
     const row = await prisma.device.findUnique({ where: { id: deviceId } });
     expect(row?.lockState).toBe('LOCKED');
-    // The mock gateway acked, so the device is considered reachable.
+    expect(row?.lockStateUpdatedAt).not.toBeNull();
+    // The device spoke, so it is reachable.
     expect(row?.online).toBe(true);
     expect(row?.lastSeenAt).not.toBeNull();
+    // Measured, not assumed.
+    expect(row?.doorState).toBe('CLOSED');
   });
 
-  it('is idempotent: locking a locked safe succeeds and writes no event', async () => {
+  it('is idempotent: locking a locked safe issues no command and writes no event', async () => {
     const { user, deviceId } = await createUserWithDevice();
 
-    const first = await post(LOCK_URL, user.cookie).send({});
-    expect(first.status).toBe(200);
-    // Allocation already left it LOCKED, so even the first call is a no-op.
-    expect(first.body.alreadyLocked).toBe(true);
+    const first = await sendCommand(LOCK_URL, user.cookie);
+    expect(first.status).toBe(202);
+    // The safe is already locked, so even the first call has nothing to send.
+    expect(first.body.alreadyInState).toBe(true);
+    expect(first.body.commandId).toBeNull();
 
-    const second = await post(LOCK_URL, user.cookie).send({});
-    expect(second.status).toBe(200);
-    expect(second.body.alreadyLocked).toBe(true);
-    expect(second.body.device.lockState).toBe('LOCKED');
+    const second = await sendCommand(LOCK_URL, user.cookie);
+    expect(second.body.alreadyInState).toBe(true);
 
-    // No state changed, so there is nothing to put in the activity feed.
+    // No command, so nothing to poll and nothing to record.
+    expect(await prisma.command.count({ where: { deviceId } })).toBe(0);
     const events = await prisma.deviceEvent.count({ where: { deviceId, type: 'LOCK' } });
     expect(events).toBe(0);
   });
 
-  it('writes a DeviceEvent and an audit row for a real lock', async () => {
+  /**
+   * The `LOCK` event is written by the **ack handler**, not the request. The
+   * feed is the user-visible security record of a physical safe, and the fact
+   * worth recording is that the bolt moved.
+   */
+  it('writes the DeviceEvent when the device acks, not when the command is sent', async () => {
     const { user, deviceId } = await createUserWithDevice();
     await prisma.device.update({ where: { id: deviceId }, data: { lockState: 'UNLOCKED' } });
 
     await post(LOCK_URL, user.cookie).send({});
+    expect(await prisma.deviceEvent.count({ where: { deviceId, type: 'LOCK' } })).toBe(0);
+
+    await drainDeviceAcks();
 
     const event = await prisma.deviceEvent.findFirst({ where: { deviceId, type: 'LOCK' } });
     expect(event).toMatchObject({ userId: user.id, type: 'LOCK', source: 'WEB' });
-    expect(event?.requestId).toBeTruthy();
 
-    const audit = await prisma.auditLog.findFirst({
-      where: { userId: user.id, action: 'device.lock.success' },
+    const issued = await prisma.auditLog.findFirst({
+      where: { userId: user.id, action: 'device.command.issued' },
     });
-    expect(audit?.deviceId).toBe(deviceId);
+    expect(issued).not.toBeNull();
+
+    const acked = await prisma.auditLog.findFirst({
+      where: { action: 'device.command.acked', deviceId },
+    });
+    expect((acked?.metadata as { result?: string })?.result).toBe('OK');
   });
 
   it('rejects a cross-site POST before it reaches the handler', async () => {
@@ -307,7 +373,45 @@ describe('POST /devices/unlock/request', () => {
 
     // The current one still works.
     const ok = await post(CONFIRM_URL, user.cookie).send({ otp: second });
-    expect(ok.status).toBe(200);
+    expect(ok.status).toBe(202);
+  });
+
+  /**
+   * The offline refusal that matters most, because it happens **before** a
+   * code exists. Issuing one for a safe that cannot receive a command spends
+   * the user's send cap and one of their three codes per ten minutes on a code
+   * that cannot work, and then fails at confirm anyway — after they have typed
+   * it in.
+   */
+  it('refuses before sending a code when the safe is unreachable', async () => {
+    const { user, deviceId } = await createUserWithDevice();
+    await prisma.device.update({
+      where: { id: deviceId },
+      data: { online: false, lastSeenAt: null },
+    });
+
+    const response = await post(REQUEST_URL, user.cookie).send({});
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('DEVICE_OFFLINE');
+    expect(await prisma.unlockChallenge.count({ where: { deviceId } })).toBe(0);
+  });
+
+  /**
+   * Stale liveness is not liveness. The stored flag still says online; the
+   * last message is older than three heartbeats, and that is what decides.
+   */
+  it('treats a device that has stopped reporting as offline', async () => {
+    const { user, deviceId } = await createUserWithDevice();
+    await prisma.device.update({
+      where: { id: deviceId },
+      data: { online: true, lastSeenAt: new Date(Date.now() - 10 * 60 * 1000) },
+    });
+
+    const response = await post(REQUEST_URL, user.cookie).send({});
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('DEVICE_OFFLINE');
   });
 });
 
@@ -318,10 +422,18 @@ describe('POST /devices/unlock/confirm', () => {
     const { user, deviceId } = await createUserWithDevice();
     const code = await getCode(user.cookie);
 
-    const response = await post(CONFIRM_URL, user.cookie).send({ otp: code });
+    const response = await sendCommand(CONFIRM_URL, user.cookie, { otp: code });
 
-    expect(response.status).toBe(200);
-    expect(response.body.device.lockState).toBe('UNLOCKED');
+    expect(response.status).toBe(202);
+    expect(response.body.commandId).toBeTruthy();
+
+    const command = await commandOf(response);
+    expect(command.type).toBe('UNLOCK');
+    expect(command.status).toBe('ACKED');
+    expect(command.userId).toBe(user.id);
+    // A user command. Nobody retries one, because somebody is waiting on it.
+    expect(command.systemActor).toBeNull();
+    expect(command.attempts).toBe(1);
 
     const row = await prisma.device.findUnique({ where: { id: deviceId } });
     expect(row?.lockState).toBe('UNLOCKED');
@@ -332,10 +444,33 @@ describe('POST /devices/unlock/confirm', () => {
     });
     expect(event?.userId).toBe(user.id);
 
-    const audit = await prisma.auditLog.findFirst({
-      where: { userId: user.id, action: 'device.unlock.success' },
+    // The owner is told, in the same transaction as the event.
+    const notification = await prisma.notification.findFirst({
+      where: { userId: user.id, type: 'UNLOCK_CONFIRMED' },
     });
-    expect(audit?.deviceId).toBe(deviceId);
+    expect(notification?.deviceEventId).toBe(event?.id);
+  });
+
+  /**
+   * The code is spent **at the ack**, not at the confirm. That is what makes a
+   * failed command releasable without ever making a successful one reusable.
+   */
+  it('consumes the code when the device acks, and not before', async () => {
+    const { user } = await createUserWithDevice();
+    const code = await getCode(user.cookie);
+
+    const response = await post(CONFIRM_URL, user.cookie).send({ otp: code });
+    const commandId = response.body.commandId as string;
+
+    const bound = await prisma.unlockChallenge.findFirstOrThrow({});
+    expect(bound.commandId).toBe(commandId);
+    expect(bound.binds).toBe(1);
+    expect(bound.consumedAt).toBeNull();
+
+    await drainDeviceAcks();
+
+    const settled = await prisma.unlockChallenge.findFirstOrThrow({});
+    expect(settled.consumedAt).not.toBeNull();
   });
 
   it('accepts a pasted code with spaces', async () => {
@@ -343,9 +478,9 @@ describe('POST /devices/unlock/confirm', () => {
     const code = await getCode(user.cookie);
 
     const spaced = `${code.slice(0, 3)} ${code.slice(3)}`;
-    const response = await post(CONFIRM_URL, user.cookie).send({ otp: spaced });
+    const response = await sendCommand(CONFIRM_URL, user.cookie, { otp: spaced });
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
   });
 
   it('rejects a malformed code at the schema, before any lookup', async () => {
@@ -381,7 +516,7 @@ describe('POST /devices/unlock/confirm', () => {
     expect(challenge.consumedAt).toBeNull();
 
     // The right code still works afterwards — one mistake is not fatal.
-    expect((await post(CONFIRM_URL, user.cookie).send({ otp: code })).status).toBe(200);
+    expect((await post(CONFIRM_URL, user.cookie).send({ otp: code })).status).toBe(202);
   });
 
   it('records a failed attempt in the activity feed and the audit log', async () => {
@@ -448,15 +583,32 @@ describe('POST /devices/unlock/confirm', () => {
     expect(row?.lockState).toBe('LOCKED');
   });
 
-  it('is single-use: a correct code cannot be replayed', async () => {
+  /**
+   * Single-use, and the interesting thing is that it holds **at both points**.
+   *
+   * Before the ack the code is bound to a live command, so a replay has
+   * nothing to spend. After the ack it is consumed. There is no instant in
+   * between at which the same code buys a second command.
+   */
+  it('is single-use: a correct code cannot be replayed, before or after the ack', async () => {
     const { user } = await createUserWithDevice();
     const code = await getCode(user.cookie);
 
-    expect((await post(CONFIRM_URL, user.cookie).send({ otp: code })).status).toBe(200);
+    expect((await post(CONFIRM_URL, user.cookie).send({ otp: code })).status).toBe(202);
 
-    const replay = await post(CONFIRM_URL, user.cookie).send({ otp: code });
-    expect(replay.status).toBe(400);
-    expect(replay.body.error.code).toBe('OTP_NOT_FOUND');
+    // While the first command is still in flight.
+    const duringFlight = await post(CONFIRM_URL, user.cookie).send({ otp: code });
+    expect(duringFlight.status).toBe(400);
+    expect(duringFlight.body.error.code).toBe('OTP_NOT_FOUND');
+
+    await drainDeviceAcks();
+
+    const afterAck = await post(CONFIRM_URL, user.cookie).send({ otp: code });
+    expect(afterAck.status).toBe(400);
+    expect(afterAck.body.error.code).toBe('OTP_NOT_FOUND');
+
+    // One code, one command, ever.
+    expect(await prisma.command.count({ where: { type: 'UNLOCK' } })).toBe(1);
   });
 
   it('refuses when no code was ever requested', async () => {
@@ -500,19 +652,28 @@ describe('concurrency', () => {
     ]);
 
     const statuses = [a.status, b.status].sort();
-    expect(statuses).toEqual([200, 400]);
+    expect(statuses).toEqual([202, 400]);
 
     const loser = a.status === 400 ? a : b;
     expect(loser.body.error.code).toBe('OTP_NOT_FOUND');
 
-    // One physical movement, one event.
+    await drainDeviceAcks();
+
+    /**
+     * One command, one movement, one event. The serialisation point moved
+     * from `consumedAt` to `commandId`, and this is the property that had to
+     * survive the move: the loser must not be able to allocate a second
+     * sequence number and send a second command to the same bolt.
+     */
+    expect(await prisma.command.count({ where: { deviceId } })).toBe(1);
+
     const events = await prisma.deviceEvent.count({
       where: { deviceId, type: 'UNLOCK_CONFIRMED' },
     });
     expect(events).toBe(1);
   });
 
-  it('serialises two simultaneous locks into one state change', async () => {
+  it('serialises two simultaneous locks into one command', async () => {
     const { user, deviceId } = await createUserWithDevice();
     await prisma.device.update({ where: { id: deviceId }, data: { lockState: 'UNLOCKED' } });
 
@@ -521,11 +682,24 @@ describe('concurrency', () => {
       post(LOCK_URL, user.cookie).send({}),
     ]);
 
-    // Both succeed — locking is idempotent — but exactly one did the work.
-    expect(a.status).toBe(200);
-    expect(b.status).toBe(200);
-    expect([a.body.alreadyLocked, b.body.alreadyLocked].sort()).toEqual([false, true]);
+    /**
+     * Both succeed — locking is idempotent — and both are pointed at the
+     * **same** command.
+     *
+     * This is the shape the asynchronous model forces. The second request is
+     * serialised behind the first by the device row lock, but the state has
+     * not moved yet (it moves on the ack), so "is it already locked?" is still
+     * no. What stops a second command is the in-flight check: the device holds
+     * no queue and would reject a duplicate as `UNSUPPORTED`, so the honest
+     * answer to a second tap is the command already running.
+     */
+    expect(a.status).toBe(202);
+    expect(b.status).toBe(202);
+    expect(a.body.commandId).toBe(b.body.commandId);
 
+    await drainDeviceAcks();
+
+    expect(await prisma.command.count({ where: { deviceId } })).toBe(1);
     const events = await prisma.deviceEvent.count({ where: { deviceId, type: 'LOCK' } });
     expect(events).toBe(1);
   });
@@ -619,7 +793,7 @@ describe('rate limiting', () => {
     const send = () =>
       request(server).post(LOCK_URL).set('Origin', TEST_ORIGIN).set('Cookie', user.cookie).send({});
 
-    expect((await send()).status).toBe(200);
+    expect((await send()).status).toBe(202);
     expect((await send()).status).toBe(429);
   });
 });

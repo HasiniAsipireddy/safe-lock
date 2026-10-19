@@ -64,8 +64,31 @@ describe('GET /api/v1/devices/mine', () => {
       id: deviceId,
       serialNumber,
       lockState: 'LOCKED',
-      online: false,
+      // A rentable safe is reachable, and `online` is derived from the age of
+      // its last message rather than read off the stored flag.
+      online: true,
+      doorState: 'CLOSED',
     });
+  });
+
+  /**
+   * A read must still answer for a safe we cannot reach.
+   *
+   * The controls refuse an offline device, but the dashboard needs to render
+   * *why* — and a 409 here would tell the user nothing about their booking,
+   * which is the thing the page is mostly about.
+   */
+  it('returns an offline safe, reporting it as offline', async () => {
+    const { user, deviceId } = await createUserWithDevice();
+    await prisma.device.update({
+      where: { id: deviceId },
+      data: { online: false, lastSeenAt: null },
+    });
+
+    const response = await request(app()).get(MINE_URL).set('Cookie', user.cookie);
+
+    expect(response.status).toBe(200);
+    expect(response.body.device).toMatchObject({ id: deviceId, online: false });
   });
 
   /** An unpaid overstay still has the safe physically, so it still resolves. */
