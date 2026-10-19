@@ -41,6 +41,20 @@ export default defineConfig({
       // Fixed so an OTP's HMAC is reproducible inside a test.
       OTP_HMAC_SECRET: 'test_otp_hmac_secret_for_vitest_only_32+chars',
       SAFE_PRICE_PAISE: '99900',
+
+      /**
+       * Device command signing. Fixed so a derived `K_d`, and therefore every
+       * signature over it, is reproducible inside a test — and **distinct from
+       * `OTP_HMAC_SECRET`**, which the env schema requires and which the
+       * domain-separation tests depend on.
+       *
+       * The suite runs on `DEVICE_GATEWAY=mock`, so the secret is not strictly
+       * required at boot. It is set anyway: the protocol tests derive real keys
+       * and sign real messages, and a simulator standing in for firmware needs
+       * the same key the server uses.
+       */
+      DEVICE_COMMAND_HMAC_SECRET: 'test_device_command_secret_for_vitest_32+chars',
+      DEVICE_COMMAND_KEY_VERSION: '1',
       RAZORPAY_KEY_ID: 'rzp_test_vitest',
       RAZORPAY_KEY_SECRET: 'vitest_key_secret_do_not_use_anywhere',
       RAZORPAY_WEBHOOK_SECRET: 'vitest_webhook_secret_do_not_use_anywhere',
