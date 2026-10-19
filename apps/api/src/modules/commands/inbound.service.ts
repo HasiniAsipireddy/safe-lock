@@ -12,6 +12,7 @@ import {
 } from '../../lib/deviceProtocol';
 import { AUDIT_ACTIONS, writeAudit } from '../audit/audit.service';
 import { handleAck, touchDevice } from './ack.service';
+import { reconcileUnexpectedUnlock } from './reconcile.service';
 
 /**
  * Everything a device says, arriving here.
@@ -118,6 +119,18 @@ async function onState(serialNumber: string, raw: Buffer): Promise<void> {
   }
 
   await applyState(device.id, payload);
+
+  /**
+   * And then the question a state report is the only place to ask: is this safe
+   * open with nobody entitled to have it open? Evaluated on **every** report,
+   * because the ways a bolt ends up withdrawn without a command of ours — a
+   * power event, a firmware fault, a completion lock lost while this process
+   * was down — all surface as an ordinary heartbeat. See §8.3.
+   */
+  await reconcileUnexpectedUnlock({
+    deviceId: device.id,
+    reportedLockState: payload.lockState,
+  });
 }
 
 async function applyState(deviceId: string, payload: StatePayload): Promise<void> {
@@ -167,7 +180,7 @@ async function onStatus(serialNumber: string, raw: Buffer): Promise<void> {
 
   const device = await prisma.device.findUnique({
     where: { serialNumber },
-    select: { id: true },
+    select: { id: true, lockState: true },
   });
 
   if (!device) return;
@@ -194,4 +207,20 @@ async function onStatus(serialNumber: string, raw: Buffer): Promise<void> {
       data: { firmwareVersion: payload.firmwareVersion },
     });
   }
+
+  /**
+   * A device that has just **connected** is the other half of §8.3's trigger.
+   *
+   * A status message carries no lock state, so the stored one is what is
+   * checked — and that is the case worth catching: a safe recorded open, whose
+   * completion lock was lost while this process was down, is a safe nobody
+   * would otherwise look at again until its next heartbeat. The reconciler
+   * re-reads the device under a row lock before it does anything, so acting on
+   * a stored value here cannot race the state report that may be arriving
+   * alongside it.
+   */
+  await reconcileUnexpectedUnlock({
+    deviceId: device.id,
+    reportedLockState: device.lockState,
+  });
 }

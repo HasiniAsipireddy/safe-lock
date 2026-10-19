@@ -9,6 +9,10 @@ import {
   stopBookingSweeper,
 } from './modules/bookings/booking.sweeper';
 import { deviceInboundHandler } from './modules/commands/inbound.service';
+import {
+  startCommandSweeper,
+  stopCommandSweeper,
+} from './modules/commands/command.sweeper';
 
 /**
  * Process entry point: listen, then shut down cleanly.
@@ -57,6 +61,19 @@ const server = app.listen(env.PORT, () => {
   startBookingSweeper();
 
   /**
+   * The command sweeper, started here and **only** here, for the third time and
+   * the same reason.
+   *
+   * Like the booking sweeper it is a reconciler: `effectiveCommandStatus`
+   * derives a timeout from the clock on every read, so a user waiting on a
+   * command sees the right answer with or without this loop. What it adds is
+   * the writing-down — the terminal row, the released code, the feed entry —
+   * and the one thing a read genuinely cannot do: retry a **system** lock and
+   * escalate a safe we could not close.
+   */
+  startCommandSweeper();
+
+  /**
    * Connect to the broker and register where device messages land.
    *
    * Here and not in `createApp()`, because this opens a network connection and
@@ -97,6 +114,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // pushed-out backoff, so the next process picks it up rather than losing it.
   stopOutboxWorker();
   stopBookingSweeper();
+  stopCommandSweeper();
 
   /**
    * Disconnect from the broker, after in-flight acks have been handled.

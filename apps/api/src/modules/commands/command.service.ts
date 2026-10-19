@@ -282,21 +282,24 @@ export async function publishCommand(command: CommandRecord): Promise<PublishOut
     if (!result.published) throw new Error('the broker did not acknowledge the publish');
 
     /**
-     * `SENT` only for a command still `PENDING`.
+     * The attempt is counted unconditionally, and the status change is not.
      *
-     * The mock gateway's ack can arrive **before** this update runs — it is in
-     * the same process — and a blind `update` would walk an `ACKED` row back
-     * to `SENT`, losing the ack entirely. The conditional makes publishing and
-     * acking order-independent, which a real broker on a fast link can also
-     * demand.
+     * They are separate because they are different claims. We made an attempt,
+     * full stop — and `attempts` is what the sweeper counts a retry chain by,
+     * so losing one would buy a safe a fourth attempt where the policy says
+     * three. Whereas `SENT` is only true of a command still `PENDING`: the mock
+     * gateway's ack can arrive **before** this runs (it is in the same process,
+     * and a real broker on a fast link can do the same), and a blind update
+     * would walk an `ACKED` row back to `SENT`, losing the ack entirely.
      */
+    await prisma.command.update({
+      where: { id: command.id },
+      data: { attempts: { increment: 1 } },
+    });
+
     await prisma.command.updateMany({
       where: { id: command.id, status: 'PENDING' },
-      data: {
-        status: 'SENT',
-        sentAt: result.publishedAt,
-        attempts: { increment: 1 },
-      },
+      data: { status: 'SENT', sentAt: result.publishedAt },
     });
 
     return { status: 'SENT', sentAt: result.publishedAt };
