@@ -7,7 +7,7 @@ import {
 } from '@safelock/shared';
 import { prisma } from '../../lib/prisma';
 import { resetRazorpayClient } from '../../lib/razorpay';
-import { env } from '../../config/env';
+import { DEVICE_OFFLINE_AFTER_MS, env } from '../../config/env';
 import {
   TEST_ORIGIN,
   app,
@@ -242,6 +242,108 @@ describe('POST /api/v1/bookings', () => {
 
     expect(response.status).toBe(409);
     expect(response.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+  });
+
+  /**
+   * §6.2: renting someone a safe we cannot command is selling a product that
+   * does not work.
+   *
+   * The failure is invisible at the moment of sale and obvious an hour later,
+   * when somebody is standing in front of a safe that will not open — and by
+   * then there is money involved and a refund to argue about.
+   */
+  it('never picks an offline safe', async () => {
+    const user = await createTestUser();
+    await seedDevice({ online: false });
+
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+  });
+
+  /**
+   * The case a retained `online: true` flag cannot catch on its own: a device
+   * still claiming to be here whose last message is older than three
+   * heartbeats. A wedged unit, or a broker that restarted and lost the will it
+   * was holding.
+   */
+  it('never picks a safe whose last message is too old, whatever its flag says', async () => {
+    const user = await createTestUser();
+    await seedDevice({
+      online: true,
+      lastSeenAt: new Date(Date.now() - (DEVICE_OFFLINE_AFTER_MS + 60_000)),
+    });
+
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+  });
+
+  /**
+   * §11.8: units ship with a door sensor, and one that is not reporting is a
+   * fault rather than a configuration.
+   *
+   * Without a working sensor, "locked" cannot be distinguished from "bolt
+   * extended into thin air" — so the one check that matters before handing a
+   * safe to the next renter cannot be made at all, and every guarantee in §8
+   * degrades to an assertion about a motor.
+   */
+  it('never picks a safe whose door sensor is not reporting', async () => {
+    const user = await createTestUser();
+    await seedDevice({ doorState: 'UNKNOWN' });
+
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+  });
+
+  /**
+   * And the one that stops the three conditions above from being a
+   * false-negative machine: a unit backdated for the oldest-first ordering is
+   * still perfectly bookable.
+   *
+   * `createdAt` is how the pick orders, and `lastSeenAt` is how it judges
+   * liveness. Conflating them would quietly make the whole fleet unbookable
+   * the moment a test — or a real deployment — backdated anything.
+   */
+  it('still picks the oldest safe when it is old but alive', async () => {
+    const user = await createTestUser();
+    const oldest = await seedDevice({
+      createdAt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000),
+      lastSeenAt: new Date(),
+    });
+    await seedDevice();
+
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+
+    expect(response.status).toBe(201);
+    expect(response.body.booking.deviceId).toBe(oldest.id);
+  });
+
+  /**
+   * A safe going offline *after* the booking is made is deliberately not
+   * cancelled: there is money involved and it may come back within seconds.
+   * It raises an admin flag and refuses unlocks with an accurate code.
+   */
+  it('does not cancel a booking whose safe goes offline afterwards', async () => {
+    const user = await createTestUser();
+    const device = await seedDevice();
+
+    const created = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+    expect(created.status).toBe(201);
+
+    await prisma.device.update({
+      where: { id: device.id },
+      data: { online: false, lastSeenAt: null },
+    });
+
+    const mine = await get(CURRENT_URL, user.cookie);
+
+    expect(mine.status).toBe(200);
+    expect(mine.body.booking).toMatchObject({ id: created.body.booking.id });
   });
 });
 

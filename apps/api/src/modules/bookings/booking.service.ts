@@ -10,7 +10,7 @@ import {
   type ExtensionRefusalReason,
   type RateSnapshot,
 } from '@safelock/shared';
-import { env } from '../../config/env';
+import { DEVICE_OFFLINE_AFTER_MS, env } from '../../config/env';
 import { HttpError, conflict } from '../../lib/httpError';
 import { logger } from '../../lib/logger';
 import { prisma, type PrismaTransaction } from '../../lib/prisma';
@@ -281,19 +281,60 @@ export async function createBooking(input: {
  * same "next free" row and one failing.
  *
  * Raw SQL because Prisma has no row-locking API. The interpolated values are
- * two timestamps this function computed — there is no caller input in the
+ * three timestamps this function computed — there is no caller input in the
  * query. `NEEDS_INSPECTION` and `RETIRED` devices are excluded by the status
  * filter, so a safe nobody has looked inside cannot be rented out.
+ *
+ * ## Three conditions, not one, since the hardware became real
+ * A safe is bookable only if it is `AVAILABLE` **and we can reach it** **and
+ * it can tell us whether its door is shut**. Renting someone a safe we cannot
+ * command, or one whose closure we cannot verify, is selling a product that
+ * does not work — and both failures are invisible at the moment of sale and
+ * obvious an hour later when somebody is standing in front of it.
+ *
+ * The liveness condition duplicates `isDeviceOnline`, which is a duplication
+ * worth naming: it has to be expressed in SQL because the pick is a
+ * row-locking query that must not fetch the fleet to filter it in TypeScript.
+ * The cutoff is computed by the caller from `DEVICE_OFFLINE_AFTER_MS`, so the
+ * *threshold* lives in one place even though the comparison is written twice.
  */
 async function pickAvailableDeviceId(
   tx: PrismaTransaction,
   from: Date,
   until: Date,
 ): Promise<string> {
+  /**
+   * The same two-part test `isDeviceOnline` applies: the device's own claim,
+   * and a message recent enough to believe it. Each misses what the other
+   * catches — a will that the broker lost, or a wedged device still holding a
+   * TCP connection.
+   */
+  const freshSince = new Date(Date.now() - DEVICE_OFFLINE_AFTER_MS);
+
+  /**
+   * And the door sensor, which is the §11.8 half.
+   *
+   * Units ship with one, and one that is not reporting is a *fault* rather
+   * than a configuration — so `UNKNOWN` means "we do not know whether the
+   * door is shut", which is exactly the check the completion flow has to make
+   * before handing a safe to the next renter. A unit that cannot answer it
+   * cannot be rented, on the same footing as an offline one.
+   *
+   * This also excludes a brand-new unit that has never reported, whose
+   * `doorState` defaults to `UNKNOWN`. Correct, and not a side effect:
+   * registering a serial is inventory, and a safe is genuinely bookable only
+   * once it has connected and said what it is (§2.4).
+   */
+
   const rows = await tx.$queryRaw<Array<{ id: string }>>`
     SELECT d."id"
     FROM "Device" d
     WHERE d."status" = 'AVAILABLE'
+      AND d."online" = true
+      AND d."lastSeenAt" IS NOT NULL
+      AND d."lastSeenAt" > ${freshSince}::timestamp
+      -- A door sensor that is not reporting. See the note above the query.
+      AND d."doorState" <> 'UNKNOWN'
       AND NOT EXISTS (
         SELECT 1 FROM "Booking" b
         WHERE b."deviceId" = d."id"
