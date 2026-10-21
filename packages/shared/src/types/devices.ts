@@ -318,3 +318,45 @@ export interface BulkCreateResult {
   invalid: number;
   results: BulkCreateRowResult[];
 }
+
+/**
+ * Response body of `POST /admin/devices/:id/credential`. **Shown once.**
+ *
+ * The only place in this API where a secret is returned to a caller, and the
+ * reason is physical: a unit has to be *given* its identity before it can
+ * speak, and there is no channel to a device that does not yet have one. So
+ * the secrets are minted, returned exactly once, and only a `sha256` of the
+ * password is kept. There is no endpoint that reads one back, and re-issuing
+ * mints a new pair rather than revealing the old.
+ *
+ * The client's obligation is the other half of "once": display it for
+ * provisioning and never store it. It is deliberately not in
+ * {@link AdminDeviceRow}, so the device list cannot carry it by accident.
+ */
+export interface DeviceCredentialResponse {
+  deviceId: string;
+  /** Also the MQTT username and client id. One identity, no lookup table. */
+  serialNumber: string;
+  /** The broker password, in full, for the only time it exists in readable form. */
+  password: string;
+  /**
+   * The device's command key `K_d`, base64url.
+   *
+   * Derived from one server-side master secret and the serial, never stored —
+   * so this response is the only way it can be handed to an installer, and a
+   * database leak yields no device key because no device key is in the
+   * database.
+   */
+  commandKey: string;
+  /** Which `K_d` version the device is being provisioned at. */
+  keyVersion: number;
+  issuedAt: string;
+  /**
+   * True when this device already had a credential.
+   *
+   * A re-issue is also a **revocation**: the previous password stops working
+   * the moment the broker is updated, and a unit in the field that was not
+   * re-provisioned goes silent. The UI says so before the button is pressed.
+   */
+  reissued: boolean;
+}

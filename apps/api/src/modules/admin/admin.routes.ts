@@ -26,6 +26,7 @@ import {
   postClearPaymentReview,
   postDevice,
   postDevicesBulk,
+  postDeviceCredential,
   postForceCompleteBooking,
   postRetireDevice,
   postWaiveOverstay,
@@ -61,6 +62,7 @@ export function createAdminRouter(limiters: Limiters): Router {
     limiters.adminWrite,
     validateBody(bulkCreateDevicesSchema),
     postDevicesBulk,
+  postDeviceCredential,
   );
 
   /**
@@ -78,6 +80,22 @@ export function createAdminRouter(limiters: Limiters): Router {
     limiters.adminWrite,
     validateBody(clearInspectionSchema),
     postClearInspection,
+  );
+
+  /**
+   * Mints the unit's broker password and command key, **shown once**.
+   *
+   * `POST` rather than `GET` even though it reads like a fetch, because it is
+   * not one: it *creates* a credential and invalidates whatever came before.
+   * A `GET` would also be cacheable, bookmarkable and retried by a browser,
+   * which for a secret-bearing response is three separate ways to leave a copy
+   * somewhere. See docs/device-protocol.md §10.2.
+   */
+  router.post(
+    '/devices/:id/credential',
+    limiters.adminWrite,
+    validateBody(emptyBodySchema),
+    postDeviceCredential,
   );
 
   router.post(

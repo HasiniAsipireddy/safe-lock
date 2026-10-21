@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { prisma } from '../../lib/prisma';
+import { deviceGateway } from '../../lib/deviceGateway';
 import {
   TEST_ORIGIN,
   app,
@@ -12,6 +13,7 @@ import {
   seedDevice,
   seedDevices,
   seedPayment,
+  withCapturedOtp,
 } from '../../test/helpers';
 
 /**
@@ -32,6 +34,7 @@ const ADMIN_ROUTES = [
     path: '/api/v1/admin/devices/some-id/clear-inspection',
     body: { note: 'Opened and checked, empty' },
   },
+  { method: 'post' as const, path: '/api/v1/admin/devices/some-id/credential', body: {} },
   { method: 'post' as const, path: '/api/v1/admin/devices/some-id/retire', body: {} },
   { method: 'get' as const, path: '/api/v1/admin/bookings' },
   {
@@ -680,6 +683,419 @@ describe('POST /api/v1/admin/devices/:id/clear-inspection', () => {
 
     expect(allowed.status).toBe(201);
     expect(allowed.body.booking.deviceId).toBe(deviceId);
+  });
+});
+
+describe('POST /api/v1/admin/devices/:id/credential', () => {
+  const issue = (deviceId: string, cookie: string) =>
+    request(app())
+      .post(`/api/v1/admin/devices/${deviceId}/credential`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', cookie)
+      .send({});
+
+  /**
+   * The one response in this API that carries a secret, and the only time it
+   * exists in readable form.
+   *
+   * A device cannot be *told* its identity over a channel it does not yet
+   * have, so the secrets have to come out of an endpoint once. What matters is
+   * that "once" is literal: only a `sha256` of the password is kept, nothing
+   * of the key at all, and nothing reads either back.
+   */
+  it('returns the password and command key once, and stores only a hash', async () => {
+    const admin = await createTestAdmin();
+    const device = await seedDevice();
+
+    /**
+     * `seedDevice` pre-provisions, because every other test needs a device
+     * whose commands can be signed. A genuinely new unit has nothing, which is
+     * the state this test is about.
+     */
+    await prisma.device.update({
+      where: { id: device.id },
+      data: { credentialIssuedAt: null },
+    });
+
+    const response = await issue(device.id, admin.cookie);
+
+    expect(response.status).toBe(201);
+    expect(response.body).toMatchObject({
+      deviceId: device.id,
+      serialNumber: device.serialNumber,
+      keyVersion: 1,
+      reissued: false,
+    });
+    expect(response.body.password).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(response.body.commandKey).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    // A secret-bearing response must not be cacheable by anything in the path.
+    expect(response.headers['cache-control']).toBe('no-store');
+
+    const stored = await prisma.device.findUniqueOrThrow({
+      where: { id: device.id },
+      select: { credentialHash: true, credentialIssuedAt: true, commandKeyVersion: true },
+    });
+
+    // The hash, and never the password.
+    expect(stored.credentialHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(stored.credentialHash).not.toBe(response.body.password);
+    expect(stored.credentialIssuedAt).not.toBeNull();
+    expect(stored.commandKeyVersion).toBe(1);
+
+    /**
+     * And the key is not stored in any form, hashed or otherwise. It is
+     * derived from the master secret and the serial on demand, which is why a
+     * database leak yields no device key.
+     */
+    const row = await prisma.$queryRaw<
+      Array<Record<string, unknown>>
+    >`SELECT * FROM "Device" WHERE "id" = ${device.id}`;
+    expect(JSON.stringify(row)).not.toContain(response.body.commandKey);
+    expect(JSON.stringify(row)).not.toContain(response.body.password);
+  });
+
+  /**
+   * Re-issuing is a revocation, and the response says so.
+   *
+   * The dangerous case: the old password stops working the moment the broker
+   * is updated, so a unit in the field that is not then re-provisioned goes
+   * silent. An admin needs to know that before they press the button and
+   * afterwards in the audit log.
+   */
+  it('mints a different credential on a re-issue and flags it as one', async () => {
+    const admin = await createTestAdmin();
+    const device = await seedDevice();
+
+    await prisma.device.update({
+      where: { id: device.id },
+      data: { credentialIssuedAt: null },
+    });
+
+    const first = await issue(device.id, admin.cookie);
+    const firstHash = (
+      await prisma.device.findUniqueOrThrow({
+        where: { id: device.id },
+        select: { credentialHash: true },
+      })
+    ).credentialHash;
+
+    const second = await issue(device.id, admin.cookie);
+
+    expect(second.status).toBe(201);
+    expect(second.body.reissued).toBe(true);
+    expect(second.body.password).not.toBe(first.body.password);
+
+    // The key is derived from the serial, so it is *stable* across a re-issue
+    // at the same version — which is the point of versioning it rather than
+    // rotating it per credential.
+    expect(second.body.commandKey).toBe(first.body.commandKey);
+
+    expect(
+      (
+        await prisma.device.findUniqueOrThrow({
+          where: { id: device.id },
+          select: { credentialHash: true },
+        })
+      ).credentialHash,
+    ).not.toBe(firstHash);
+
+    const audit = await prisma.auditLog.findMany({
+      where: { action: 'device.credential.issued' },
+      orderBy: { createdAt: 'asc' },
+      select: { metadata: true },
+    });
+    expect(audit).toHaveLength(2);
+    expect(audit[1]?.metadata).toMatchObject({ reissued: true, keyVersion: 1 });
+  });
+
+  /**
+   * Nothing derived from the secrets reaches the audit table.
+   *
+   * Not a prefix, not a length, not a digest. An audit row is read by more
+   * people than a password store, and a value that is useless to an attacker
+   * is equally useless to the admin reading the row — so there is nothing to
+   * put there.
+   */
+  it('audits the issue without recording anything derived from the secrets', async () => {
+    const admin = await createTestAdmin();
+    const device = await seedDevice();
+
+    const response = await issue(device.id, admin.cookie);
+    const audit = await prisma.auditLog.findFirstOrThrow({
+      where: { action: 'device.credential.issued' },
+    });
+
+    const serialised = JSON.stringify(audit);
+    expect(serialised).not.toContain(response.body.password);
+    expect(serialised).not.toContain(response.body.commandKey);
+    expect(serialised).not.toContain(response.body.password.slice(0, 8));
+  });
+
+  /**
+   * `NEEDS_INSPECTION` keeps its credential and can be re-provisioned.
+   *
+   * The disagreement with the brief, and §2.3's reasoning: that status means a
+   * safe is in the field with contents nobody has checked. Revoking its
+   * credential would make the one device that most needs attention the one
+   * device nobody can reach.
+   */
+  it('issues to a safe awaiting inspection, which is the safe most needing to be reachable', async () => {
+    const admin = await createTestAdmin();
+    const device = await seedDevice();
+
+    await prisma.device.update({
+      where: { id: device.id },
+      data: { status: 'NEEDS_INSPECTION' },
+    });
+
+    const response = await issue(device.id, admin.cookie);
+
+    expect(response.status).toBe(201);
+    expect(response.body.password).toBeTruthy();
+  });
+
+  it('refuses a retired safe, whose credential was revoked deliberately', async () => {
+    const admin = await createTestAdmin();
+    const device = await seedDevice();
+
+    await prisma.device.update({ where: { id: device.id }, data: { status: 'RETIRED' } });
+
+    const response = await issue(device.id, admin.cookie);
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('DEVICE_NOT_AVAILABLE');
+    expect(
+      (
+        await prisma.device.findUniqueOrThrow({
+          where: { id: device.id },
+          select: { credentialHash: true },
+        })
+      ).credentialHash,
+    ).toBeNull();
+  });
+
+  it('404s an unknown device', async () => {
+    const admin = await createTestAdmin();
+
+    expect((await issue('not-a-device', admin.cookie)).status).toBe(404);
+  });
+});
+
+/**
+ * Which safes can still be commanded, read as one thing.
+ *
+ * The two halves of §2.3 are deliberately adjacent. Retirement revokes the
+ * credential, so a retired unit cannot connect at all; `NEEDS_INSPECTION`
+ * keeps its credential on purpose and is refused at a different layer
+ * entirely. Keeping a live credential is not the same as keeping a live safe,
+ * and the two must not be allowed to drift together — which is only visible
+ * if both tests are in front of you.
+ */
+describe('which safes the server will still issue an UNLOCK to', () => {
+  /** Watches the transport without answering, so "nothing was published" means it. */
+  function watchGateway() {
+    return {
+      lock: vi.spyOn(deviceGateway, 'sendLock'),
+      unlock: vi.spyOn(deviceGateway, 'sendUnlock'),
+    };
+  }
+
+  /**
+   * The guarantee that does not depend on how the device got there.
+   *
+   * A booking should not exist for an inspecting safe — it is excluded from
+   * the pick — but "should not exist" is a consequence of a `WHERE` clause
+   * three modules away, and a physical-security guarantee must not rest on
+   * one. So the command issuer refuses outright, under the device row lock, in
+   * the same transaction that would have allocated the sequence number.
+   */
+  it('refuses an UNLOCK to a NEEDS_INSPECTION safe, and publishes nothing', async () => {
+    const held = await createUserWithDevice();
+    const gateway = watchGateway();
+
+    const { result, code } = await withCapturedOtp(() =>
+      request(app())
+        .post('/api/v1/devices/unlock/request')
+        .set('Origin', TEST_ORIGIN)
+        .set('Cookie', held.user.cookie)
+        .send({}),
+    );
+    expect(result.status).toBe(200);
+
+    // The status changes *after* the code is issued, which is the race this
+    // guard exists for: an admin flags a safe while a renter is typing.
+    await prisma.device.update({
+      where: { id: held.deviceId },
+      data: { status: 'NEEDS_INSPECTION' },
+    });
+
+    const confirm = await request(app())
+      .post('/api/v1/devices/unlock/confirm')
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', held.user.cookie)
+      .send({ otp: code });
+
+    expect(confirm.status).toBe(409);
+    expect(confirm.body.error.code).toBe('DEVICE_NOT_OPERABLE');
+
+    // Nothing published, no command row, no sequence number spent.
+    expect(gateway.unlock).not.toHaveBeenCalled();
+    expect(await prisma.command.count({ where: { deviceId: held.deviceId } })).toBe(0);
+    expect(
+      (
+        await prisma.device.findUniqueOrThrow({
+          where: { id: held.deviceId },
+          select: { commandSeq: true },
+        })
+      ).commandSeq,
+    ).toBe(0);
+
+    /**
+     * And the code survives, unbound. The transaction that would have claimed
+     * it rolled back with the refusal, so a user whose safe was flagged
+     * mid-flow has not lost their code — though they will not be opening the
+     * safe with it either.
+     */
+    expect(
+      await prisma.unlockChallenge.findFirstOrThrow({
+        where: { userId: held.user.id },
+        select: { consumedAt: true, commandId: true },
+      }),
+    ).toMatchObject({ consumedAt: null, commandId: null });
+
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Locking a safe under inspection is still allowed, and that asymmetry is
+   * the point: a safe an admin has opened is exactly a safe somebody may need
+   * to close, and locking is the safe direction everywhere else in this system
+   * too.
+   */
+  it('still allows a LOCK to a NEEDS_INSPECTION safe', async () => {
+    const held = await createUserWithDevice();
+
+    await prisma.device.update({
+      where: { id: held.deviceId },
+      data: { status: 'NEEDS_INSPECTION', lockState: 'UNLOCKED' },
+    });
+
+    const response = await request(app())
+      .post('/api/v1/devices/lock')
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', held.user.cookie)
+      .send({});
+
+    expect(response.status).toBe(202);
+    expect(await prisma.command.count({ where: { deviceId: held.deviceId } })).toBe(1);
+  });
+
+  /** Retirement, the other half: the credential is gone, so is the unlock. */
+  it('revokes the credential on retirement and refuses an UNLOCK to a retired safe', async () => {
+    const admin = await createTestAdmin();
+    const held = await createUserWithDevice();
+
+    const credential = await request(app())
+      .post(`/api/v1/admin/devices/${held.deviceId}/credential`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({});
+    expect(credential.status).toBe(201);
+
+    const { result, code } = await withCapturedOtp(() =>
+      request(app())
+        .post('/api/v1/devices/unlock/request')
+        .set('Origin', TEST_ORIGIN)
+        .set('Cookie', held.user.cookie)
+        .send({}),
+    );
+    expect(result.status).toBe(200);
+
+    /**
+     * Retiring is refused while a booking is live, which is the rule that
+     * makes this test take the long way round: the booking is force-completed
+     * first, exactly as an admin would have to.
+     */
+    await request(app())
+      .post(`/api/v1/admin/bookings/${held.bookingId}/force-complete`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({ reason: 'Unit is being taken out of service' });
+
+    const retire = await request(app())
+      .post(`/api/v1/admin/devices/${held.deviceId}/retire`)
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', admin.cookie)
+      .send({});
+
+    expect(retire.status).toBe(200);
+    expect(retire.body.credentialRevoked).toBe(true);
+
+    const stored = await prisma.device.findUniqueOrThrow({
+      where: { id: held.deviceId },
+      select: { credentialHash: true, credentialIssuedAt: true },
+    });
+    expect(stored).toMatchObject({ credentialHash: null, credentialIssuedAt: null });
+
+    // The revocation gets a row of its own, because it has a second half
+    // somebody has to perform at the broker by hand.
+    expect(
+      await prisma.auditLog.findFirstOrThrow({
+        where: { action: 'device.credential.revoked' },
+        select: { metadata: true },
+      }),
+    ).toMatchObject({ metadata: { reason: 'RETIRED' } });
+
+    /**
+     * And the unlock is refused on the **booking**, not on the hardware —
+     * which is the right refusal and the right order. Completing the booking
+     * took the entitlement away, and `assertCanOperate` asks about
+     * entitlement before anything reaches the command issuer. A renter is told
+     * their rental has ended rather than being sent to look at a safe.
+     */
+    const confirm = await request(app())
+      .post('/api/v1/devices/unlock/confirm')
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', held.user.cookie)
+      .send({ otp: code });
+
+    expect(confirm.status).toBe(409);
+    expect(confirm.body.error.code).toBe('NO_ACTIVE_BOOKING');
+    expect(await prisma.command.count({ where: { deviceId: held.deviceId, type: 'UNLOCK' } })).toBe(
+      0,
+    );
+  });
+
+  /** A retired safe with a live booking cannot happen, so this forces the state. */
+  it('refuses an UNLOCK to a RETIRED safe even with a booking that would otherwise allow it', async () => {
+    const held = await createUserWithDevice();
+    const gateway = watchGateway();
+
+    const { code } = await withCapturedOtp(() =>
+      request(app())
+        .post('/api/v1/devices/unlock/request')
+        .set('Origin', TEST_ORIGIN)
+        .set('Cookie', held.user.cookie)
+        .send({}),
+    );
+
+    await prisma.device.update({
+      where: { id: held.deviceId },
+      data: { status: 'RETIRED' },
+    });
+
+    const confirm = await request(app())
+      .post('/api/v1/devices/unlock/confirm')
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', held.user.cookie)
+      .send({ otp: code });
+
+    expect(confirm.status).toBe(409);
+    expect(confirm.body.error.code).toBe('DEVICE_NOT_OPERABLE');
+    expect(gateway.unlock).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
   });
 });
 

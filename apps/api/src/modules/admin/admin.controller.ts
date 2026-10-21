@@ -156,6 +156,52 @@ export const postClearInspection: RequestHandler = async (req, res, next) => {
   }
 };
 
+/**
+ * Mints a unit's credential, for the one and only time it is readable.
+ *
+ * The audit row records that a credential was issued, which safe it was for,
+ * and at which key version — and **nothing derived from the secrets**. Not a
+ * prefix, not a length, not a digest: an audit table is read by more people
+ * than a password store, and a value that is useless to an attacker is also
+ * useless to the admin reading the row, so there is nothing to put there.
+ *
+ * `reissued` is recorded because it is the operationally dangerous case: a
+ * re-issue silently revokes a working unit's password, and the question "who
+ * bricked SAFE-0007" needs an answer.
+ */
+export const postDeviceCredential: RequestHandler = async (req, res, next) => {
+  const deviceId = routeParam(req, 'id');
+
+  try {
+    const credential = await deviceService.issueDeviceCredential(deviceId);
+
+    await writeAudit({
+      action: AUDIT_ACTIONS.DEVICE_CREDENTIAL_ISSUED,
+      deviceId,
+      ...auditContext(req),
+      metadata: {
+        issuedByAdminId: req.user!.id,
+        serialNumber: credential.serialNumber,
+        keyVersion: credential.keyVersion,
+        reissued: credential.reissued,
+      },
+    });
+
+    /**
+     * 201, not 200: a credential was created. And `Cache-Control: no-store`
+     * rather than relying on the default, because this is the one response in
+     * the API a browser or proxy holding a copy of would be a stored secret.
+     */
+    res.status(201).set('Cache-Control', 'no-store').json(credential);
+  } catch (error) {
+    await auditFailure(req, AUDIT_ACTIONS.DEVICE_CREDENTIAL_ISSUED, error, {
+      deviceId,
+      attemptedByAdminId: req.user?.id,
+    });
+    next(error);
+  }
+};
+
 export const postRetireDevice: RequestHandler = async (req, res, next) => {
   const deviceId = routeParam(req, 'id');
 
@@ -169,8 +215,31 @@ export const postRetireDevice: RequestHandler = async (req, res, next) => {
       metadata: {
         retiredByAdminId: req.user!.id,
         serialNumber: result.device.serialNumber,
+        credentialRevoked: result.credentialRevoked,
       },
     });
+
+    /**
+     * Its own row, and only when there was something to revoke.
+     *
+     * Two actions rather than one, because they answer different questions and
+     * the second one has a **second half somebody has to perform by hand**:
+     * the stored hash is gone, and the unit is still in the broker's password
+     * file until an operator removes it. A row saying "this credential was
+     * revoked at this time" is what that work gets reconciled against.
+     */
+    if (result.credentialRevoked) {
+      await writeAudit({
+        action: AUDIT_ACTIONS.DEVICE_CREDENTIAL_REVOKED,
+        deviceId,
+        ...auditContext(req),
+        metadata: {
+          revokedByAdminId: req.user!.id,
+          serialNumber: result.device.serialNumber,
+          reason: 'RETIRED',
+        },
+      });
+    }
 
     res.status(200).json(result);
   } catch (error) {

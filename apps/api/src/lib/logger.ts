@@ -34,9 +34,15 @@ const REDACTED = '[redacted]';
  *
  * `templateParams` is here because a template's parameters are exactly where
  * an OTP would be if anyone ever logged a send payload.
+ *
+ * `commandkey` covers the one device secret that ever leaves this process: a
+ * unit's `K_d`, returned once by the credential endpoint so an installer can
+ * provision it. It is derived rather than stored, so a log line is the only
+ * place it could persist — which makes the backstop the whole of its
+ * protection.
  */
 const SENSITIVE_KEY =
-  /secret|signature|password|passwd|token|otp|authorization|auth|cookie|hash|credential|apikey|api_key|privatekey|private_key|phone|mobile|msisdn|recipient|templateparams|^to$|^body$/i;
+  /secret|signature|password|passwd|token|otp|authorization|auth|cookie|hash|credential|commandkey|apikey|api_key|privatekey|private_key|phone|mobile|msisdn|recipient|templateparams|^to$|^body$/i;
 
 /**
  * Keys that merely *sound* sensitive but are safe and useful to keep.

@@ -37,6 +37,13 @@ describe('sanitise', () => {
       'cookie',
       'credentialHash',
       'apiKey',
+      /**
+       * The device command key, added with provisioning. It is the one secret
+       * in this system that is **derived and never stored**, which makes a log
+       * line the only place it could persist — so the backstop is the whole of
+       * its protection rather than a second layer.
+       */
+      'commandKey',
     ]) {
       expect(redactedValue(key, 'sensitive-value'), key).toBe(REDACTED);
     }

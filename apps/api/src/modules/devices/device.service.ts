@@ -3,14 +3,17 @@ import {
   ERROR_CODES,
   type AdminDeviceRow,
   type BulkCreateResult,
+  type DeviceCredentialResponse,
   type BulkCreateRowResult,
   type ListDevicesQuery,
   type Paginated,
   normaliseSerial,
   serialNumberSchema,
 } from '@safelock/shared';
+import { env } from '../../config/env';
 import { prisma } from '../../lib/prisma';
 import { HttpError, conflict, notFound } from '../../lib/httpError';
+import { deriveCommandKey, mintDeviceCredential } from '../../lib/deviceProtocol';
 import { ADMIN_DEVICE_SELECT, toAdminDeviceRow } from './device.mapper';
 
 /**
@@ -44,6 +47,20 @@ function isUniqueViolation(error: unknown): boolean {
 
 export interface DeviceMutationResult {
   device: AdminDeviceRow;
+}
+
+/**
+ * Retirement, plus whether it revoked anything.
+ *
+ * Separate from {@link DeviceMutationResult} because the flag drives two
+ * things a boolean on a device row could not: an audit row that is only
+ * written when a credential actually existed, and a sentence telling the admin
+ * the unit must now be removed at the broker as well. Retiring a never-
+ * provisioned safe is paperwork; retiring a live one is a revocation with a
+ * second half to perform by hand.
+ */
+export interface RetireDeviceResult extends DeviceMutationResult {
+  credentialRevoked: boolean;
 }
 
 /**
@@ -89,6 +106,83 @@ export async function clearInspection(
   return { device: toAdminDeviceRow(device) };
 }
 
+// --- Provisioning ------------------------------------------------------------
+
+/**
+ * Mints a unit's broker password and hands over its command key. **Once.**
+ *
+ * The one endpoint in this API that returns a secret, and the reason is
+ * physical rather than a convenience: a device cannot be *told* its identity
+ * over a channel it does not yet have. So both secrets are generated here,
+ * returned exactly once, and what is kept is a `sha256` of the password and
+ * nothing of the key at all — `K_d` is derived from the master secret and the
+ * serial every time it is needed, so a database leak yields no device key
+ * because no device key is in the database.
+ *
+ * **Re-issuing is a revocation.** The previous password stops working the
+ * moment the broker is updated, and a unit in the field that is not
+ * re-provisioned goes silent — which is why the response says `reissued` and
+ * the UI warns before the button is pressed. It is also how both rotations in
+ * §2.3 are performed: the row's `commandKeyVersion` is set to the master
+ * secret's current version here, so a re-provisioned device and its row move
+ * together. That matters more than it looks — a device holding one version
+ * while its row says another cannot even have its *rejection* read (§2.3's
+ * open note), so provisioning is the only place the two are brought into
+ * step.
+ *
+ * Refused for a `RETIRED` device, and allowed for `NEEDS_INSPECTION`: that
+ * status means a safe is in the field with unknown contents, which is the one
+ * safe an admin most needs to be able to reach.
+ */
+export async function issueDeviceCredential(
+  deviceId: string,
+): Promise<DeviceCredentialResponse> {
+  const { password, hash } = mintDeviceCredential();
+  const keyVersion = env.DEVICE_COMMAND_KEY_VERSION;
+  const issuedAt = new Date();
+
+  const device = await prisma.$transaction(async (tx) => {
+    const current = await tx.device.findUnique({
+      where: { id: deviceId },
+      select: { id: true, serialNumber: true, status: true, credentialIssuedAt: true },
+    });
+    if (!current) throw deviceNotFound();
+
+    if (current.status === 'RETIRED') {
+      throw conflict(
+        ERROR_CODES.DEVICE_NOT_AVAILABLE,
+        'That safe is retired. Its credential was revoked and a new one cannot be issued.',
+      );
+    }
+
+    await tx.device.update({
+      where: { id: deviceId },
+      data: {
+        credentialHash: hash,
+        credentialIssuedAt: issuedAt,
+        commandKeyVersion: keyVersion,
+      },
+    });
+
+    return current;
+  });
+
+  return {
+    deviceId: device.id,
+    serialNumber: device.serialNumber,
+    password,
+    /**
+     * Returned as base64url rather than hex: it is what the installer pastes
+     * or scans, and the derivation returns raw bytes precisely so the key has
+     * no useful default rendering to leak through a stray template literal.
+     */
+    commandKey: deriveCommandKey(device.serialNumber, keyVersion).toString('base64url'),
+    keyVersion,
+    issuedAt: issuedAt.toISOString(),
+    reissued: device.credentialIssuedAt !== null,
+  };
+}
+
 /**
  * Takes a device permanently out of service.
  *
@@ -96,11 +190,11 @@ export async function clearInspection(
  * somebody's rental would leave a renter with a safe the system has forgotten.
  * Wait for the booking to end, or force-complete it first.
  */
-export async function retireDevice(deviceId: string): Promise<DeviceMutationResult> {
-  const device = await prisma.$transaction(async (tx) => {
+export async function retireDevice(deviceId: string): Promise<RetireDeviceResult> {
+  const retired = await prisma.$transaction(async (tx) => {
     const current = await tx.device.findUnique({
       where: { id: deviceId },
-      select: { id: true, status: true },
+      select: { id: true, status: true, credentialHash: true },
     });
     if (!current) throw deviceNotFound();
 
@@ -123,14 +217,47 @@ export async function retireDevice(deviceId: string): Promise<DeviceMutationResu
       );
     }
 
-    return tx.device.update({
+    const hadCredential = current.credentialHash !== null;
+
+    const device = await tx.device.update({
       where: { id: deviceId },
-      data: { status: 'RETIRED', online: false },
+      data: {
+        status: 'RETIRED',
+        online: false,
+        /**
+         * Retirement **revokes the credential**, and this is the half of that
+         * the database can do.
+         *
+         * The other half is at the broker, where the password row is deleted
+         * or the certificate revoked — and that is the half that actually
+         * stops the unit connecting, because nothing here is consulted on a
+         * connect. Nulling the hash is what makes the two impossible to drift
+         * apart silently: there is no stored value left for anyone to compare
+         * a password against, so a retired serial cannot be quietly
+         * re-authenticated by restoring a broker entry.
+         *
+         * `credentialIssuedAt` goes with it. A retired unit showing
+         * "provisioned" in the admin list would be a claim about a credential
+         * that no longer authenticates anything; that it once had one is in
+         * the audit log, which is where a question about the past belongs.
+         *
+         * `NEEDS_INSPECTION` deliberately does **not** do this — see §2.3. A
+         * safe whose contents are unknown is the one safe an admin most needs
+         * to be able to reach.
+         */
+        credentialHash: null,
+        credentialIssuedAt: null,
+      },
       select: ADMIN_DEVICE_SELECT,
     });
+
+    return { device, hadCredential };
   });
 
-  return { device: toAdminDeviceRow(device) };
+  return {
+    device: toAdminDeviceRow(retired.device),
+    credentialRevoked: retired.hadCredential,
+  };
 }
 
 // --- Inventory ---------------------------------------------------------------
