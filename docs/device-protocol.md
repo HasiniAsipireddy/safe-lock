@@ -1,8 +1,16 @@
 # Safe Lock — Device Protocol v1
 
 **Status:** **approved 2026-10-19**, including the four review decisions in §0
-and the five amendments recorded with them. Implementation is in progress; the
-protocol on the wire is this document.
+and the five amendments recorded with them. **Implemented 2026-10-22** — the
+server side in full, with a simulator standing in for the firmware this
+document is written for. The protocol on the wire is this document.
+
+Two things changed while implementing, both recorded here rather than silently:
+§2.3 gained an **open note** on a mismatched key version being mutual
+incomprehension rather than a readable rejection, and §13's "it must be proved
+delivered" rule turned out to need a *jam* modelled separately from a dropped
+ack — a safe that loses its acks but quietly locks itself anyway clears the very
+flag §8.3 exists to raise. See `docs/decisions.md`.
 **Scope:** the wire protocol between the API and an ESP32-based safe lock, the
 broker it runs over, and the server-side command lifecycle. **Firmware is out of
 scope** — this is the document a firmware developer implements against.

@@ -510,11 +510,20 @@ it never does.
 
 Once a booking is paid, the renter gets working controls on `/dashboard`.
 
+**Both answer 202 with a command id, not a result.** The bolt has not moved
+when the request returns — it has been asked to. The client polls
+`GET /devices/commands/:id` every second for up to twenty, and renders the
+state the **device reported**, which is the only state `lockState` ever moves
+on. See "Hardware" below.
+
 **Lock** is one tap plus a confirmation. It is idempotent — locking an
-already-locked safe is a success that sends no command, not a 409. It stays
-available during an unpaid overstay, and for an unverified phone: refusing to
-let someone secure a safe they are standing at would punish them in the one
-direction that creates risk.
+already-locked safe is a success that sends no command at all (`commandId:
+null`, `alreadyInState: true`), not a 409. It stays available during an unpaid
+overstay, and for an unverified phone: refusing to let someone secure a safe
+they are standing at would punish them in the one direction that creates risk.
+It is refused while the safe is **offline**, which is physics rather than
+policy — and refused rather than queued, because a lock that fires forty
+minutes later is a command whose premise has expired.
 
 **Unlock** always costs a one-time code:
 
@@ -541,13 +550,125 @@ Both routes refuse anyone who is not entitled, with a code the UI can act on:
 | `OVERSTAY_PAYMENT_REQUIRED` | 402 | A fee is owed. **Unlock and collect are refused; lock is not.** |
 | `PHONE_NOT_VERIFIED` | 403 | Unlock only — the one-time code has nowhere to go. |
 | `DEVICE_STATE_UNKNOWN` | 409 | The safe is not reporting a state. Should be unreachable. |
+| `DEVICE_OFFLINE` | 409 | We cannot reach the safe. Refused, never queued. |
+| `DEVICE_NOT_OPERABLE` | 409 | Unlock only — the safe is retired or awaiting inspection. |
+| `DEVICE_BUSY` | 409 | Another command is already on its way to it. |
 | `OTP_INVALID` / `OTP_EXPIRED` / `OTP_TOO_MANY_ATTEMPTS` / `OTP_NOT_FOUND` | 400 | Code problems. |
+
+A command's outcome is recorded **when the ack arrives**, not when it is sent:
+`UNLOCK_CONFIRMED` means the bolt moved, so `/history` is a log of what
+happened rather than of what was attempted. A `TIMED_OUT` unlock says the safe
+did not answer and pointedly **does not** say it stayed shut — if a late ack
+turns up, an `UNLOCK_CONFIRMED` appears above it, and the two only read
+consistently because the first never claimed more than it knew.
 
 Every state change writes a `DeviceEvent` (the renter's activity feed, which
 `/history` reads) **and** an `AuditLog` row. Failed code attempts are written
 to both as well — a run of them against one account is worth seeing, and the
 event carries a `failureReason` from a fixed enum. Neither ever contains the
 code.
+
+## Hardware: the MQTT gateway and the simulator
+
+The wire protocol is **`docs/device-protocol.md`** — approved 2026-10-19, and
+the document a firmware developer implements against. This section is how to
+run it.
+
+Firmware does not exist yet, so a **simulator** stands in for it. That is not a
+stopgap: a protocol tested only against its own transport has exactly one
+interpretation of itself, and the simulator is the second implementation that
+makes the first one checkable.
+
+### Nothing to configure for the suite
+
+`DEVICE_GATEWAY=mock` is the default and the suite runs on it. The protocol
+tests use an **in-memory broker**, for the same reason `test/setup.ts` blocks
+`fetch`: a unit test that opens a socket is a test that fails when Docker is
+down, and this protocol needs exercising on every run.
+
+### Running the real transport locally
+
+`npm run db:up` starts Postgres **and** a Mosquitto broker on `:1883`, with
+`docker/mosquitto/aclfile` enforcing the same topic permissions production
+does. Then, in three terminals:
+
+```bash
+# 1. the API, on the broker
+DEVICE_GATEWAY=mqtt \
+MQTT_URL=mqtt://localhost:1883 \
+MQTT_USERNAME=safelock-api-local \
+MQTT_PASSWORD=safelock_dev_only \
+DEVICE_COMMAND_HMAC_SECRET=local_device_command_secret_32_chars_min \
+npm run dev:api
+
+# 2. a simulated safe (SAFE-0001..0003 are in the dev password file)
+npm --workspace apps/api run simulate -- SAFE-0001
+
+# 3. the web app
+npm run dev:web
+```
+
+The simulator connects, publishes a retained `status: online` and a `BOOT`
+state, heartbeats every 60s, and answers commands. Register `SAFE-0001` in the
+admin panel first, or the server will drop its reports as coming from a serial
+that is not in the inventory.
+
+**The ACL is the thing worth seeing work.** A device may publish only to its own
+`ack`/`state`/`status` and subscribe only to its own `cmd`; the API may write to
+any `cmd` and **cannot write** to any report topic. There is no reason for the
+server to be able to forge a device report, so it is denied the ability — which
+means a compromised API credential can only issue commands it could issue
+anyway.
+
+### Making it misbehave
+
+```bash
+npm --workspace apps/api run simulate -- SAFE-0001 --misbehave DROP_ACK
+```
+
+| Flag | What it does | What you should see |
+| --- | --- | --- |
+| `DROP_ACK` | Receives, acts, never answers | The dialog waits, then "did not answer" — **not** "stayed shut" |
+| `HOLD_ACK` | Builds the ack and sits on it | A timeout, then a late ack that writes `UNLOCK_CONFIRMED` anyway |
+| `FORGE_SIGNATURE` | Signs with the wrong key | Dropped, `DEVICE_MESSAGE_SIGNATURE_INVALID` in the audit log |
+| `WRONG_COMMAND_ID` | Acks an id it was never sent | `DEVICE_ACK_FOREIGN_COMMAND`; the real command untouched |
+| `REPLAY_ACK` | Publishes the same ack twice | One event, one notification — idempotent by construction |
+| `DISAGREE_STATE` | Acks `OK` with the bolt unmoved | The **measured** state is stored, not the requested one |
+| `REBOOT` | Restarts instead of acting | New `bootId`, comes back `LOCKED`, command times out |
+| `GO_SILENT` | Publishes nothing at all | A timeout, and the device going offline on heartbeat age |
+
+These are also the server paths that matter most, which is why the suite drives
+them rather than only this script. **Every one of those tests proves the
+misbehaviour was delivered before it asserts what the server did** — see §13 of
+the protocol: a test that forges a signature and checks "the server recorded
+nothing" also passes if the simulator never connected.
+
+### Provisioning a real unit
+
+1. `POST /admin/devices` registers the serial (Devices tab → Add).
+2. **Issue credential** on its row returns the broker password and the command
+   key `K_d`, **once**. Only a `sha256` of the password is stored and nothing of
+   the key at all — it is derived from one server-side master secret and the
+   serial every time it is needed, so a database leak yields no device key.
+3. The installer hands the unit its Wi-Fi credentials, broker details and
+   `K_d` over BLE (§10 — the installer app is not built).
+4. The device connects, and only then is it genuinely bookable: the pick
+   requires a safe to be online **and** reporting a door state.
+
+**Re-issuing revokes.** The old password stops working as soon as the broker is
+updated, so a unit in the field that is not re-provisioned goes silent. The
+panel says so before the button. **Retiring also revokes** — `credentialHash` is
+nulled and a `device.credential.revoked` audit row is written, which is what the
+manual removal at the broker gets reconciled against.
+
+### What is still owed
+
+- **Firmware.** §8.2 is the normative list it must satisfy; the important one
+  is *default locked* — the bolt is driven shut on boot and `UNLOCKED` is never
+  restored from storage.
+- **The pilot broker.** HiveMQ Cloud is chosen (§9) and not yet stood up.
+- **Two templates and a key-version decision** — see the open questions in
+  `CLAUDE.md`.
 
 ### Activity and notifications
 

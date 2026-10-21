@@ -2311,3 +2311,206 @@ IST, `lib/outbox/messageFormat.ts` is the one place that changes.
 - **Two of the five new templates depend on the production domain**, because
   their dynamic URL button bakes in a base URL. They cannot be submitted to
   Meta until the host is decided. See README.
+
+---
+
+## 2026-10-22 — Real hardware over MQTT (step 9)
+
+The protocol itself is `docs/device-protocol.md`, approved 2026-10-19 with the
+four review decisions and five amendments recorded in its §0. What follows is
+what implementing it decided, changed or discovered — not a second copy of the
+spec.
+
+### A gateway's job ends at "the broker took it"
+
+The old seam returned `{ acked, ackedAt }`, which was honest while
+`MockDeviceGateway` answered in process and became a lie the instant a radio
+was involved. A publish and an ack are two events separated by an unbounded
+amount of time, and either can be lost.
+
+So `sendLock`/`sendUnlock` now return a `PublishResult` — the broker accepted a
+packet, and nothing about the bolt — and the ack arrives later through
+`DeviceInboundHandler`. Conflating the two is how `lockState` would start
+moving on a publish, which is the one thing this protocol is arranged to
+prevent.
+
+What the interface still does **not** take is any context: no user, no booking,
+no payment state. What it gained is the opposite of context — a command id, a
+sequence number and a key version, which are the three things that make a
+packet unforgeable and unreplayable and say nothing about who it is for.
+
+### Lock and unlock answer 202, and the client polls
+
+`POST /devices/lock` and `/unlock/confirm` used to return a `DeviceSummary`.
+They now return `{ commandId, status, pollAfterMs, expiresAt }`, and
+`LockResponse`/`UnlockConfirmResponse` were **deleted rather than deprecated**:
+a type describing a contract the API no longer honours is worse than a missing
+one, because it compiles.
+
+Polled rather than pushed, for the same reason the notification bell is: the
+dialog is open for at most twenty seconds, and a websocket to carry twenty
+messages is infrastructure to maintain forever. `COMMAND_POLL_TIMEOUT_MS` (20s)
+is deliberately **longer** than `COMMAND_TTL_MS` (15s), so the client never
+stops waiting while the server is still deciding — the other order would show a
+timeout for a command that then succeeded.
+
+### Per-device keys are derived, not stored
+
+`K_d = HMAC(DEVICE_COMMAND_HMAC_SECRET, "safelock:device-cmd:v1:<kv>:<serial>")`.
+The alternative — a random per-device key — would have to be stored
+*reversibly*, because HMAC verification needs the key and not a digest of it,
+which means either plaintext secrets in a table or an envelope-encryption
+dependency. Both are worse than one secret in the environment where
+`OTP_HMAC_SECRET` already lives, and this way **a database leak yields no
+device key, because no device key is in the database**.
+
+The master secret must differ from `OTP_HMAC_SECRET` and the env schema refuses
+to boot otherwise. They protect different things and rotate on different
+schedules; sharing them would mean rotating the unlock-code key in order to
+re-provision a safe.
+
+### A mismatched key version is mutual incomprehension — open
+
+Found by writing the test, not by reading the spec. §3.4 has a device refuse a
+command signed at a key version it does not hold (`BAD_KEY_VERSION`), and §4.3
+has it sign that refusal with its own `K_d`. An ack carries no `kv` of its own,
+so the server verifies the refusal under the version *it* believes — which is
+the version they disagree about. The signature fails, the ack is dropped as
+`DEVICE_MESSAGE_SIGNATURE_INVALID`, and the command times out.
+
+The outcome is safe and is the right way round to be wrong: a mis-provisioned
+safe looks exactly like a hostile one, and neither is obeyed. But it means
+`BAD_KEY_VERSION` is a reason the server can essentially **never see**, so the
+diagnostic for "this unit was re-provisioned and its row was not updated" is
+indistinguishable from an attack.
+
+Recorded in §2.3 with both candidate fixes rather than quietly changing the
+wire format mid-implementation: putting `kv` in the ack (cheap, and widens
+nothing — a claimed version is still only believed if the signature verifies),
+or verifying against the recorded version and its neighbours during a rotation
+window (two keys accepted, a wider change than it looks). Neither is in v1.
+Provisioning is meanwhile the one place the device and its row are brought into
+step, which is why issuing a credential sets `commandKeyVersion`.
+
+### The physical record commits before the owner's record
+
+Step 5 made the in-app notification atomic with its `DeviceEvent` and
+deliberately let a notifier failure **roll the unlock back** — the trade being
+that we would rather refuse to open a safe than open it without telling the
+owner.
+
+That trade does not survive hardware, because by the time an ack arrives the
+bolt has already moved. There is no unlock left to refuse. Rolling back would
+not prevent an unannounced opening; it would leave a safe that is physically
+open recorded as locked, which is strictly the worse of the two.
+
+So the physical truth commits first and alone, and the owner's record follows
+in a second transaction. The step-5 contract is kept **where it still means
+something**: the event and the notification are atomic *with each other*, so
+there can be no event the owner was not told about. What can now happen is a
+bolt that moved with the feed row missing — logged loudly, and recoverable,
+which "safe silently recorded as shut" is not.
+
+### A user command is never retried; a system lock is
+
+A person is standing there. A silent retry answers a question they have already
+stopped asking, and the honest response to "your safe did not answer" is to say
+so.
+
+A system `LOCK` is the deliberate asymmetry: nobody is waiting on it, the
+correct end state is not a judgement call, and the alternative is a safe left
+open between renters. Three attempts on a 10s/60s/300s backoff, each a **new
+row with a fresh sequence number** — the device rejects anything at or below the
+highest it has seen, so a re-publish could not be accepted at all.
+
+Exhaustion stamps `lockCommandFailedAt`, writes an audit row and moves the
+device to `NEEDS_INSPECTION`, which already means "contents unknown, not
+bookable". That is the guarantee the roadmap said this path owed: before it, a
+safe could be recorded closed while physically open.
+
+### The simulator, and tests that cannot pass vacuously
+
+Firmware is out of scope, so a protocol with one implementation would be a
+function calling itself. `SimulatedDevice` is the other end: it runs §3.4's
+checks in §3.4's order, signs with the real `K_d` over the real canonical
+strings, and can be told to misbehave.
+
+The discipline matters more than the simulator. A misbehaviour test **fails by
+passing**: a forged-signature test that asserts "the server recorded nothing"
+also passes if the simulator never connected, if the topic was misspelled, if
+the broker refused the publish, or if the flag was read before it was set. In
+all of those the server recorded nothing *because nothing arrived*, and the
+green tells us only that silence is silent — which is worse than no test,
+because it reports the path as covered.
+
+So every such test asserts the misbehaviour was **delivered** first, and the
+record is written where the device *branches on the flag* rather than where the
+flag was set. There is a test whose subject is that property, which is the only
+thing making the other twenty load-bearing.
+
+An in-memory broker rather than the container, for the reason `test/setup.ts`
+blocks `fetch`: a unit test that opens a socket fails when Docker is down, and
+this protocol needs exercising on every run. The Mosquitto in
+`docker-compose.yml` is what `npm run simulate` points at, and that is where
+TLS and the real ACLs get tested.
+
+A **jam is not a misbehaviour**. It is honest hardware failure — a `FAILED` ack
+with a mechanism reason and the bolt left where it was — and it had to be
+modelled separately, because a safe that dropped its acks while quietly locking
+itself anyway would heartbeat `LOCKED` and clear the very flag §8.3's retry
+chain exists to raise. The test would have passed while testing nothing.
+
+### A credential is returned once, and retirement revokes it
+
+`POST /admin/devices/:id/credential` is the only endpoint in this API that
+returns a secret, and the reason is physical: a device cannot be *told* its
+identity over a channel it does not yet have. Only a `sha256` of the password
+is stored, nothing of `K_d` at all, and no endpoint reads either back.
+
+`POST` rather than `GET` though it reads like a fetch — it creates a credential
+and invalidates its predecessor, and a `GET` would additionally be cacheable,
+bookmarkable and browser-retried, which for a secret-bearing response is three
+ways to leave a copy somewhere.
+
+Retirement nulls `credentialHash`, so there is no stored value left to compare a
+password against and a retired serial cannot be quietly re-authenticated by
+restoring a broker entry. The other half of the revocation is at the broker and
+is **manual**, which is why it gets an audit row of its own: that is what the
+work is reconciled against.
+
+`NEEDS_INSPECTION` keeps its credential, which is the disagreement with the
+brief recorded in §2.3 — it is the one safe an admin most needs to be able to
+reach. The guarantee comes from somewhere better: `UNLOCK` is never published to
+a device that is not `AVAILABLE`, checked under the row lock in the same
+transaction that allocates the sequence number.
+
+### The booking pick refuses what it cannot reach
+
+Three conditions where there was one: `AVAILABLE`, online, and a door sensor
+that is reporting. Renting a safe we cannot command — or whose closure we
+cannot verify — is selling a product that does not work, and both failures are
+invisible at the moment of sale and obvious an hour later with money already
+taken.
+
+The liveness test duplicates `isDeviceOnline` in SQL, which is worth naming
+rather than hiding: the pick is a row-locking query and must not fetch the fleet
+to filter it in TypeScript. The *threshold* still lives in one place.
+
+The door-sensor condition also excludes a brand-new unit that has never
+reported. That is correct rather than a side effect: registering a serial is
+inventory, and a safe is genuinely bookable only once it has connected and said
+what it is.
+
+### Still open, from this step
+
+- **Firmware.** Out of scope by decision; the simulator stands in, and §8.2 is
+  the normative list a firmware developer implements against.
+- **The `kv`-mismatch fix.** Above, and in §2.3.
+- **The broker for the pilot.** HiveMQ Cloud is chosen (§9) and not yet stood
+  up; local development is Mosquitto in Docker.
+- **§8.3 against a back-to-back booking.** The sweeper clamps an overstaying
+  booking's reservation at the next booking's start rather than forcing past it,
+  and nothing resolves the collision — it is surfaced in the flagged list.
+  Unchanged by this step, and still the open question it was.
+- **Tamper reporting**, which the protocol has room for (`TAMPER` and a flag)
+  and v1 does not implement.

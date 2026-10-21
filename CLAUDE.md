@@ -117,6 +117,24 @@ middleware/    # auth, rateLimit, validate, errorHandler
   — `lockStateUpdatedAt` is the last **acked** state change. Clearing an
   inspection asserts `LOCKED` without touching it: that is a claim about
   process, not a state the hardware confirmed.
+  — **also, with the hardware:** `doorState` (`CLOSED` | `OPEN` | `UNKNOWN`),
+  `commandSeq`, `commandKeyVersion`, `credentialIssuedAt`, `firmwareVersion`,
+  `rssi`, `clockSynced`, `bootId`, `lockCommandFailedAt`, `unexpectedUnlockAt`.
+  — `doorState` is **distinct from `lockState`**: a bolt can be extended with
+  the door standing open, and the completion flow has to tell those apart.
+  `UNKNOWN` means *we do not know* — a failed sensor or firmware mid-boot —
+  and never "there is no sensor", which is now an unsupported configuration.
+  A unit reporting it is flagged and excluded from the booking pick.
+  — `commandSeq` is allocated under the device row lock, which is what makes it
+  monotonic under concurrency: two tabs tapping Unlock would otherwise be
+  handed the same number and the device would reject the second as a replay.
+  — `rssi` exists because a metal safe is a Faraday cage and the likeliest
+  field failure is a unit on the edge of Wi-Fi range. `clockSynced` gates
+  **nothing** — replay protection is the sequence number, so a device with no
+  time source is not degraded — and is shown to admins anyway.
+  — `credentialHash` **is** populated now, by
+  `POST /admin/devices/:id/credential`, and is still in no `select` list and
+  returned by nothing. Nulled on retirement.
 - **UnlockChallenge**: id, userId, deviceId, otpHash, expiresAt, attempts, consumedAt, createdAt
   — only `HMAC-SHA256(code, OTP_HMAC_SECRET)` is stored. A 6-digit space is 10^6, so a
   slow hash buys nothing; the key living outside the database is what protects it.
@@ -163,9 +181,32 @@ middleware/    # auth, rateLimit, validate, errorHandler
   — skip reasons `CANCELLED` (a state change withdrew it), `NOT_APPLICABLE`
   (re-validation refused it) and `STALE` (claimed too late to be true) are
   kept distinct: which guard fired is the diagnostic.
-- ~~**Command**~~ — **deferred to the MQTT gateway.** The mock acks synchronously, so
-  there is nothing in flight to track and nothing to time out. Command ids/nonces and the
-  15s timeout land with it. See `docs/decisions.md`.
+- **Command**: id, deviceId, bookingId (nullable), type (`LOCK` | `UNLOCK`),
+  status (`PENDING` | `SENT` | `ACKED` | `REJECTED` | `FAILED` | `TIMED_OUT` |
+  `EXPIRED` | `CANCELLED`), seq, attempts, issuedAt, expiresAt, sentAt,
+  ackedAt, **lateAckedAt**, failureCategory, userId (nullable), **systemActor**
+  (`COMPLETION` | `SWEEPER` | `ADMIN`, nullable), **challengeId** (nullable)
+  — one instruction to one safe, and the row that makes "we asked" a different
+  fact from "it happened". Built with the MQTT gateway, as planned: a mock that
+  acks in process has nothing in flight to track.
+  — **`@@unique([deviceId, seq])`** is the database insisting on what the row
+  lock computes. `seq` is monotonic per device and the device rejects anything
+  at or below the highest it has seen, so a captured command cannot be
+  replayed — its number is spent. Gaps are fine; the device requires
+  *increasing*, not contiguous.
+  — `EXPIRED` and `TIMED_OUT` are deliberately distinct. `TIMED_OUT` means we
+  reached the safe and it never answered, so its state is **unknown**;
+  `EXPIRED` means the command never left the building, so we know nothing
+  moved. One needs reconciling, the other a retry.
+  — exactly one of `userId` and `systemActor` is set, and that is the test for
+  "is anyone waiting on this". **A user command is never retried**; a system
+  `LOCK` is (10s, 60s, 300s, three attempts).
+  — `lateAckedAt` records that we had already given up when the answer came. A
+  dashboard saying "failed" and a row saying `ACKED` would otherwise be an
+  unexplainable contradiction.
+  — `challengeId` is the **immutable** record of which code bought this
+  command, which is what lets a late `OK` still consume a code the timeout had
+  released. See `docs/device-protocol.md` §5.5.
 - **RefreshToken**: id, userId, tokenHash (unique — sha256 of an opaque token; the raw value is never stored), familyId, expiresAt, revokedAt, **revokedReason** (`ROTATED` | `LOGOUT` | `PASSWORD_CHANGE` | `PASSWORD_RESET` | `REUSE_CASCADE`, nullable), replacedById, graceUsedAt, userAgent, ip, createdAt
   — `revokedReason` exists for exactly one decision: whether a replay is
   **theft**. `PASSWORD_CHANGE` / `PASSWORD_RESET` replays are not. Null on rows
@@ -252,6 +293,24 @@ middleware/    # auth, rateLimit, validate, errorHandler
 - **Rates are snapshotted onto every booking.** Changing an env var must never
   re-price a booking that is already running. The overstay multiplier is basis
   points, never a float.
+- **A safe is bookable only if it is `AVAILABLE`, online, and its door sensor
+  is reporting.** Renting one we cannot command — or whose closure we cannot
+  verify — is selling a product that does not work, and both failures are
+  invisible at the moment of sale and obvious an hour later. A safe that goes
+  offline *after* the booking is not cancelled: there is money involved and it
+  may come back in seconds, so it raises an admin flag instead.
+- **`UNLOCK` is never published to a device that is not `AVAILABLE`**
+  (409 `DEVICE_NOT_OPERABLE`), checked under the device row lock in the same
+  transaction that allocates the sequence number. `LOCK` still is — a safe
+  under inspection is exactly a safe an admin may need to close.
+- **Retirement revokes the credential** (`credentialHash` nulled, audited);
+  `NEEDS_INSPECTION` deliberately keeps it. Keeping a live credential is not
+  the same as keeping a live safe, and revoking the inspecting one would make
+  the device that most needs attention the device nobody can reach.
+- **A safe reporting itself open with no booking entitled to it is reconciled
+  closed**: a system `LOCK`, a flag raised on issue, an audit row, retries with
+  backoff, and `NEEDS_INSPECTION` on exhaustion. "Entitled" is
+  `unlockEligibility` on the live booking, not `Booking.status`.
 - Every lock/unlock attempt (success or fail) is written to `AuditLog`.
 - Admin responses are an **explicit allow-list** via Prisma `select` — never whole rows.
   No password hashes, token hashes or `credentialHash`, ever.
@@ -396,28 +455,61 @@ middleware/    # auth, rateLimit, validate, errorHandler
   client reads as "back off and retry" when the challenge is in fact dead.
 
 ## Device / Hardware Layer
-Define one interface and keep everything else hardware-agnostic
-(`apps/api/src/lib/deviceGateway/`):
+**The wire protocol is `docs/device-protocol.md`** — approved 2026-10-19 and
+the authority on topics, signing, the command lifecycle and the firmware
+requirements. This section is the summary; that document is the contract a
+firmware developer implements against.
+
+One interface, two implementations (`apps/api/src/lib/deviceGateway/`):
 ```ts
 interface DeviceGateway {
   readonly name: string;
-  sendLock(serialNumber: string): Promise<DeviceCommandResult>;
-  sendUnlock(serialNumber: string): Promise<DeviceCommandResult>;
+  start(handler: DeviceInboundHandler): Promise<void>;
+  stop(): Promise<void>;
+  sendLock(command: OutboundCommand): Promise<PublishResult>;
+  sendUnlock(command: OutboundCommand): Promise<PublishResult>;
 }
 ```
+- **A gateway's job ends at "the broker took it".** The old interface returned
+  `{ acked }`, which was honest for an in-process mock and cannot survive a
+  radio: a publish and an ack are two events separated by an unbounded amount
+  of time, and either can be lost. The ack arrives later through
+  `DeviceInboundHandler`.
 - **Two methods, not one `sendCommand(type)`** — unlocking has a precondition
   (a verified OTP) that locking does not, and the asymmetry should be visible
   at every call site.
-- **The interface takes a serial number and nothing else**: no user, no payment
-  state, no request. Authorisation is settled before anything reaches a gateway.
-- `MockDeviceGateway` (now): small delay, **always acks** — a flaky mock makes
-  every test flaky. Selected by `DEVICE_GATEWAY=mock`.
-- `MqttGateway` (later): topics like `safes/{serial}/cmd` and `safes/{serial}/state`; TLS + per-device credentials/certs; device sends an **ack** with the command id.
-- Commands will be time-limited (e.g. 15s). If no ack -> mark `TIMEOUT` and show the user "device not responding". **Not built yet** — see the `Command` note above.
-- Commands must include a nonce/command id + timestamp to prevent replay. **Also deferred**: the mock cannot lose or replay a message.
-- UI reflects real state from the device ack, not "button pressed": `lockState`
-  only moves when a command is **acked**, and the dashboard renders what the
-  server returned rather than an optimistic guess.
+- **The interface still takes no context**: no user, no booking, no payment
+  state, no request. What it gained is the opposite of context — a command id,
+  a sequence number and a key version, the three things that make a packet
+  unforgeable and unreplayable. Authorisation is settled before anything
+  reaches a gateway.
+- `MockDeviceGateway` (`DEVICE_GATEWAY=mock`): small delay, **always acks** — a
+  flaky mock makes every test flaky. Refused in production.
+- `MqttDeviceGateway` (`DEVICE_GATEWAY=mqtt`): MQTT 5 over TLS,
+  `safelock/v1/<serial>/{cmd,ack,state,status}`. **`retain: false` on `/cmd` is
+  hardcoded and asserted by a test** — a retained command is re-delivered on
+  every reconnect, and for `UNLOCK` that is a safe which opens itself every
+  time its Wi-Fi flaps.
+- **Per-device keys are derived, never stored.** `K_d = HMAC(master, "…:kv:
+  serial")`, so a database leak yields no device key. Every command carries
+  `kv`, so the master secret can rotate without a flag day.
+- **Commands are time-limited (`COMMAND_TTL_MS`, 15s)** and the sweeper writes
+  down what a read already knows: `effectiveCommandStatus` derives a timeout
+  from the clock on every read, so a wedged sweeper still shows a waiting user
+  the right answer.
+- **`lockState` moves only on an ack**, and on the **measured** state rather
+  than the requested one — a `FAILED` ack reporting `UNLOCKED` records
+  `UNLOCKED`, because the safe is open and the dashboard must say so.
+- `SimulatedDevice` (`apps/api/src/lib/deviceSimulator/`) stands in for the
+  firmware, which is out of scope. It implements the device side of the
+  protocol, signs with the real `K_d`, and **can be told to misbehave** — drop
+  an ack, hold one, forge a signature, ack a foreign command, reboot
+  mid-command, go silent, jam. Run against the dev broker with
+  `npm --workspace apps/api run simulate -- SAFE-0001`.
+- **Every misbehaviour test asserts the misbehaviour was delivered before it
+  asserts the server's response.** §13 is the reasoning: such a test fails by
+  *passing*, because "the server recorded nothing" is equally true of a
+  simulator that never connected.
 
 ## Activity History & Notifications
 - `GET /api/v1/devices/history?cursor=&limit=` — the caller's own events, newest
@@ -503,7 +595,12 @@ interface DeviceGateway {
 ## API Conventions
 - Base path `/api/v1`, JSON only, consistent error shape: `{ "error": { "code": "...", "message": "..." } }`.
 - Validate every request body/query with **zod**.
-- Authorization on every device route: confirm `device.ownerId === req.user.id`.
+- Authorization on every device route goes through `assertCanOperate`, which
+  resolves the safe **from the caller's live booking** — there is no device id
+  in any path, so there is no id a caller could substitute, and no `ownerId`
+  left to compare against.
+- **A lock or unlock answers 202 with a command id**, never a device summary.
+  The bolt has not moved yet; clients poll `GET /devices/commands/:id`.
 - Use proper HTTP codes (401 unauthenticated, 403 forbidden, 404, 409 conflict, 429 rate limit).
 - Keep controllers thin; put logic in services.
 
@@ -550,7 +647,13 @@ interface DeviceGateway {
   server's `extension` block; refusals name the remedy. `?next=` anywhere is
   validated by `safeInternalPath`, which resolves the value against the
   current origin and refuses anything that escapes.
-- `/dashboard/unlock` — OTP entry (6 input boxes, resend timer 30s)
+- `/dashboard/unlock` — OTP entry (6 input boxes, resend timer 30s). Once the
+  code is accepted the entry **goes away**: everything after that point is
+  about the safe, not the digits, so offering boxes to retype a *correct* code
+  into would be a lie about what the user can still do — and a motor fault
+  must never read as "you mistyped it". The dialog then polls the command and
+  can be dismissed with "Close and check later", which is honest: closing
+  stops the polling, not the command.
 - `/history` — activity log, grouped by local day, "Load more" (not infinite
   scroll — an endless list has no end for a keyboard or screen reader user).
   Rows are icon **plus** text, never colour alone. The unread bell lives in
@@ -559,9 +662,31 @@ interface DeviceGateway {
   list nothing else surfaces), device inventory with Clear inspection, users
   with their current booking, payments with a needs-refund queue, audit.
   Allocate and Unassign are gone.
+- **The Devices tab carries the hardware's own account of itself**: last seen,
+  firmware, RSSI, a clock warning, whether it is provisioned, the flags with
+  **their remedy** (a list of problems with no suggested next step is a list
+  people stop opening), a lazily-fetched recent-commands expander, and
+  "Issue credential".
+- **The credential is shown once, in a panel rather than a toast**, and the
+  dialog before it warns that a *re-issue* revokes the password the unit is
+  currently using — so a safe in the field that is not then re-provisioned
+  goes silent. That has to be said before the button, not after.
 - **A payment that could not be applied is never rendered as success.**
   `needsReview` gets its own panel saying the money arrived, is logged for a
   refund, and do not pay again.
+- **A command's outcome is wording, and the wording is in
+  `COMMAND_OUTCOME_COPY`** (`@safelock/shared`), like `NOTIFICATION_COPY`: the
+  API owns the fact, the UI owns the phrasing. `TIMED_OUT` says we cannot
+  confirm what happened and pointedly does **not** say the safe stayed shut —
+  the bolt may have moved and the ack been lost, and a late
+  `UNLOCK_CONFIRMED` in the feed must not contradict what the user was told.
+  `EXPIRED` can afford to be definite: nothing left the building.
+- **An offline safe disables Unlock** and says the safe also opens with its
+  physical key. The API refuses the unlock *request* before a code is sent, so
+  offering the button would spend the user's send cap and their
+  three-codes-per-ten-minutes on a code that cannot work. **Lock stays
+  enabled**: refusing to let someone try to secure their own safe would be the
+  wrong way to be careful.
 - UX: big touch-friendly buttons, clear status colors, loading/disabled states while a command is pending, confirm dialog on Lock.
 
 ## Environment Variables
@@ -618,7 +743,23 @@ OTP_HMAC_SECRET=change_me     # REQUIRED, 32+ chars; keys the unlock-code HMAC.
                               # Keep it separate from JWT_ACCESS_SECRET.
                               # Password reset needs NO secret of its own — its
                               # tokens are 32 random bytes under a plain sha256.
-DEVICE_GATEWAY=mock           # mock (only value today; mqtt arrives with hardware)
+DEVICE_GATEWAY=mock           # mock | mqtt. `mock` is REFUSED in production:
+                              # it acks every command without a device.
+DEVICE_COMMAND_HMAC_SECRET=   # REQUIRED for mqtt, 32+ chars, and must DIFFER
+                              # from OTP_HMAC_SECRET — they rotate
+                              # independently. Keys every per-device K_d.
+DEVICE_COMMAND_KEY_VERSION=1  # which K_d version new provisioning hands out
+COMMAND_TTL_MS=15000          # a command's lifetime. Under the ~20s a person
+                              # will stare at a spinner
+COMMAND_LATE_ACK_MAX_MS=600000   # past this an ack is dropped for command
+                                 # purposes — its *state* is still applied
+COMMAND_SWEEP_INTERVAL_MS=5000   # reconciler only; every read derives a
+                                 # timeout from the clock
+COMMAND_MAX_ATTEMPTS=3           # system LOCK retries (10s, 60s, 300s)
+COMMAND_FAILURE_FLAG_THRESHOLD=3 # consecutive failures before a device is flagged
+DEVICE_HEARTBEAT_SECONDS=60      # how often a unit reports unprompted
+DEVICE_OFFLINE_AFTER_SECONDS=180 # three missed heartbeats, so one lost packet
+                                 # is not an outage
 WHATSAPP_PROVIDER=fake        # fake | cloud. `fake` is REFUSED in production.
 # Required when WHATSAPP_PROVIDER=cloud, in every environment:
 # WHATSAPP_ACCESS_TOKEN=      # System User token for production
@@ -630,10 +771,15 @@ WHATSAPP_PROVIDER=fake        # fake | cloud. `fake` is REFUSED in production.
 # TWO send budgets — WHATSAPP_DAILY_SEND_CAP (default 10, user-triggered
 # kinds) and WHATSAPP_BOOKING_SEND_CAP (default 20, rental lifecycle) — see
 # apps/api/.env.example
-# Not yet used — added with the MQTT gateway:
-# MQTT_URL=mqtts://broker.example.com
+# Required when DEVICE_GATEWAY=mqtt, in every environment. The URL must use
+# TLS in production. The API connects with ONE privileged server credential
+# whose ACL denies it write access to ack/state/status — there is no reason for
+# the server to be able to forge a device report. Devices get a per-device
+# credential from POST /admin/devices/:id/credential, shown once.
+# MQTT_URL=mqtts://broker.example.com   # mqtt://localhost:1883 for `npm run db:up`
 # MQTT_USERNAME=
 # MQTT_PASSWORD=
+# MQTT_TIMEOUT_MS=5000
 ```
 
 Frontend (`apps/web/.env.local`):
@@ -656,6 +802,8 @@ npm run dev:web                              # next dev,   :3000  (separate term
 npm --workspace apps/api run prisma:migrate  # prisma migrate dev
 npm --workspace apps/api run db:seed         # create/update the ADMIN from SEED_ADMIN_*
 npm --workspace apps/api run db:cleanup-tokens  # prune dead refresh + reset tokens
+npm --workspace apps/api run simulate -- SAFE-0001   # a simulated safe on the dev broker
+npm --workspace apps/api run simulate -- SAFE-0001 --misbehave DROP_ACK
 npm test                                     # vitest + supertest against safelock_test
 npm run lint && npm run typecheck            # runs across all workspaces
 ```
@@ -722,7 +870,22 @@ portable to PowerShell, so use two terminals.
 - **Future-dated bookings — not built.** Bookings are "from now" only. Adding
   them widens the collision above from "the next hour" to "next Tuesday", and
   would want a real answer to it first.
-- **Serial number format is provisional** (`^SAFE-[0-9A-Z]{4,12}$`). Confirm what the
+- ~~**Serial number format**~~ → **confirmed** (`^SAFE-[0-9A-Z]{4,12}$`), and
+  it **is** the device's MQTT identity: client id = username = certificate CN =
+  serial, and `K_d` is derived from it. One identity, no lookup table to get out
+  of sync. Changing it now means a migration, re-labelled stock *and*
+  re-provisioning the fleet.
+- **A mismatched key version is mutual incomprehension, not a readable
+  rejection — open, and found while implementing.** A device re-provisioned to
+  `kv=2` whose row still says `kv=1` refuses commands correctly with
+  `BAD_KEY_VERSION`, and the server **cannot read the refusal**: device reports
+  are signed with the device's own `K_d` and an ack carries no `kv`, so the
+  signature is checked under the version they disagree about. Safe, and the
+  right way round to be wrong — a mis-provisioned safe looks exactly like a
+  hostile one — but it makes `BAD_KEY_VERSION` a reason the server can
+  essentially never see. Both candidate fixes are in `docs/device-protocol.md`
+  §2.3. Pinned by a test either way.
+- ~~Serial number format is provisional~~ (`^SAFE-[0-9A-Z]{4,12}$`). Confirm what the
   units are actually stamped with, and whether the serial is also the device's MQTT
   identity, **before ordering hardware** — changing it later means a migration plus
   re-labelling stock.
@@ -811,12 +974,26 @@ portable to PowerShell, so use two terminals.
    reminder links to, and `safeInternalPath` for `?next=`. Also fixed a live
    bug: the unlock-code template was being sent two parameters where Meta
    permits one, so no code would have been delivered in production.
-9. Real hardware via MQTT — also brings the `Command` table, command nonces and
-   the 15s ack timeout, all deliberately deferred until there is a transport
-   that can lose a message. **It also owes the lock-after-completion path a
-   real guarantee**: today that command is best-effort and logged on failure,
-   which with real hardware means a safe can be recorded closed while
+9. ✅ **Real hardware via MQTT** (2026-10-22) — the protocol in
+   `docs/device-protocol.md`, approved 2026-10-19 and implemented behind it.
+   `Command` with a per-device sequence number and a deadline; derived `K_d`,
+   canonical signing strings and closed enums on the wire; lock and unlock
+   answering **202 with a command id** instead of pretending to be
+   synchronous; `MqttDeviceGateway` plus a dev broker enforcing the production
+   ACLs; a sweeper that retries a system lock and escalates to
+   `NEEDS_INSPECTION`; §8.3's reconcile for a safe found open with nobody
+   entitled to it; a `SimulatedDevice` standing in for firmware, with
+   misbehaviours and tests that prove delivery before asserting a response;
+   credential issue and revocation; a booking pick that refuses safes it
+   cannot reach or whose door sensor is silent; and a web client that polls a
+   command to its outcome.
+   **The lock-after-completion path now has the guarantee the roadmap owed
+   it**: the command is a row, it retries on a backoff, and on exhaustion the
+   device is flagged and sent for inspection rather than recorded closed while
    physically open.
+   **Still owed:** firmware (out of scope — the simulator stands in), the
+   broker chosen for the pilot being stood up (HiveMQ Cloud; §9), and the
+   `kv`-mismatch decision in the open questions.
 10. Convert to mobile app (reuse `/api/v1`)
 
 **Built in step 7:** WhatsApp phone verification. `phoneVerifiedAt` exists and
