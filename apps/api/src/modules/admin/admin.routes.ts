@@ -19,6 +19,7 @@ import { validateBody, validateQuery } from '../../middleware/validate';
 import {
   getAudit,
   getBookings,
+  getDeviceCommands,
   getDevices,
   getPayments,
   getUsers,
@@ -81,6 +82,9 @@ export function createAdminRouter(limiters: Limiters): Router {
     validateBody(clearInspectionSchema),
     postClearInspection,
   );
+
+  /** The last `ADMIN_COMMAND_HISTORY_LIMIT` commands for one safe. §7. */
+  router.get('/devices/:id/commands', getDeviceCommands);
 
   /**
    * Mints the unit's broker password and command key, **shown once**.

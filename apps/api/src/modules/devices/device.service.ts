@@ -1,6 +1,8 @@
 import {
+  ADMIN_COMMAND_HISTORY_LIMIT,
   BULK_CREATE_MAX_ROWS,
   ERROR_CODES,
+  type AdminCommandRow,
   type AdminDeviceRow,
   type BulkCreateResult,
   type DeviceCredentialResponse,
@@ -14,7 +16,12 @@ import { env } from '../../config/env';
 import { prisma } from '../../lib/prisma';
 import { HttpError, conflict, notFound } from '../../lib/httpError';
 import { deriveCommandKey, mintDeviceCredential } from '../../lib/deviceProtocol';
-import { ADMIN_DEVICE_SELECT, toAdminDeviceRow } from './device.mapper';
+import {
+  ADMIN_COMMAND_SELECT,
+  ADMIN_DEVICE_SELECT,
+  toAdminCommandRow,
+  toAdminDeviceRow,
+} from './device.mapper';
 
 /**
  * Device inventory.
@@ -412,4 +419,34 @@ export async function listDevices(query: ListDevicesQuery): Promise<Paginated<Ad
     total,
     totalPages: Math.max(1, Math.ceil(total / query.pageSize)),
   };
+}
+
+/**
+ * The last few commands for one device, newest first.
+ *
+ * The §7 expander. Capped rather than paginated: an admin opening this is
+ * asking "what has this safe been doing lately", and a page-2 button on a
+ * diagnostic panel is a page nobody clicks. The whole history is in the audit
+ * log for the rare case that matters.
+ *
+ * `ADMIN_COMMAND_SELECT` is an explicit allow-list like every other admin
+ * read, and note what it leaves out: `seq`. A sequence number is not a secret,
+ * but it is an input to a signed canonical string, and the rule here is that
+ * nothing feeding a signature is serialised to a client.
+ */
+export async function listDeviceCommands(deviceId: string): Promise<AdminCommandRow[]> {
+  const device = await prisma.device.findUnique({
+    where: { id: deviceId },
+    select: { id: true },
+  });
+  if (!device) throw deviceNotFound();
+
+  const commands = await prisma.command.findMany({
+    where: { deviceId },
+    orderBy: { issuedAt: 'desc' },
+    take: ADMIN_COMMAND_HISTORY_LIMIT,
+    select: ADMIN_COMMAND_SELECT,
+  });
+
+  return commands.map(toAdminCommandRow);
 }

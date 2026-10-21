@@ -357,3 +357,35 @@ export interface DeviceCredentialResponse {
    */
   reissued: boolean;
 }
+
+/**
+ * What each device flag means, in a sentence an admin can act on.
+ *
+ * Here rather than in the panel for the reason `NOTIFICATION_COPY` is: the API
+ * owns the fact and the wording is a product decision, so a new flag cannot be
+ * added without someone deciding how it reads. `action` is the part that makes
+ * the flag worth having — a list of problems with no suggested next step is a
+ * list people stop opening.
+ */
+export const DEVICE_FLAG_COPY: Record<DeviceFlag, { label: string; action: string }> = {
+  OFFLINE_WITH_BOOKING: {
+    label: 'Offline with a paid booking',
+    action: 'Somebody has paid for this safe and we cannot reach it. Check power and Wi-Fi first.',
+  },
+  CONSECUTIVE_COMMAND_FAILURES: {
+    label: 'Several commands in a row failed',
+    action: 'Open the recent commands below — the failure reasons say whether it is the radio or the mechanism.',
+  },
+  LOCK_COMMAND_FAILED: {
+    label: 'Could not be locked',
+    action: 'This safe may be standing open. It is out of the pool until someone confirms it is shut.',
+  },
+  UNEXPECTED_UNLOCKED: {
+    label: 'Reported open with nobody entitled to it',
+    action: 'A lock was sent automatically. Check it physically — the contents are unaccounted for.',
+  },
+  DOOR_STATE_UNKNOWN: {
+    label: 'Door sensor not reporting',
+    action: 'Units ship with a sensor, so this is a fault. The safe cannot be rented until it reports again.',
+  },
+};

@@ -73,10 +73,13 @@ import {
   type CurrentBookingResponse,
   type ExtensionAvailability,
   type ExtensionRefusalReason,
+  ADMIN_COMMAND_HISTORY_LIMIT,
   isCommandSettled,
+  type AdminCommandRow,
   type CommandAcceptedResponse,
   type CommandStatus,
   type CommandStatusResponse,
+  type DeviceCredentialResponse,
   type DeviceCurrentBooking,
   type DeviceEventType,
   type DeviceFlag,
@@ -647,7 +650,13 @@ export async function mockRequest<T>(
     const [, deviceId = '', action] = deviceAction;
 
     if (action === 'clear-inspection') return handleAdminClearInspection(deviceId, body) as T;
+    if (action === 'credential') return handleAdminIssueCredential(deviceId) as T;
     return handleAdminRetire(deviceId) as T;
+  }
+
+  const deviceCommands = /^\/admin\/devices\/([^/]+)\/commands$/.exec(pathname);
+  if (method === 'GET' && deviceCommands) {
+    return handleAdminDeviceCommands(deviceCommands[1] ?? '') as T;
   }
 
   const adminBookingAction =
@@ -2633,7 +2642,9 @@ function handleAdminClearInspection(deviceId: string, body: unknown): { device: 
   return { device: toAdminDevice(device) };
 }
 
-function handleAdminRetire(deviceId: string): { device: AdminDeviceRow } {
+function handleAdminRetire(
+  deviceId: string,
+): { device: AdminDeviceRow; credentialRevoked: boolean } {
   requireAdminAccount();
 
   const device = devices.find((candidate) => candidate.id === deviceId);
@@ -2654,14 +2665,113 @@ function handleAdminRetire(deviceId: string): { device: AdminDeviceRow } {
     );
   }
 
+  const hadCredential = device.credentialIssuedAt !== null;
+
   device.status = 'RETIRED';
   device.online = false;
+  // Retirement revokes: there is nothing left to authenticate a password
+  // against, so a retired serial cannot be quietly brought back.
+  device.credentialIssuedAt = null;
+
   recordAudit('device.retired', {
     deviceId: device.id,
-    metadata: { serialNumber: device.serialNumber },
+    metadata: { serialNumber: device.serialNumber, credentialRevoked: hadCredential },
   });
 
-  return { device: toAdminDevice(device) };
+  if (hadCredential) {
+    recordAudit('device.credential.revoked', {
+      deviceId: device.id,
+      metadata: { serialNumber: device.serialNumber, reason: 'RETIRED' },
+    });
+  }
+
+  return { device: toAdminDevice(device), credentialRevoked: hadCredential };
+}
+
+/**
+ * A credential, minted once.
+ *
+ * The mock's secrets are obviously fake and deliberately look it — nobody
+ * should be able to mistake a value from this build for one that provisions a
+ * real unit. What it *is* faithful about is the shape of the promise: a new
+ * value every time, only the issue timestamp retained, and no endpoint that
+ * reads one back.
+ */
+function handleAdminIssueCredential(deviceId: string): DeviceCredentialResponse {
+  requireAdminAccount();
+
+  const device = devices.find((candidate) => candidate.id === deviceId);
+  if (!device) return fail(404, ERROR_CODES.NOT_FOUND, 'No safe with that id.');
+
+  if (device.status === 'RETIRED') {
+    return fail(
+      409,
+      ERROR_CODES.DEVICE_NOT_AVAILABLE,
+      'That safe is retired. Its credential was revoked and a new one cannot be issued.',
+    );
+  }
+
+  const reissued = device.credentialIssuedAt !== null;
+  const issuedAt = new Date().toISOString();
+  device.credentialIssuedAt = issuedAt;
+
+  recordAudit('device.credential.issued', {
+    deviceId: device.id,
+    metadata: { serialNumber: device.serialNumber, keyVersion: 1, reissued },
+  });
+
+  return {
+    deviceId: device.id,
+    serialNumber: device.serialNumber,
+    password: `mock-password-${mockSecret()}`,
+    /**
+     * Derived from the serial in the real thing, so it is **stable across a
+     * re-issue** at the same key version. Mirrored here, because an admin who
+     * sees it change would draw the wrong conclusion about what re-issuing
+     * does.
+     */
+    commandKey: `mock-key-${device.serialNumber.toLowerCase()}`,
+    keyVersion: 1,
+    issuedAt,
+    reissued,
+  };
+}
+
+function mockSecret(): string {
+  return Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+}
+
+/**
+ * The recent-commands expander.
+ *
+ * Reads the same store the device controls write to, so what an admin sees
+ * here is the command the dashboard just polled — not a separate fiction that
+ * could disagree with it.
+ */
+function handleAdminDeviceCommands(deviceId: string): { items: AdminCommandRow[] } {
+  requireAdminAccount();
+
+  const device = devices.find((candidate) => candidate.id === deviceId);
+  if (!device) return fail(404, ERROR_CODES.NOT_FOUND, 'No safe with that id.');
+
+  const items = mockCommands
+    .slice()
+    .reverse()
+    .slice(0, ADMIN_COMMAND_HISTORY_LIMIT)
+    .map((command) => ({
+      id: command.id,
+      type: command.type,
+      status: command.status,
+      failureCategory: null,
+      actor: 'USER' as const,
+      issuedAt: command.issuedAt,
+      latencyMs: command.ackedAt
+        ? new Date(command.ackedAt).getTime() - new Date(command.issuedAt).getTime()
+        : null,
+      lateAcked: false,
+    }));
+
+  return { items };
 }
 
 // --- Admin bookings ----------------------------------------------------------

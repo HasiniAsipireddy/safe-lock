@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { prisma } from '../../lib/prisma';
-import { deviceGateway } from '../../lib/deviceGateway';
+import { deviceGateway, drainDeviceAcks } from '../../lib/deviceGateway';
 import {
   TEST_ORIGIN,
   app,
@@ -34,6 +34,7 @@ const ADMIN_ROUTES = [
     path: '/api/v1/admin/devices/some-id/clear-inspection',
     body: { note: 'Opened and checked, empty' },
   },
+  { method: 'get' as const, path: '/api/v1/admin/devices/some-id/commands' },
   { method: 'post' as const, path: '/api/v1/admin/devices/some-id/credential', body: {} },
   { method: 'post' as const, path: '/api/v1/admin/devices/some-id/retire', body: {} },
   { method: 'get' as const, path: '/api/v1/admin/bookings' },
@@ -683,6 +684,108 @@ describe('POST /api/v1/admin/devices/:id/clear-inspection', () => {
 
     expect(allowed.status).toBe(201);
     expect(allowed.body.booking.deviceId).toBe(deviceId);
+  });
+});
+
+describe('GET /api/v1/admin/devices/:id/commands', () => {
+  /**
+   * The §7 expander: what this safe has been doing lately.
+   *
+   * The interesting assertion is the negative one. `seq` is not a secret, but
+   * it is an input to a signed canonical string, and the rule in this codebase
+   * is that nothing feeding a signature is serialised to a client — the same
+   * discipline that keeps `credentialHash` out of every select.
+   */
+  it('returns recent commands newest first, with no signing input', async () => {
+    const admin = await createTestAdmin();
+    const held = await createUserWithDevice();
+
+    // A safe already locked issues no command at all — locking is idempotent.
+    await prisma.device.update({
+      where: { id: held.deviceId },
+      data: { lockState: 'UNLOCKED' },
+    });
+
+    await request(app())
+      .post('/api/v1/devices/lock')
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', held.user.cookie)
+      .send({});
+
+    const response = await request(app())
+      .get(`/api/v1/admin/devices/${held.deviceId}/commands`)
+      .set('Cookie', admin.cookie);
+
+    expect(response.status).toBe(200);
+    expect(response.body.items).toHaveLength(1);
+    expect(response.body.items[0]).toMatchObject({
+      type: 'LOCK',
+      // A user asked, so the actor is the person and not a system actor.
+      actor: 'USER',
+    });
+
+    const serialised = JSON.stringify(response.body);
+    for (const forbidden of ['seq', 'sig', 'commandKey', 'credentialHash', 'keyVersion']) {
+      expect(serialised, forbidden).not.toContain(forbidden);
+    }
+  });
+
+  /**
+   * Latency is measured from `sentAt`, not `issuedAt`.
+   *
+   * The gap between committing a row and publishing it is our own scheduling,
+   * and folding it into a number labelled "device latency" would make our
+   * slowness look like the hardware's.
+   */
+  it('reports a latency the device is actually responsible for', async () => {
+    const admin = await createTestAdmin();
+    const held = await createUserWithDevice();
+
+    // A safe already locked issues no command at all — locking is idempotent.
+    await prisma.device.update({
+      where: { id: held.deviceId },
+      data: { lockState: 'UNLOCKED' },
+    });
+
+    await request(app())
+      .post('/api/v1/devices/lock')
+      .set('Origin', TEST_ORIGIN)
+      .set('Cookie', held.user.cookie)
+      .send({});
+    await drainDeviceAcks();
+
+    const command = await prisma.command.findFirstOrThrow({
+      where: { deviceId: held.deviceId },
+      select: { id: true, sentAt: true, ackedAt: true },
+    });
+
+    // Backdated so the two possible answers differ by a visible amount.
+    await prisma.command.update({
+      where: { id: command.id },
+      data: {
+        issuedAt: new Date(Date.now() - 60_000),
+        sentAt: new Date(Date.now() - 1_000),
+        ackedAt: new Date(),
+      },
+    });
+
+    const response = await request(app())
+      .get(`/api/v1/admin/devices/${held.deviceId}/commands`)
+      .set('Cookie', admin.cookie);
+
+    const latency = response.body.items[0].latencyMs as number;
+    expect(latency).toBeGreaterThanOrEqual(900);
+    expect(latency).toBeLessThan(5_000);
+  });
+
+  it('404s an unknown device', async () => {
+    const admin = await createTestAdmin();
+
+    const response = await request(app())
+      .get('/api/v1/admin/devices/not-a-device/commands')
+      .set('Cookie', admin.cookie);
+
+    expect(response.status).toBe(404);
   });
 });
 

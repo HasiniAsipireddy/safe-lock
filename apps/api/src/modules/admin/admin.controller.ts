@@ -157,6 +157,23 @@ export const postClearInspection: RequestHandler = async (req, res, next) => {
 };
 
 /**
+ * What this safe has been doing lately. Read-only, so not audited.
+ *
+ * Reading a diagnostic list is not an action on a device, and auditing every
+ * panel expansion would bury the rows that record somebody *doing* something
+ * — which is the only reason the audit log is worth reading.
+ */
+export const getDeviceCommands: RequestHandler = async (req, res, next) => {
+  try {
+    const commands = await deviceService.listDeviceCommands(routeParam(req, 'id'));
+
+    res.status(200).json({ items: commands });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
  * Mints a unit's credential, for the one and only time it is readable.
  *
  * The audit row records that a credential was issued, which safe it was for,

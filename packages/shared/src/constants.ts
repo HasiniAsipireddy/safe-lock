@@ -304,6 +304,16 @@ export const COMMAND_POLL_INTERVAL_MS = 1_000;
 export const COMMAND_POLL_TIMEOUT_MS = 20_000;
 
 /**
+ * How many commands the admin recent-commands expander shows.
+ *
+ * Capped rather than paginated. An admin opening it is asking "what has this
+ * safe been doing lately", and a page-2 button on a diagnostic panel is a page
+ * nobody clicks — the full history is in the audit log for the rare case that
+ * needs it. Shared so the heading can say the number the query uses.
+ */
+export const ADMIN_COMMAND_HISTORY_LIMIT = 20;
+
+/**
  * Generic message for any failed login. Deliberately does not say whether the
  * identifier or the password was wrong — that would let an attacker enumerate
  * registered accounts.
