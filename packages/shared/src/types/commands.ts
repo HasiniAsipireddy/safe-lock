@@ -146,3 +146,89 @@ export interface CommandAcceptedResponse {
    */
   alreadyInState?: boolean;
 }
+
+/**
+ * What to tell the user about a settled command, for each type.
+ *
+ * Here rather than in a component for the reason `NOTIFICATION_COPY` is: the
+ * API owns the fact and the UI owns the wording, and two places that both
+ * phrase "your safe did not answer" will eventually phrase it differently.
+ *
+ * The wording is the hard part, and `TIMED_OUT` is why. It does **not** say
+ * the safe stayed shut, because we do not know that — the bolt may have moved
+ * and the ack been lost. Claiming otherwise would be a UI lying about a
+ * physical safe, and would contradict the `UNLOCK_CONFIRMED` that appears in
+ * the feed if the ack turns up late. `EXPIRED` is the opposite case and can
+ * afford to be definite: nothing left the building, so nothing moved.
+ */
+export const COMMAND_OUTCOME_COPY: Record<
+  CommandType,
+  Partial<Record<CommandStatus, { tone: 'success' | 'warning' | 'error'; message: string }>>
+> = {
+  LOCK: {
+    ACKED: { tone: 'success', message: 'Your safe is locked.' },
+    REJECTED: {
+      tone: 'error',
+      message: 'Your safe refused the instruction and did not move. Please contact support.',
+    },
+    FAILED: {
+      tone: 'error',
+      message: 'Your safe tried to lock and could not. Check that nothing is obstructing the door, then try again.',
+    },
+    TIMED_OUT: {
+      tone: 'warning',
+      message: 'Your safe did not answer, so we cannot confirm whether it locked. Check it, and try again.',
+    },
+    EXPIRED: {
+      tone: 'error',
+      message: 'We could not reach your safe, so nothing was sent to it. Try again in a moment.',
+    },
+    CANCELLED: {
+      tone: 'warning',
+      message: 'That instruction was withdrawn because something else happened to your safe.',
+    },
+  },
+  UNLOCK: {
+    ACKED: { tone: 'success', message: 'Your safe is unlocked.' },
+    REJECTED: {
+      tone: 'error',
+      message: 'Your safe refused to open and did not move. Your code was correct — please contact support.',
+    },
+    FAILED: {
+      tone: 'error',
+      message: 'Your safe tried to open and could not. Your code was correct, so please contact support.',
+    },
+    TIMED_OUT: {
+      tone: 'warning',
+      message: 'Your safe did not answer, so we cannot confirm whether it opened. Check it before requesting another code.',
+    },
+    EXPIRED: {
+      tone: 'error',
+      message: 'We could not reach your safe, so it did not open. Your code has not been used — try again in a moment.',
+    },
+    CANCELLED: {
+      tone: 'warning',
+      message: 'That unlock was withdrawn because something else happened to your safe.',
+    },
+  },
+};
+
+/**
+ * The copy for one settled command, with a fallback that cannot be reached.
+ *
+ * Thrown rather than defaulted would be wrong here — this runs in a browser
+ * while somebody is waiting on a bolt — but a silent empty string would be
+ * worse, so the fallback is deliberately generic and deliberately honest about
+ * not knowing.
+ */
+export function commandOutcomeCopy(
+  type: CommandType,
+  status: CommandStatus,
+): { tone: 'success' | 'warning' | 'error'; message: string } {
+  return (
+    COMMAND_OUTCOME_COPY[type][status] ?? {
+      tone: 'warning',
+      message: 'We could not confirm what your safe did. Check it, and contact support if it looks wrong.',
+    }
+  );
+}

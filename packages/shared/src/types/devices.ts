@@ -83,16 +83,18 @@ export type DeviceEventType = 'LOCK' | 'UNLOCK_REQUESTED' | 'UNLOCK_CONFIRMED' |
 /** Where a device event originated. Only the web app for now. */
 export type DeviceEventSource = 'WEB';
 
-/** Response body of `POST /devices/lock`. */
-export interface LockResponse {
-  device: DeviceSummary;
-  /**
-   * True when the safe was already locked and no command was sent. Locking is
-   * idempotent, so this is a success, not an error — the UI can say
-   * "already locked" rather than claiming it just locked it.
-   */
-  alreadyLocked: boolean;
-}
+/**
+ * There is no `LockResponse` or `UnlockConfirmResponse` any more.
+ *
+ * Both returned a `DeviceSummary`, which was honest while a mock gateway acked
+ * in process and became a lie the moment a radio was involved: the bolt has
+ * not moved when the request returns. They are replaced by
+ * `CommandAcceptedResponse` (202, a command id) plus `CommandStatusResponse`
+ * from polling — see `types/commands.ts`.
+ *
+ * Deleted rather than deprecated, deliberately. A type describing a contract
+ * the API no longer honours is worse than a missing one: it compiles.
+ */
 
 /**
  * Response body of `POST /devices/unlock/request`.
@@ -109,11 +111,6 @@ export interface UnlockRequestResponse {
   attemptsAllowed: number;
   /** Seconds the client should disable "Resend" for. */
   resendAfterSeconds: number;
-}
-
-/** Response body of `POST /devices/unlock/confirm`. */
-export interface UnlockConfirmResponse {
-  device: DeviceSummary;
 }
 
 /**

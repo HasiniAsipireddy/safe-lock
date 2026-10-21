@@ -73,6 +73,10 @@ import {
   type CurrentBookingResponse,
   type ExtensionAvailability,
   type ExtensionRefusalReason,
+  isCommandSettled,
+  type CommandAcceptedResponse,
+  type CommandStatus,
+  type CommandStatusResponse,
   type DeviceCurrentBooking,
   type DeviceEventType,
   type DeviceFlag,
@@ -82,7 +86,6 @@ import {
   type ForgotPasswordResponse,
   type HistoryEvent,
   type HistoryResponse,
-  type LockResponse,
   type LockState,
   type MarkNotificationsReadResponse,
   type MyDeviceResponse,
@@ -97,7 +100,6 @@ import {
   type PaymentSummary,
   type PublicUser,
   type RateSnapshot,
-  type UnlockConfirmResponse,
   type UnlockFailureReason,
   type UnlockRequestResponse,
   type VerifyPaymentResponse,
@@ -614,6 +616,12 @@ export async function mockRequest<T>(
       break;
   }
 
+  // `GET /devices/commands/:id` — how a pending command ends.
+  const commandStatus = /^\/devices\/commands\/([^/]+)$/.exec(pathname);
+  if (method === 'GET' && commandStatus) {
+    return handleMockCommandStatus(commandStatus[1] ?? '') as T;
+  }
+
   // Parameterised booking routes.
   const bookingAction =
     /^\/bookings\/([^/]+)(?:\/(order|extend\/order|overstay\/order|collect|cancel))?$/.exec(
@@ -633,7 +641,8 @@ export async function mockRequest<T>(
   }
 
   // Parameterised admin routes.
-  const deviceAction = /^\/admin\/devices\/([^/]+)\/(clear-inspection|retire)$/.exec(pathname);
+  const deviceAction =
+    /^\/admin\/devices\/([^/]+)\/(clear-inspection|retire|credential)$/.exec(pathname);
   if (method === 'POST' && deviceAction) {
     const [, deviceId = '', action] = deviceAction;
 
@@ -1975,27 +1984,162 @@ function requireOperableDevice(
   return { account, device, booking };
 }
 
-function handleMockLock(): LockResponse {
-  const { account, device } = requireOperableDevice();
+/**
+ * Commands in flight, and the deferred work each one owes.
+ *
+ * The mock used to move the bolt inside the request, because the mock gateway
+ * did too. It cannot any more: the thing being mocked is now a *radio*, and
+ * the property the UI has to be built against is that the answer arrives
+ * later. So a command is issued `SENT`, settles when it is next polled after
+ * its own little delay, and only then does anything happen to the device, the
+ * activity feed or the notification bell.
+ *
+ * It **always acks**, like `MockDeviceGateway` and for the same reason: a
+ * flaky mock makes every screen flaky, and the interesting failures belong in
+ * the simulator's tests where they can be asserted rather than watched.
+ */
+interface MockCommand {
+  id: string;
+  type: 'LOCK' | 'UNLOCK';
+  status: CommandStatus;
+  issuedAt: string;
+  expiresAt: string;
+  ackedAt: string | null;
+  /** When the simulated device would answer. */
+  settleAt: number;
+  /** Moves the bolt and writes the records. Runs once, at settle time. */
+  settle: () => void;
+}
 
-  if (device.lockState === 'LOCKED') {
-    return { device: toDeviceSummary(device), alreadyLocked: true };
+const mockCommands: MockCommand[] = [];
+
+/** Long enough that the client genuinely polls, short enough to not annoy. */
+const MOCK_ACK_DELAY_MS = 900;
+const MOCK_COMMAND_TTL_MS = 15_000;
+
+function issueMockCommand(
+  type: 'LOCK' | 'UNLOCK',
+  settle: () => void,
+): CommandAcceptedResponse {
+  const now = Date.now();
+
+  const command: MockCommand = {
+    id: `cmd_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    type,
+    status: 'SENT',
+    issuedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + MOCK_COMMAND_TTL_MS).toISOString(),
+    ackedAt: null,
+    settleAt: now + MOCK_ACK_DELAY_MS,
+    settle,
+  };
+
+  mockCommands.push(command);
+
+  return {
+    commandId: command.id,
+    status: command.status,
+    // Half the delay, so the first poll lands before the ack and the UI's
+    // waiting state is exercised rather than skipped.
+    pollAfterMs: Math.round(MOCK_ACK_DELAY_MS / 2),
+    expiresAt: command.expiresAt,
+  };
+}
+
+/**
+ * `GET /devices/commands/:id`, settling the command if its moment has come.
+ *
+ * Settled lazily on read rather than on a timer: a `setTimeout` firing in
+ * module scope would keep running after a page navigation and move a mock
+ * bolt with nobody looking, and the real server does not have a timer either
+ * — the status endpoint derives the outcome from the clock on every read.
+ */
+function handleMockCommandStatus(commandId: string): CommandStatusResponse {
+  const command = mockCommands.find((candidate) => candidate.id === commandId);
+
+  if (!command) {
+    return fail(404, ERROR_CODES.COMMAND_NOT_FOUND, 'No command with that id.');
   }
 
-  const now = new Date().toISOString();
-  device.lockState = 'LOCKED';
-  device.lockStateUpdatedAt = now;
-  device.online = true;
-  device.lastSeenAt = now;
-  recordAudit('device.lock.success', { userId: account.user.id, deviceId: device.id });
-  // No notification: locking is the safe state, matching the API.
-  recordMockEvent({
+  if (command.status === 'SENT' && Date.now() >= command.settleAt) {
+    command.settle();
+    command.status = 'ACKED';
+    command.ackedAt = new Date().toISOString();
+  }
+
+  /**
+   * Read through the caller's live booking, like every other device read here.
+   * Null rather than a throw when there is no booking: a command's *outcome*
+   * is still a fact, and a user whose rental ended between the request and the
+   * poll should be told what happened rather than shown an error.
+   */
+  const account = requireAccount();
+  const booking = liveBookingFor(account.user.id);
+  const device = booking ? mockDeviceFor(booking) : null;
+
+  return {
+    id: command.id,
+    type: command.type,
+    status: command.status,
+    settled: isCommandSettled(command.status),
+    failureCategory: null,
+    issuedAt: command.issuedAt,
+    expiresAt: command.expiresAt,
+    ackedAt: command.ackedAt,
+    lateAckedAt: null,
+    // The device's state **as acked**, which before the ack is whatever it was
+    // — never the state we asked for.
+    lockState: device?.lockState ?? null,
+    doorState: device?.doorState ?? null,
+  };
+}
+
+function handleMockLock(): CommandAcceptedResponse {
+  const { account, device } = requireOperableDevice();
+
+  /**
+   * Already locked: no command, nothing to wait for, and `commandId` is null
+   * rather than an id pointing at nothing — a client that polled a fabricated
+   * id would get a 404 and show an error for what was a success.
+   */
+  if (device.lockState === 'LOCKED') {
+    return {
+      commandId: null,
+      status: 'ACKED',
+      pollAfterMs: 0,
+      expiresAt: new Date().toISOString(),
+      alreadyInState: true,
+    };
+  }
+
+  // Audited at issue, because that is when it happened. What the safe *did* is
+  // recorded below, when it answers.
+  recordAudit('device.command.issued', {
     userId: account.user.id,
-    serialNumber: device.serialNumber,
-    type: 'LOCK',
+    deviceId: device.id,
+    metadata: { type: 'LOCK' },
   });
 
-  return { device: toDeviceSummary(device), alreadyLocked: false };
+  return issueMockCommand('LOCK', () => {
+    const now = new Date().toISOString();
+    device.lockState = 'LOCKED';
+    device.lockStateUpdatedAt = now;
+    device.online = true;
+    device.lastSeenAt = now;
+
+    recordAudit('device.command.acked', {
+      userId: account.user.id,
+      deviceId: device.id,
+      metadata: { type: 'LOCK', result: 'OK' },
+    });
+
+    // No notification: locking is the safe direction, matching the API.
+    recordMockEvent({
+      userId: account.user.id,
+      serialNumber: device.serialNumber,
+      type: 'LOCK',
+    });
+  });
 }
 
 function handleMockUnlockRequest(): UnlockRequestResponse {
@@ -2029,7 +2173,7 @@ function handleMockUnlockRequest(): UnlockRequestResponse {
   };
 }
 
-function handleMockUnlockConfirm(body: unknown): UnlockConfirmResponse {
+function handleMockUnlockConfirm(body: unknown): CommandAcceptedResponse {
   const { account, device } = requireOperableDevice();
   const parsed = otpSchema.safeParse((body as { otp?: unknown })?.otp ?? '');
 
@@ -2111,28 +2255,42 @@ function handleMockUnlockConfirm(body: unknown): UnlockConfirmResponse {
     );
   }
 
+  /**
+   * The code was right, so a command is issued — and **nothing is unlocked
+   * yet**. No `UNLOCK_CONFIRMED` event, no notification, no bolt: those are
+   * facts about a safe that has not answered. Writing them here would make
+   * `/history` a log of intentions, which is exactly what the API moved away
+   * from when the ack became a separate event.
+   */
   challenge.consumed = true;
-  const now = new Date().toISOString();
-  device.lockState = 'UNLOCKED';
-  device.lockStateUpdatedAt = now;
-  device.online = true;
-  device.lastSeenAt = now;
-  recordAudit('device.unlock.success', { userId: account.user.id, deviceId: device.id });
-
-  // Event and notification together, as one step — the API writes both in one
-  // transaction and neither can exist without the other.
-  const event = recordMockEvent({
+  recordAudit('device.command.issued', {
     userId: account.user.id,
-    serialNumber: device.serialNumber,
-    type: 'UNLOCK_CONFIRMED',
-  });
-  recordMockNotification({
-    userId: account.user.id,
-    type: 'UNLOCK_CONFIRMED',
-    deviceEventId: event.id,
+    deviceId: device.id,
+    metadata: { type: 'UNLOCK' },
   });
 
-  return { device: toDeviceSummary(device) };
+  return issueMockCommand('UNLOCK', () => {
+    const now = new Date().toISOString();
+    device.lockState = 'UNLOCKED';
+    device.lockStateUpdatedAt = now;
+    device.online = true;
+    device.lastSeenAt = now;
+
+    recordAudit('device.unlock.success', { userId: account.user.id, deviceId: device.id });
+
+    // Event and notification together, as one step — the API writes both in
+    // one transaction and neither can exist without the other.
+    const event = recordMockEvent({
+      userId: account.user.id,
+      serialNumber: device.serialNumber,
+      type: 'UNLOCK_CONFIRMED',
+    });
+    recordMockNotification({
+      userId: account.user.id,
+      type: 'UNLOCK_CONFIRMED',
+      deviceEventId: event.id,
+    });
+  });
 }
 
 // --- History (mock) ----------------------------------------------------------
