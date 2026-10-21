@@ -231,6 +231,28 @@ rest on a `WHERE` clause three modules away. **Test:** an `UNLOCK` to a
 alongside the test that a `RETIRED` device's credential is revoked (§2.3), so
 the two halves of "which safes can still be commanded" are read together.
 
+**Open, found while implementing: a mismatched `kv` is mutual
+incomprehension, not a readable rejection.** §3.4 step 2 has the device refuse
+a command signed at a key version it does not hold, with `BAD_KEY_VERSION` —
+and §4.3 has it sign that refusal with its own `K_d`. An ack carries no `kv` of
+its own, so the server verifies the refusal under the version *it* believes the
+device holds, which is the version they disagree about. The signature does not
+match, the ack is dropped as `DEVICE_MESSAGE_SIGNATURE_INVALID`, and the
+command times out.
+
+The outcome is safe and is the right way round to be wrong: a mis-provisioned
+safe looks exactly like a hostile one, and neither is obeyed. But it means
+`BAD_KEY_VERSION` is a reason the server can essentially never *see*, so the
+diagnostic for "this unit was re-provisioned and its row was not updated" is a
+signature failure — the same symptom as an attack. Pinned down by a test in
+`deviceSimulator.test.ts`, which also shows rotation working when the device
+and its row move together. **Needs deciding** before the fleet is large enough
+to rotate: put `kv` in the ack and verify under the version the device claims
+(cheap, and widens nothing — the claim is still only believed if the signature
+verifies), or have the server try the device's recorded version and its
+neighbours during a rotation window (two keys accepted, which is a wider
+change than it looks). Neither is in v1.
+
 ### 2.4 Stamped, burned, and provisioned
 
 | Stage | What happens |

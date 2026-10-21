@@ -728,6 +728,17 @@ export const PUBLIC_WEB_URL: string = (
 export const DEVICE_OFFLINE_AFTER_MS = env.DEVICE_OFFLINE_AFTER_SECONDS * 1000;
 
 /**
+ * How often a device reports its state unprompted.
+ *
+ * A firmware figure the server only *reads* — it is baked into a unit at
+ * provisioning and the server cannot change it — kept here so the simulator
+ * heartbeats at the rate `DEVICE_OFFLINE_AFTER_SECONDS` was chosen against.
+ * Three missed beats before a safe counts offline is only three if both
+ * numbers come from one place.
+ */
+export const DEVICE_HEARTBEAT_MS = env.DEVICE_HEARTBEAT_SECONDS * 1000;
+
+/**
  * Backoff between retries of a **system** command, in milliseconds.
  *
  * In code rather than the environment: these are three numbers that only make

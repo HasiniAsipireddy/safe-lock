@@ -56,4 +56,9 @@ export const deviceGateway: DeviceGateway = resolveGateway();
  */
 export async function drainDeviceAcks(): Promise<void> {
   if (deviceGateway instanceof MockDeviceGateway) await deviceGateway.drain();
+
+  // Over MQTT the owed work is inbound rather than outbound — acks being
+  // handled, not acks waiting to be sent — but the question a caller is asking
+  // is the same one, so it gets the same answer.
+  if (deviceGateway instanceof MqttDeviceGateway) await deviceGateway.drain();
 }

@@ -43,6 +43,18 @@ export class MqttDeviceGateway implements DeviceGateway {
   private client: MqttClient | null = null;
   private handler: DeviceInboundHandler | null = null;
 
+  /**
+   * Inbound messages currently being handled.
+   *
+   * `client.on('message')` cannot await — it is a library's event callback —
+   * so the promise it starts has to be held somewhere or it is unobservable.
+   * Two callers need it: `stop()`, because an ack arriving mid-shutdown is a
+   * bolt that moved and dropping it would leave the safe recorded wrongly, and
+   * {@link drain}, which is how the simulator's tests are deterministic about
+   * an asynchronous protocol without sleeping.
+   */
+  private readonly inFlight = new Set<Promise<void>>();
+
   async start(handler: DeviceInboundHandler): Promise<void> {
     this.handler = handler;
 
@@ -88,7 +100,10 @@ export class MqttDeviceGateway implements DeviceGateway {
     this.client = client;
 
     client.on('message', (topic, payload) => {
-      void this.dispatch(topic, payload);
+      const handling = this.dispatch(topic, payload);
+
+      this.inFlight.add(handling);
+      void handling.finally(() => this.inFlight.delete(handling));
     });
 
     client.on('error', (error) => {
@@ -131,10 +146,30 @@ export class MqttDeviceGateway implements DeviceGateway {
     logger.info({ gateway: this.name, clientId: options.clientId }, 'MQTT gateway connected');
   }
 
+  /**
+   * Waits for every inbound message currently being handled.
+   *
+   * A loop rather than one `Promise.all`, because handling an ack can produce
+   * another inbound message: §8.3's reconciling `LOCK` is published from inside
+   * a state report's handler, and the device answers it before the first
+   * handler has returned. One pass would wait for the first wave only.
+   *
+   * Lives on the gateway for the same reason `drainDeviceAcks` does: nothing
+   * has to reach into a concrete class, and it is honestly useful in
+   * production — `stop()` uses it so a shutdown does not drop an ack.
+   */
+  async drain(): Promise<void> {
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight]);
+    }
+  }
+
   async stop(): Promise<void> {
     const client = this.client;
     this.client = null;
     this.handler = null;
+
+    await this.drain();
 
     if (!client) return;
 
