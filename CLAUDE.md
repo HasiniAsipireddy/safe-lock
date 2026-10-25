@@ -72,8 +72,9 @@ middleware/    # auth, rateLimit, validate, errorHandler
 - **Booking**: id, userId, deviceId, status (`PENDING_PAYMENT` | `ACTIVE` |
   `OVERSTAY` | `COMPLETED` | `CANCELLED` | `EXPIRED_UNPAID`), hours, startsAt,
   endsAt (nullable), holdExpiresAt (nullable), reservedUntil, pricePaise,
-  currency, **the rate snapshot** (hourlyRatePaise, overstayMultiplierBps,
-  graceMinutes, capHours, collectionWindowMinutes), overstaySettledAt,
+  currency, **the rate snapshot** (**safeSize**, hourlyRatePaise,
+  overstayMultiplierBps, graceMinutes, capHours, collectionWindowMinutes),
+  overstaySettledAt,
   overstayPaidPaise, overstayWaivedAt, completedAt, completionReason
   (`COLLECTED` | `COLLECTION_WINDOW_LAPSED` | `ADMIN_FORCE_COMPLETED`,
   nullable), adminNote, timestamps
@@ -85,6 +86,10 @@ middleware/    # auth, rateLimit, validate, errorHandler
   `reservedUntil` is the overlap constraint's upper bound and covers the grace
   period and collection window too — the safe may still hold someone's
   belongings for all of it. The sweeper pushes it out during an overstay.
+  — `safeSize` is part of the snapshot, not read from the device: an admin
+  reclassifying a cabinet mid-rental must not change what the renter is
+  recorded as having booked, or what it cost. `Device.size` is a fact about
+  inventory; `Booking.safeSize` is a fact about the contract.
   — The rate snapshot exists so **config changes never re-price a live
   booking**. `overstayMultiplierBps` is basis points (15000 = 1.5x); money
   never touches a float.
@@ -105,7 +110,14 @@ middleware/    # auth, rateLimit, validate, errorHandler
   Razorpay order carries the same `expire_by`.
 - **WebhookEvent**: id, eventId (unique — Razorpay's `x-razorpay-event-id`), type, processedAt
   — the idempotency ledger. An event id already present is acknowledged and dropped.
-- **Device** (safe lock): id, serialNumber (unique), status (`AVAILABLE` | `NEEDS_INSPECTION` | `RETIRED`), lockState (`LOCKED` | `UNLOCKED` | `UNKNOWN`, **default `LOCKED`**), lockStateUpdatedAt, online (bool), lastSeenAt, **inspectionNote**, **inspectionNotedAt**, credentialHash (nullable, reserved for the hardware phase)
+- **Device** (safe lock): id, serialNumber (unique), **size** (`SMALL` |
+  `MEDIUM` | `LARGE`, default `MEDIUM`), status (`AVAILABLE` | `NEEDS_INSPECTION` | `RETIRED`), lockState (`LOCKED` | `UNLOCKED` | `UNKNOWN`, **default `LOCKED`**), lockStateUpdatedAt, online (bool), lastSeenAt, **inspectionNote**, **inspectionNotedAt**, credentialHash (nullable, reserved for the hardware phase)
+  — `size` drives the hourly rate and is a **hard filter** on the booking
+  pick: a renter who asks for a small safe is never handed a large one. It is
+  required when registering a device (no default on the request body, unlike
+  the column) and reclassifiable from the Devices tab — allowed even while the
+  safe is occupied, because a live booking snapshots its own size and rate, and
+  refused once retired.
   — `credentialHash` is **never populated or returned** today and appears in no `select` list.
   — **Nobody owns a device.** `ownerId` and `allocatedAt` are gone with the
   purchase model: a safe is occupied for the duration of a `Booking` and free
@@ -293,6 +305,16 @@ middleware/    # auth, rateLimit, validate, errorHandler
 - **Rates are snapshotted onto every booking.** Changing an env var must never
   re-price a booking that is already running. The overstay multiplier is basis
   points, never a float.
+- **A renter chooses a size before a duration, and the size is a hard filter
+  on the pick.** Three sizes (`SMALL`/`MEDIUM`/`LARGE`), each with its own
+  hourly rate, and a request for one is never satisfied with another: handing
+  out a large safe at the small rate charges less for stock worth more, and a
+  size perpetually given away as an upgrade earns nothing. When the chosen size
+  has nothing free but another does, the answer is **409 `SIZE_NOT_AVAILABLE`
+  naming the sizes that are** — distinct from `NO_DEVICES_AVAILABLE` because
+  "try a shorter booking" is false and discouraging while a large one stands
+  empty. The quote marks each size available or not, so the page disables a
+  card rather than leading someone into that refusal.
 - **A safe is bookable only if it is `AVAILABLE`, online, and its door sensor
   is reporting.** Renting one we cannot command — or whose closure we cannot
   verify — is selling a product that does not work, and both failures are
@@ -455,6 +477,25 @@ middleware/    # auth, rateLimit, validate, errorHandler
   client reads as "back off and retry" when the challenge is in fact dead.
 
 ## Device / Hardware Layer
+**The MQTT transport is PARKED as of 2026-10-24.** `DEVICE_GATEWAY=mqtt` is
+refused at boot in **every** environment by the `MQTT_PARKED` constant in
+`apps/api/src/config/env.ts`, making `mock` the only reachable gateway. The
+decision is to finish the website first and integrate an ESP32 afterwards.
+**Nothing below was deleted** — the transport, `lib/deviceProtocol/`, the
+simulator, the dev broker and every test are intact and passing, and
+un-parking is one line. Everything in this section therefore describes code
+that exists and is correct but is currently unreachable; the `Command`/ack
+lifecycle is **not** parked and runs on the mock exactly as described.
+
+Two consequences worth holding onto:
+- **Nothing boots in production today.** `mock` is refused there and `mqtt` is
+  parked, so there is no valid `DEVICE_GATEWAY`. Deliberate — a rental product
+  whose safes cannot be opened has nothing to sell. Pinned by a test.
+- **Running `mqtt` with no broker is not harmless**, which is why the refusal
+  exists rather than a note: completion locks fail, the sweeper retries them
+  three times and the escalation moves each device to `NEEDS_INSPECTION`,
+  silently making the inventory unbookable. See `docs/decisions.md`.
+
 **The wire protocol is `docs/device-protocol.md`** — approved 2026-10-19 and
 the authority on topics, signing, the command lifecycle and the firmware
 requirements. This section is the summary; that document is the contract a
@@ -484,8 +525,36 @@ interface DeviceGateway {
   unforgeable and unreplayable. Authorisation is settled before anything
   reaches a gateway.
 - `MockDeviceGateway` (`DEVICE_GATEWAY=mock`): small delay, **always acks** — a
-  flaky mock makes every test flaky. Refused in production.
-- `MqttDeviceGateway` (`DEVICE_GATEWAY=mqtt`): MQTT 5 over TLS,
+  flaky mock makes every test flaky. Refused in production. **The only
+  reachable gateway while MQTT is parked**, and not a stub: it signs a real ack
+  with the device's derived `K_d` and feeds the production inbound handler, so
+  the whole 202-and-poll path is genuinely exercised.
+- **Dev-only test safes** (`prisma/testSafes.ts`, `db:seed:safes`): 30 rows —
+  12 `SMALL`, 12 `MEDIUM`, 6 `LARGE` — serialled `SAFE-TEST{S,M,L}NNN`, which
+  is both the test-data marker and a serial `SERIAL_NUMBER_REGEX` accepts (no
+  second hyphen, so not `SAFE-S-001`). **No schema change**: the prefix is the
+  flag, because a boolean column would be a migration and `inspectionNote` is
+  load-bearing elsewhere. Seeded `online` with a `CLOSED` door, since a
+  registered serial is deliberately *not* bookable until it has reported and
+  the mock never will. Refused when `NODE_ENV=production` and on any gateway
+  but `mock`, **with no override flag** — a privileged account is sometimes
+  needed in production, fake inventory never is, and over a real transport
+  nothing answers for these serials so every completion lock would escalate
+  all 30 to `NEEDS_INSPECTION`. A re-run only advances liveness and never
+  touches `status`, `size` or `lockState`, so a safe driven into
+  `NEEDS_INSPECTION` is not silently healed by a seed.
+  — **They go offline after `DEVICE_OFFLINE_AFTER_SECONDS` and cannot recover
+  on their own.** On the mock, `lastSeenAt` moves only on an ack, and `lock`
+  and `unlock/request` both pass `requireOnline: true`, so the one action that
+  would refresh liveness is the one a stale row refuses. `db:seed:safes --
+  --heartbeat` holds them up with a dev-only `updateMany` on the prefix; no
+  request path and no `online` derivation was changed to accommodate this.
+  — Cleanup (`db:cleanup-safes`) **deletes the never-booked and retires the
+  rest**: `Booking.device` is `onDelete: Restrict` because a booking is the
+  record of a contract, so a safe with history cannot be deleted without
+  destroying it. Retirement revokes the credential, as in the admin flow.
+- `MqttDeviceGateway` (`DEVICE_GATEWAY=mqtt`, **parked — refused at boot**):
+  MQTT 5 over TLS,
   `safelock/v1/<serial>/{cmd,ack,state,status}`. **`retain: false` on `/cmd` is
   hardcoded and asserted by a test** — a retained command is re-delivered on
   every reconnect, and for `UNLOCK` that is a safe which opens itself every
@@ -633,9 +702,16 @@ interface DeviceGateway {
   any unverified user, not only when an unlock is refused: discovering the
   requirement when you need to open your safe is discovering it too late. The
   Unlock button is disabled with the reason shown; Lock stays enabled.
-- `/book` — duration picker, the price for each allowed duration **from the
-  server's quote** (the client does no money arithmetic), and the overstay rule
-  stated with its real figures *before* anyone pays. `/pay` is gone.
+- `/book` — **size first, then duration.** A radio group of the three sizes
+  with each one's hourly rate and what it fits, then a duration picker priced
+  **at the chosen size** from the server's quote (the client does no money
+  arithmetic), and the overstay rule stated with its real figures for that size
+  *before* anyone pays. That ordering is the product's: size is answerable by
+  looking at what you are holding and it decides the price, so asking hours
+  first would show a figure that changes the moment a size is picked. A size
+  with nothing free is **disabled with the reason on the card**, and a
+  `SIZE_NOT_AVAILABLE` refusal re-marks the cards from what the server says is
+  free. `/pay` is gone.
 - `/dashboard` — the booking card plus, once paid, the safe's controls. Three
   shapes, all decided from `effectiveStatus`: no booking (book one), awaiting
   payment (pay or cancel, with the hold counting down), paid (time left,
@@ -696,7 +772,12 @@ Backend (`apps/api/.env`):
 ```
 NODE_ENV=development
 PORT=4000
-WEB_ORIGIN=http://localhost:3000   # exact-match allowlist; CORS_ORIGINS is a legacy alias
+WEB_ORIGIN=http://localhost:3000,http://localhost:3001
+                              # comma-separated EXACT-match allowlist, never a
+                              # prefix or wildcard; CORS_ORIGINS is a legacy
+                              # alias. Both dev ports listed because `next dev`
+                              # moves to 3001 when 3000 is taken. Production
+                              # stays the real origins and nothing else.
 TRUST_PROXY=false                  # only `true`/hop-count when actually behind a proxy
 LOG_LEVEL=info
 SEED_ADMIN_EMAIL=                  # db:seed; password must be 12+ chars, no default
@@ -707,14 +788,28 @@ SEED_ADMIN_PHONE=
 # Dev DB runs in Docker on host port 5433 (see docker-compose.yml) to avoid
 # clashing with a local PostgreSQL install on 5432.
 DATABASE_URL=postgresql://safelock:safelock_dev_only@localhost:5433/safelock
+DIRECT_URL=postgresql://safelock:safelock_dev_only@localhost:5433/safelock
+                              # migrations only, read by prisma.config.ts.
+                              # Locally identical to DATABASE_URL and may be
+                              # omitted. On Supabase: DATABASE_URL is the
+                              # TRANSACTION pooler (6543) and DIRECT_URL the
+                              # SESSION pooler (5432), because Migrate needs a
+                              # session it can hold. See "Supabase" below.
 TEST_DATABASE_URL=postgresql://safelock:safelock_dev_only@localhost:5433/safelock_test
+                              # Docker ALWAYS. The suite truncates every table
+                              # and refuses to start if this names a non-local
+                              # host (`src/test/localDatabaseGuard.ts`).
 JWT_ACCESS_SECRET=change_me   # signs the access token only
 ACCESS_TOKEN_TTL=15m
 REFRESH_TOKEN_TTL_DAYS=7      # refresh tokens are opaque, not signed
 # JWT_REFRESH_SECRET          # legacy, unused — refresh tokens are not JWTs
-RENTAL_HOURLY_RATE_PAISE=10000   # paise/hour; the ONLY source of the rate.
-                                 # PROVISIONAL. Snapshotted onto every booking,
-                                 # so changing it never re-prices a live one.
+RENTAL_HOURLY_RATE_SMALL_PAISE=6000     # paise/hour PER SIZE; the ONLY source
+RENTAL_HOURLY_RATE_MEDIUM_PAISE=10000   # of the rates. PROVISIONAL (2026-10-25).
+RENTAL_HOURLY_RATE_LARGE_PAISE=16000    # Snapshotted onto every booking with its
+                                 # size, so neither a config change nor an admin
+                                 # reclassifying a cabinet re-prices a live one.
+# RENTAL_HOURLY_RATE_PAISE=10000 # LEGACY flat rate; still honoured as the
+                                 # default for the MEDIUM rate when unset.
 RENTAL_MIN_HOURS=1
 RENTAL_MAX_HOURS=24
 OVERSTAY_MULTIPLIER_BPS=15000    # basis points: 15000 = 1.5x. Never a float.
@@ -743,11 +838,17 @@ OTP_HMAC_SECRET=change_me     # REQUIRED, 32+ chars; keys the unlock-code HMAC.
                               # Keep it separate from JWT_ACCESS_SECRET.
                               # Password reset needs NO secret of its own — its
                               # tokens are 32 random bytes under a plain sha256.
-DEVICE_GATEWAY=mock           # mock | mqtt. `mock` is REFUSED in production:
-                              # it acks every command without a device.
+DEVICE_GATEWAY=mock           # mock | mqtt. LEAVE AS mock: `mqtt` is PARKED
+                              # (2026-10-24) and refused at boot in EVERY
+                              # environment — un-park with MQTT_PARKED=false in
+                              # config/env.ts. `mock` is REFUSED in production
+                              # (it acks every command without a device), so
+                              # while MQTT is parked NOTHING boots in
+                              # production. Deliberate; see docs/decisions.md.
 DEVICE_COMMAND_HMAC_SECRET=   # REQUIRED for mqtt, 32+ chars, and must DIFFER
                               # from OTP_HMAC_SECRET — they rotate
                               # independently. Keys every per-device K_d.
+                              # Not needed while mqtt is parked.
 DEVICE_COMMAND_KEY_VERSION=1  # which K_d version new provisioning hands out
 COMMAND_TTL_MS=15000          # a command's lifetime. Under the ~20s a person
                               # will stare at a spinner
@@ -771,7 +872,8 @@ WHATSAPP_PROVIDER=fake        # fake | cloud. `fake` is REFUSED in production.
 # TWO send budgets — WHATSAPP_DAILY_SEND_CAP (default 10, user-triggered
 # kinds) and WHATSAPP_BOOKING_SEND_CAP (default 20, rental lifecycle) — see
 # apps/api/.env.example
-# Required when DEVICE_GATEWAY=mqtt, in every environment. The URL must use
+# Required when DEVICE_GATEWAY=mqtt, in every environment — so NOT needed
+# today, because mqtt is parked. The URL must use
 # TLS in production. The API connects with ONE privileged server credential
 # whose ACL denies it write access to ack/state/status — there is no reason for
 # the server to be able to forge a device report. Devices get a per-device
@@ -790,6 +892,41 @@ NEXT_PUBLIC_USE_MOCK_API=true
 There is no `NEXT_PUBLIC_RAZORPAY_KEY_ID`: the key id comes back from the
 booking order endpoints, so the browser holds no payment config of its own.
 
+## Database hosting: Docker for dev, Supabase as an option
+- **Development and the entire test suite run on local Docker Postgres (5433).**
+  Supabase is a runtime option for the API, not a replacement for either.
+- **Two URLs.** `DATABASE_URL` is the application's connection — on Supabase,
+  the **transaction** pooler (6543). `DIRECT_URL` is for `prisma migrate` /
+  `db seed` — the **session** pooler (5432). Migrate holds an advisory lock for
+  a whole run, does `CREATE EXTENSION` and wraps DDL in long transactions, none
+  of which survive transaction-mode pooling, so `prisma.config.ts` **refuses**
+  a 6543 URL rather than half-applying a migration. Locally the two are the
+  same string and `DIRECT_URL` is optional.
+- The session pooler, **never** the direct host (`db.[REF].supabase.co`), which
+  is IPv6-only. `sslmode=require` on both.
+- **`url`/`directUrl` are NOT in `schema.prisma`** — Prisma 7 removed both
+  properties from schema files (P1012). `prisma.config.ts` is the only place.
+- **`connection_limit` is read by `src/lib/prisma.ts`** and applied as the pg
+  pool size, because the driver adapter ignores it as a URL parameter.
+  Supabase's `connection_limit=1` is serverless advice; this API is a
+  long-lived process with an outbox worker and two sweepers, so ~10.
+  `pgbouncer=true` is inert and kept anyway — see `docs/decisions.md`.
+- **Nothing in the codebase depends on session state**, which is what makes
+  transaction pooling safe here: no advisory locks, no `LISTEN`/`NOTIFY`, no
+  session `SET`, every row lock inside a transaction, and no transaction that
+  waits on the network.
+- **Supabase's Data API (PostgREST) must stay unused.** A migration enables RLS
+  on all fourteen tables **with no policies** and revokes `anon`/`authenticated`
+  grants, so the public anon key reads nothing. Prisma connects as `postgres`,
+  which owns the tables and has `BYPASSRLS`, so the app is unaffected —
+  **verified by `src/lib/rls.test.ts`**, not assumed. Never add a permissive
+  policy for `anon`; **never put the `service_role` key in this app.**
+  `FORCE ROW LEVEL SECURITY` must never be added — it would subject the owner
+  to the non-existent policies and take the app down.
+- **The suite refuses a non-local `TEST_DATABASE_URL`** (allow-list of hosts,
+  not a deny-list), and `globalSetup` strips `DATABASE_URL`/`DIRECT_URL` from
+  the environment it hands Migrate.
+
 ## Commands
 This repo uses **npm workspaces** (not pnpm) — see `docs/decisions.md`.
 Target runtime is **Node 22 LTS** (`.nvmrc`, root `package.json` `engines`).
@@ -801,6 +938,9 @@ npm run dev:api                              # tsx watch, :4000  (separate termi
 npm run dev:web                              # next dev,   :3000  (separate terminal)
 npm --workspace apps/api run prisma:migrate  # prisma migrate dev
 npm --workspace apps/api run db:seed         # create/update the ADMIN from SEED_ADMIN_*
+npm --workspace apps/api run db:seed:safes   # 30 dev-only test safes (12 S / 12 M / 6 L)
+npm --workspace apps/api run db:seed:safes -- --heartbeat  # and hold them online
+npm --workspace apps/api run db:cleanup-safes   # delete or retire only SAFE-TEST* safes
 npm --workspace apps/api run db:cleanup-tokens  # prune dead refresh + reset tokens
 npm --workspace apps/api run simulate -- SAFE-0001   # a simulated safe on the dev broker
 npm --workspace apps/api run simulate -- SAFE-0001 --misbehave DROP_ACK
@@ -823,12 +963,22 @@ portable to PowerShell, so use two terminals.
 - Make small, reviewable commits; update this file when architecture decisions change.
 
 ## Open Questions (to decide)
-- ~~Price and plan structure~~ → **the model is now hourly rental**, not a
-  one-time purchase. `RENTAL_HOURLY_RATE_PAISE=10000` (₹100/hour) is a
-  development placeholder, exactly as the ₹999 was. **Still to confirm:** the
-  real hourly rate, whether GST is included, and the four overstay parameters
-  (1.5x multiplier, 15-minute grace, 24-hour cap, 30-minute collection window)
-  — all four are plausible guesses, not decisions anybody has made.
+- ~~Price and plan structure~~ → **hourly rental, priced per safe size**
+  (2026-10-25). ₹60 / ₹100 / ₹160 per hour for small / medium / large are
+  development placeholders, exactly as the flat ₹100 and the ₹999 before it
+  were; medium matches the old flat rate so the backfill re-priced nothing.
+  **Still to confirm:** the three real rates, whether GST is included, and the
+  four overstay parameters (1.5x multiplier, 15-minute grace, 24-hour cap,
+  30-minute collection window) — all plausible guesses, not decisions anybody
+  has made.
+- **What each size physically is — open, and it is a promise to customers.**
+  `SAFE_SIZE_COPY` in `@safelock/shared` describes the three sizes by what they
+  are *for* ("a phone, a wallet, keys and documents") and deliberately names no
+  measurements, because the units are not specced or ordered. Real internal
+  dimensions — and whether the copy should state them — must be settled before
+  launch: "fits a 15-inch laptop" is the kind of claim a customer measures us
+  against. **Needs deciding:** the dimensions of each size, how many of each to
+  stock, and whether three sizes is even the right number.
 - ~~OTP channel~~ → **decided: WhatsApp (Meta Cloud API).** Unlock codes,
   verification codes and alerts are delivered through the `WhatsAppClient` seam.
   Working in production **once ten templates are approved by Meta and the four
@@ -994,7 +1144,32 @@ portable to PowerShell, so use two terminals.
    **Still owed:** firmware (out of scope — the simulator stands in), the
    broker chosen for the pilot being stood up (HiveMQ Cloud; §9), and the
    `kv`-mismatch decision in the open questions.
-10. Convert to mobile app (reuse `/api/v1`)
+   **⏸ PARKED 2026-10-24.** `DEVICE_GATEWAY=mqtt` is refused at boot in every
+   environment and `mock` is the only reachable gateway, so step 9's transport
+   is unreachable — while every line of it, its tests, the simulator and
+   `docs/device-protocol.md` stay on disk. Nothing was deleted and un-parking
+   is one constant (`MQTT_PARKED` in `config/env.ts`). The `Command`/ack
+   lifecycle built in this step is **not** parked: it runs on the mock, which
+   is what keeps the website exercisable end to end. See `docs/decisions.md`.
+9b. **The website, finished first** (current work) — everything above is being
+   driven from the web app against real Postgres and a mock safe: signup,
+   booking, payments, history and admin. The hardware layer is deliberately
+   absent rather than half-connected, because `mqtt` with no broker is not a
+   no-op — it escalates every completion lock into `NEEDS_INSPECTION` and eats
+   the device inventory.
+   **Safe sizes** (2026-10-25) — three sizes with their own hourly rates,
+   chosen before a duration. `SafeSize` enum, `Device.size` (a hard filter on
+   the booking pick, reclassifiable by an admin), `Booking.safeSize` in the
+   rate snapshot, a quote that prices every (size, duration) pair and marks
+   each size available or not, `SIZE_NOT_AVAILABLE` naming what *is* free, a
+   two-step `/book`, and size on the admin create, bulk-import and inventory
+   list. The rates are placeholders; the physical dimensions are an open
+   question. See `docs/decisions.md`.
+10. **Real hardware on an ESP32** — resumes from step 9. Either implement
+   `docs/device-protocol.md` as it stands on the unit, or add a third
+   `DeviceGateway` implementation beside `mock` and `mqtt` if the ESP32 wants a
+   different transport. Un-park first.
+11. Convert to mobile app (reuse `/api/v1`)
 
 **Built in step 7:** WhatsApp phone verification. `phoneVerifiedAt` exists and
 `assertCanOperate` enforces it for unlock. There is still **no

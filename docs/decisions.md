@@ -2514,3 +2514,349 @@ what it is.
   Unchanged by this step, and still the open question it was.
 - **Tamper reporting**, which the protocol has room for (`TAMPER` and a flag)
   and v1 does not implement.
+
+---
+
+## 2026-10-23 â€” Supabase Postgres as a runtime option (Docker stays for dev and tests)
+
+**Decision:** The API can run against a hosted Supabase database. Local Docker
+Postgres on 5433 remains what development and the whole test suite use. Two
+connection strings:
+
+- `DATABASE_URL` â€” Supabase's **transaction** pooler (port 6543), the
+  application's runtime connection.
+- `DIRECT_URL` â€” Supabase's **session** pooler (port 5432), used by
+  `prisma migrate` and `prisma db seed`.
+
+Locally the two are the same string and `DIRECT_URL` may be omitted entirely,
+so nothing about Docker development changes.
+
+**Why two:** Migrate needs a session it can hold â€” an advisory lock across the
+whole run, `CREATE EXTENSION`, DDL inside long transactions. Transaction-mode
+pooling can hand each statement to a different backend, so none of that
+survives. Pointed at 6543, Migrate fails or half-applies. The session pooler
+rather than the direct host (`db.[REF].supabase.co`) because the direct host
+resolves to IPv6 only and is unreachable from most IPv4 networks.
+
+**Why not in `schema.prisma`:** The familiar Supabase recipe is `url` +
+`directUrl` in the datasource block, and **Prisma 7 removed both properties
+from schema files** â€” it fails validation with P1012 pointing at
+`prisma.config.ts`. So the whole arrangement lives in `prisma.config.ts`, whose
+datasource resolves `PRISMA_DATABASE_URL ?? DIRECT_URL ?? DATABASE_URL`. That
+file now also **refuses** a URL on port 6543 or carrying `pgbouncer=true`,
+because the quiet version of this mistake is a partially-migrated database.
+
+**Consequence â€” `connection_limit` had to be made real.** It is a Prisma
+*engine* parameter, and this app does not use the engine's pool; the pg driver
+adapter parses unknown query parameters into inert strings. Measured rather
+than assumed: four concurrent `pg_sleep(0.5)` queries through a URL carrying
+`connection_limit=1` completed in 535ms (parallel), while
+`PrismaPg({ max: 1 })` took 2046ms (serialised). Since every Supabase guide
+tells you to append it, `src/lib/prisma.ts` now reads it out of the URL and
+applies it as the pool size â€” the parameter does what the documentation it came
+from implies.
+
+`pgbouncer=true` is left **inert on purpose**. It instructed the old Rust
+engine to stop using *named* prepared statements, which is the thing
+transaction-mode pooling breaks; `node-postgres` only names a statement when a
+query supplies a `name`, and the adapter never does. Nothing to disable.
+
+**Consequence â€” the recommended pool size is not 1.** Supabase documents
+`connection_limit=1` for serverless functions, which are frozen between
+invocations. This API is a long-lived process running an outbox worker and two
+sweepers alongside request traffic, and a pool of one serialises all of them.
+`.env.example` suggests ~10.
+
+### Transaction-mode compatibility: what was checked
+
+Audited rather than hoped for. Nothing in the codebase depends on session
+state:
+
+- **No advisory locks, no `LISTEN`/`NOTIFY`, no `SET SESSION`/`SET LOCAL`, no
+  `set_config`/`current_setting`, no explicit `PREPARE`.** Searched for; absent.
+- **Row locks are fine.** Every `FOR UPDATE` and `FOR UPDATE SKIP LOCKED` â€”
+  the booking device pick, the command sequence allocation, the outbox claim,
+  the Â§8.3 reconcile â€” is inside a transaction, and a pooler pins one backend
+  for a transaction's duration. That is precisely the guarantee transaction
+  mode gives.
+- **No transaction waits on the network.** Step 9 already moved the MQTT
+  publish outside the device row lock, and WhatsApp has always been an outbox
+  row written inside the transaction and sent after the commit. There are no
+  long interactive transactions to hold a pooled connection open.
+- **The outbox worker and the sweepers are safe**, and for the reason the
+  design already gave: they claim rows in one short transaction with
+  `SKIP LOCKED`, commit, then act. No worker holds state across statements.
+- **No global-client use inside a transaction callback**, which was worth
+  confirming because a small pool turns that latent bug into a hang rather
+  than a slow query.
+
+**`btree_gist`** â€” required by `Booking_device_no_overlap` â€” is already created
+by `20261016210722_rental_bookings`
+(`CREATE EXTENSION IF NOT EXISTS btree_gist`). It is in Supabase's available
+extensions and is created as `postgres`, which can. Unverified against a live
+project at the time of writing: the migration has deliberately not been run
+against Supabase from this repo.
+
+---
+
+## 2026-10-23 â€” Supabase's Data API is disabled by RLS, and must stay unused
+
+**Decision:** `20261023000000_enable_rls_deny_data_api` enables Row Level
+Security on **all fourteen application tables with no policies at all**, and
+additionally revokes every privilege on them from the `anon` and
+`authenticated` roles (guarded on those roles existing, so it is a no-op on
+Docker).
+
+**Two rules, and they are the point of this entry:**
+
+- **The Data API stays unused, and no permissive policy is ever added for
+  `anon`.** A policy added "just for one table" is a public read of that table.
+- **The `service_role` key must never be added to this application.** It
+  bypasses RLS by design. The app authenticates with the database password and
+  has no use for it; its only possible effect here is to turn a leaked key into
+  full table access.
+
+**Why:** Supabase publishes every table in `public` over HTTP through
+PostgREST, authenticated with the project's `anon` key â€” a key that is public
+by design and ships inside frontend bundles. This application does not use the
+Data API at all, so it is pure attack surface, and the contents are the worst
+case for a physical-security product: `User.passwordHash`,
+`RefreshToken.tokenHash`, `UnlockChallenge.otpHash`, `PasswordResetCode`,
+device serials, and every booking. RLS with no policies is deny-by-default.
+
+**Why the application is unaffected:** Postgres exempts roles with `BYPASSRLS`
+and a table's owner (absent `FORCE ROW LEVEL SECURITY`, which this migration
+deliberately does **not** set â€” it would subject the owner to the non-existent
+policies and take the application down). Prisma connects as `postgres`, which
+on Supabase is both.
+
+**Verified, not assumed.** `src/lib/rls.test.ts` creates a `NOBYPASSRLS` role
+owning nothing, **grants it `USAGE` on the schema and `SELECT` on all fourteen
+tables**, and then reads them. It sees zero rows on every one while the
+application sees its own data. The grants are the load-bearing part: the first
+draft of that test passed because the probe could not resolve the tables at
+all, which is Â§13's failure-by-passing in a new costume â€” so the test now
+asserts the probe's access is real, including that a non-RLS temp table is
+readable over the same connection, before it concludes anything from an empty
+result. It also pins that no policies exist, that `relforcerowsecurity` is
+false everywhere, and that the table list matches the schema, so a table added
+later without RLS fails the suite.
+
+**Consequence:** `sslmode=require` is required on both Supabase URLs.
+`node-postgres` turns that into a verified TLS connection today â€” note that
+`pg-connection-string` warns it will adopt weaker libpq semantics for
+`require` in a future major, at which point `verify-full` is the value to move
+to.
+
+---
+
+## 2026-10-23 â€” The test suite refuses a non-local database
+
+**Decision:** `src/test/localDatabaseGuard.ts` throws unless
+`TEST_DATABASE_URL` names a host on an **allow-list** of local hostnames, in
+addition to the existing requirement that it name a `*_test` database. Checked
+in `globalSetup` and again at the top of per-file `setup.ts`. `globalSetup`
+also *deletes* `DATABASE_URL` and `DIRECT_URL` from the environment it hands
+`prisma migrate deploy`.
+
+**Why:** Every test file truncates all fourteen tables in `beforeEach`, and the
+global setup runs `migrate deploy`. Neither asks. Before Supabase, the `*_test`
+name was sufficient protection; now one mistyped variable, or a `.env` edited
+for a migration and not changed back, can point that name at a hosted
+database. The two checks catch different mistakes: the name catches `safelock`
+instead of `safelock_test` on the right server, the host catches
+`safelock_test` on the wrong one.
+
+An **allow-list, not a deny-list containing "supabase"** â€” a deny-list is
+satisfied by an RDS hostname, and being wrong here means losing a production
+database. Deleting the fallback variables before invoking Migrate guards the
+precedence chain in `prisma.config.ts` against being reordered later.
+
+**Deliberately not guarded:** `DATABASE_URL` and `DIRECT_URL` pointing at
+Supabase while the suite runs against Docker. That is the supported
+arrangement, and a guard that refused it would be switched off within a day.
+
+**Consequence:** Pointing the suite at a hosted database now requires editing
+the guard, which is the intended cost. Errors from it redact credentials
+(`//***:***@`), tested.
+
+---
+
+## 2026-10-24 — The MQTT transport is parked, not deleted; `mock` is the only reachable gateway
+
+**Decision:** `DEVICE_GATEWAY=mqtt` is **refused at boot in every
+environment**, by a single `MQTT_PARKED` constant in
+`apps/api/src/config/env.ts`. `mock` becomes the only reachable gateway. **No
+MQTT code, test, document or container is removed**: `MqttDeviceGateway`,
+`lib/deviceProtocol/` (canonical signing, topics, per-device `K_d`),
+`lib/deviceSimulator/`, `scripts/simulateDevice.ts`, the Mosquitto service in
+`docker-compose.yml`, `docs/device-protocol.md` and every associated test stay
+exactly as they are and keep passing. Un-parking is one line.
+
+**Why:** The remaining work is the website — signup, booking, payments,
+history, admin — and hardware integration (an ESP32) comes after it. Running
+`DEVICE_GATEWAY=mqtt` with no broker is not a neutral no-op, which is what made
+this worth a decision rather than a shrug:
+
+- mqtt.js retries the connection every two seconds, forever, and logged
+  `"reason": ""` while doing it (fixed separately, below).
+- Worse, every booking completion issues a system `LOCK`. The publish fails,
+  the command sweeper retries it three times, and the escalation then does
+  exactly what it is designed to do: stamps `lockCommandFailedAt`, flags the
+  device and moves it to `NEEDS_INSPECTION`, where it is **unbookable until an
+  admin clears it with a note**. A handful of test bookings would quietly empty
+  the device inventory, and the symptom ("no safes available") looks nothing
+  like the cause.
+
+A boot refusal is louder and cheaper than either.
+
+**Why parked rather than deleted** (the user's explicit choice, offered three
+options): the transport, the protocol and the simulator are finished, tested
+work, and the hardware phase resumes from them rather than from a blank file.
+Deleting them would also have forced a decision about the `Command`/ack
+lifecycle, which is **not** MQTT-specific — it runs on the mock, and the 202
+plus poll shape, `lockState` moving only on an ack, `/history` and the admin
+commands view all depend on it. Keeping it is what lets the website be
+exercised end to end against a mock safe that behaves like a real one.
+
+**Why a code constant and not an env var:** "is there hardware yet" is a fact
+about the project, not about a deployment. An env var would let a
+half-configured environment switch on a transport nobody has a device for,
+which is the thing being prevented.
+
+**Why refused in development too, not only production:** the failure above is
+a *local* failure. Production already refuses a broker-less `mqtt` config by
+requiring `MQTT_URL`, the credential and the command secret.
+
+**Consequence — and it is a real one:** while MQTT is parked, **no value of
+`DEVICE_GATEWAY` boots in production.** `mock` is refused there (it acks every
+command without a device) and `mqtt` is refused by the parking block. The
+codebase is therefore not deployable to production today. That is the honest
+state of a rental product whose safes cannot yet be physically opened, and the
+boot failure states it at the earliest possible moment rather than letting
+someone sell a booking against a safe that will never open. There is a test
+asserting this, so "fixing" it by letting `mock` through production fails
+loudly. The remedy is the hardware phase.
+
+**Rejected: a third `DEVICE_GATEWAY=disabled` mode.** Built first, then backed
+out. It would have refused every lock and unlock with a 503 before writing a
+`Command` row — correct behaviour, and redundant once `mqtt` is unreachable,
+because `mock` already needs no broker and never retries. It was also *worse*
+for the stated goal: a mode in which the safe controls permanently refuse
+exercises less of the website than one in which they work.
+
+---
+
+## 2026-10-24 — An MQTT connection failure logs its code, its causes and the endpoint
+
+**Decision:** `logger.error({ reason: error.message })` in the MQTT gateway is
+replaced by `describeMqttError()` and `brokerEndpoint()`, which log the error
+code, a reason that is **never empty**, every entry of `error.errors`, and the
+broker host and port — and never a username, password or connection URL.
+Applied to the `error`, `reconnect` and `close` handlers and to the failed
+`start`. Unit-tested, including the `AggregateError` case.
+
+**Why:** For the commonest failure in development — nothing listening on
+`localhost:1883` — Node resolves localhost to both `::1` and `127.0.0.1`,
+attempts both, and raises an **`AggregateError` whose own `message` is the
+empty string**, with the two real `ECONNREFUSED` errors hanging off `.errors`.
+The log said `"reason": ""`, which gave an operator no thread to pull at all.
+
+**Why host and port are parsed out rather than logging the URL:**
+`mqtts://user:pass@host` is a legal URL and the sort of thing that ends up in
+an env file. An address is a diagnosis; a credential is a device identity. An
+unparseable URL yields `null`s rather than falling back to the raw string,
+which would reintroduce exactly that leak.
+
+**Consequence:** Dead code while the transport is parked, kept deliberately —
+it is the first thing anyone will need when the ESP32 work starts, and it is
+pinned by tests in the meantime.
+
+---
+
+## 2026-10-25 — Safes come in three sizes, priced per size, chosen before the duration
+
+**Decision:** A `SafeSize` enum (`SMALL`/`MEDIUM`/`LARGE`) with its own hourly
+rate per size: **₹60 / ₹100 / ₹160**. `Device.size` says how big a cabinet is;
+`Booking.safeSize` joins the rate snapshot. `POST /bookings` requires a `size`,
+and the booking page asks for it **before** the duration.
+
+**Why size first:** it is the question a renter can answer by looking at what
+they are holding, and it is what determines the price. Asking for hours first
+means showing a price that changes the moment a size is picked, which reads as
+a bait and switch even when it is not. The quote is shaped for that order — a
+price list per size rather than one list — so the client still multiplies
+nothing.
+
+**Why ₹60 / ₹100 / ₹160:** the user picked it from three offered structures.
+Medium deliberately equals the old flat ₹100, which is what makes the backfill
+free: every pre-existing device became `MEDIUM`, and `MEDIUM` is priced at
+exactly what those safes were already renting for, so no existing booking or
+device was re-priced. **Provisional**, like every price in this project so far.
+
+**Why the size is snapshotted onto the booking** rather than read from the
+device: identical reasoning to the hourly rate beside it. An admin correcting a
+mislabelled shelf must not retroactively change what a renter is recorded as
+having booked, or what they were charged. `Device.size` is a fact about
+inventory; `Booking.safeSize` is a fact about the contract. This is also what
+makes reclassification safe to allow **while a safe is occupied** — the
+alternative is an admin unable to fix a typo for up to 24 hours, protecting
+nothing. Pinned by a test.
+
+**Why no new snapshot column for the rate:** there was already one.
+`hourlyRatePaise` always answered "what does this booking cost per hour"; size
+only changes where that number is read from. Every pricing function in
+`@safelock/shared` is unchanged.
+
+**Why the chosen size is a hard filter, not a preference** (the user's explicit
+choice from three options): a request for a small safe satisfied with a large
+one charges the small rate for stock worth more, and a size that is
+perpetually given away as a free upgrade is a size that never earns its own
+price. The alternatives considered were auto-upgrading at the cheaper rate —
+which also leaves a booking whose snapshot matches no size, so an admin
+reading revenue sees a large safe earning a medium fee — and offering the
+alternative for a second explicit confirmation.
+
+**So an unavailable size is a refusal, and it names what is free.** 409
+`SIZE_NOT_AVAILABLE`, distinct from `NO_DEVICES_AVAILABLE` because the remedy
+differs and is immediately actionable: "every safe is booked, try a shorter
+stay" is false and discouraging while a large one stands empty. The free sizes
+go in `error.fields.size` so the page renders buttons rather than parsing
+prose, and the wording distinguishes "we stock none of these" from "they are
+all booked" — waiting fixes the second and never the first. It should also be
+**rare**: the quote marks each size available before anyone picks a duration,
+so this is the race where somebody took the last medium while the page was
+open, and the exclusion constraint is what makes it a clean refusal rather than
+a double booking.
+
+**Why availability in the quote is advisory:** it is a read taken before a
+duration is chosen, against `RENTAL_MIN_HOURS` — the most permissive window, so
+a size marked unavailable is unavailable at every duration. That is the only
+direction in which being approximate is safe. The authority remains the
+exclusion constraint at creation.
+
+**Why an enum and not a volume in litres:** the price is per size, stock is
+counted per size, and a renter picks from a menu of three. A dimensions column
+would make every price lookup a range query to answer a question nobody asks.
+
+**Why `RENTAL_HOURLY_RATE_PAISE` was kept:** an existing `.env` has a value
+there, and a variable that silently stops mattering while still looking
+authoritative is its own kind of bug — the same trap as the duplicate
+`DATABASE_URL` found the day before. It is now the default for
+`RENTAL_HOURLY_RATE_MEDIUM_PAISE`, mirroring the `CORS_ORIGINS` → `WEB_ORIGIN`
+pattern, so an untouched `.env` keeps charging what it charged.
+
+**Why the request body requires a size with no default, unlike the column:**
+the column's `MEDIUM` default exists so the backfill had somewhere to land. An
+admin registering stock knows which shelf they are holding, and a silent
+default would price a large safe as a medium until somebody noticed. Bulk
+import takes **one** size for the whole batch, because a delivery is identical
+units and a per-row CSV column is one nobody fills in correctly; mixed stock is
+two imports.
+
+**Consequence — open, and it is a promise to customers.** `SAFE_SIZE_COPY`
+describes each size by what it is *for* and names **no measurements**, because
+the units are not specced or ordered. Real dimensions must replace that copy
+before launch: "fits a 15-inch laptop" is the kind of claim a customer measures
+us against. How many of each size to stock, and whether three is the right
+number, are equally open. Recorded in CLAUDE.md's open questions.

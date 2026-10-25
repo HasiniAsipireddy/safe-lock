@@ -57,18 +57,15 @@ phone still has no password-reset channel — the one real gap, tracked in
 ```bash
 npm install
 
-# Start PostgreSQL 16 and the development MQTT broker in Docker.
+# Start PostgreSQL 16 in Docker. Postgres binds host port 5433, NOT the default
+# 5432, so it cannot clash with a PostgreSQL service already installed on your
+# machine. The container creates two databases on first start: `safelock` and
+# `safelock_test`.
 #
-# Postgres binds host port 5433, NOT the default 5432, so it cannot clash with a
-# PostgreSQL service already installed on your machine. The container creates
-# two databases on first start: `safelock` and `safelock_test`.
-#
-# Mosquitto binds 1883 and is only needed for the device protocol
-# (`DEVICE_GATEWAY=mqtt`). It enforces the same per-device topic ACLs
-# production does — see docs/device-protocol.md §9. The default
-# `DEVICE_GATEWAY=mock` ignores it entirely, and the test suite never
-# connects to it.
-npm run db:up
+# `db:up` also starts the Mosquitto broker, which is NOT needed today: the MQTT
+# transport is parked (see "Website-only development" below). Start Postgres on
+# its own instead:
+docker compose up -d postgres
 
 # Backend config. The committed example already points at the Docker database.
 cp apps/api/.env.example apps/api/.env
@@ -93,6 +90,70 @@ npm run dev:api    # http://localhost:4000/api/v1
 npm run dev:web    # http://localhost:3000
 ```
 
+## Website-only development
+
+**This is the default and the current state of the project.** As of
+2026-10-24 the MQTT transport is **parked**: the website — signup, booking,
+payments, history, admin — is being finished first, and real hardware (an
+ESP32) is integrated afterwards. Nothing was deleted; `DEVICE_GATEWAY=mqtt` is
+simply refused at boot, in every environment.
+
+What that means in practice:
+
+- **No broker, anywhere.** No Mosquitto container, no `MQTT_URL`, no
+  `MQTT_USERNAME`, no `MQTT_PASSWORD`, no `DEVICE_COMMAND_HMAC_SECRET`. The API
+  opens no socket to a broker and there is no reconnect loop in the logs.
+- **The site still works end to end.** `DEVICE_GATEWAY=mock` is not a stub that
+  returns `true` — it signs a real ack with the device's own derived key and
+  hands it to the same inbound handler MQTT would, so lock and unlock really do
+  complete: 202 and poll, `lockState` moving only on an ack, `/history`,
+  notifications and the admin commands view all behave as designed.
+- **Nothing is deployable to production right now.** `mock` is refused in
+  production and `mqtt` is parked, so no value of `DEVICE_GATEWAY` boots there.
+  That is deliberate rather than an oversight: a rental product whose safes
+  cannot be physically opened has nothing to sell, and the boot failure says so
+  at the earliest possible moment.
+
+### PowerShell steps
+
+One command per line — PowerShell 5 has no `&&`.
+
+```powershell
+# Postgres only. `npm run db:up` would also start the broker, which is unused.
+docker compose up -d postgres
+
+# Confirm it is listening on 5433.
+Test-NetConnection -ComputerName localhost -Port 5433 -InformationLevel Quiet
+
+# apps/api/.env needs DEVICE_GATEWAY=mock and nothing else about hardware.
+# Edit it in your editor — do not echo it, the database URL holds a password.
+Select-String -Path apps\api\.env -Pattern "^DEVICE_GATEWAY"
+
+npm --workspace apps/api run prisma:migrate
+npm --workspace apps/api run db:seed
+
+# Two terminals.
+npm run dev:api
+npm run dev:web
+```
+
+Then add a safe to the inventory from `/admin` → Devices, or seed one, and book
+it. There is no provisioning step and no credential to issue: a mock device
+needs neither.
+
+### To resume the hardware phase
+
+Everything is still here. `docs/device-protocol.md` is the wire contract,
+`apps/api/src/lib/deviceGateway/mqtt.gateway.ts` the transport,
+`apps/api/src/lib/deviceProtocol/` the signing and key derivation,
+`apps/api/src/lib/deviceSimulator/` a simulated safe that can be told to
+misbehave — all with their tests passing. Un-parking is one line: set
+`MQTT_PARKED = false` in `apps/api/src/config/env.ts`. The ESP32 work then
+either implements `docs/device-protocol.md` as it stands, or joins the
+`DeviceGateway` seam as a third implementation beside `mock` and `mqtt`.
+
+See `docs/decisions.md` (2026-10-24) for the reasoning.
+
 ### Mock mode (no backend, no Razorpay)
 
 `apps/web/.env.local` ships with `NEXT_PUBLIC_USE_MOCK_API=true`, which routes
@@ -110,6 +171,47 @@ Demo account: `demo@example.com` / `Demo1234`.
 Mock mode is refused in production builds — `apps/web/src/lib/env.ts` throws at
 startup. A production build therefore needs `NEXT_PUBLIC_USE_MOCK_API=false`.
 
+### Test safes (dev only)
+
+A fresh database has no devices, so every size on `/book` shows unavailable and
+there is nothing to rent. This seeds 30 fake ones — 12 small, 12 medium, 6 large
+— serialled `SAFE-TESTS001`, `SAFE-TESTM001`, `SAFE-TESTL001` and so on:
+
+```powershell
+npm --workspace apps/api run db:seed:safes
+```
+
+Idempotent: re-running creates nothing and only stamps the fleet as seen again.
+
+**Refused when `NODE_ENV=production`, and on any `DEVICE_GATEWAY` but `mock`** —
+there is no override flag. These rows claim hardware that does not exist, and
+over a real transport nothing answers for them, so every completion lock would
+fail and the sweeper would move all 30 to `NEEDS_INSPECTION`.
+
+They go **offline after `DEVICE_OFFLINE_AFTER_SECONDS`** (180s by default), and
+that is not a bug in the seed: on the mock gateway the only thing that advances
+`lastSeenAt` is a command ack, because there is no device to send a heartbeat.
+Once a row is stale, lock and unlock both refuse it (`DEVICE_OFFLINE`), so it
+cannot recover by being used. Either re-run the seed when you come back, or hold
+the fleet online in a third terminal:
+
+```powershell
+npm --workspace apps/api run db:seed:safes -- --heartbeat
+```
+
+To remove them:
+
+```powershell
+npm --workspace apps/api run db:cleanup-safes
+```
+
+That deletes the safes nobody has ever booked and **retires** the rest.
+`Booking.device` is `onDelete: Restrict` on purpose — a booking is the record of
+a contract and must outlive the hardware — so a safe with any booking history
+cannot be deleted without destroying that record. Retiring is what the admin
+panel does, and it revokes the credential with it. Nothing whose serial lacks
+the `SAFE-TEST` prefix is touched.
+
 ## Everyday commands
 
 ```bash
@@ -120,6 +222,8 @@ npm --workspace apps/api test
 npm --workspace apps/api run prisma:migrate       # prisma migrate dev
 npm --workspace apps/api run prisma:studio
 npm --workspace apps/api run db:seed              # create/update the ADMIN
+npm --workspace apps/api run db:seed:safes        # 30 dev-only test safes
+npm --workspace apps/api run db:cleanup-safes     # remove them again
 npm --workspace apps/api run db:cleanup-tokens    # prune dead refresh tokens
 npm run db:up / db:down / db:reset                # db:reset wipes the volume
 ```
@@ -128,6 +232,122 @@ Dependencies are **pinned to exact versions** (`.npmrc` sets `save-exact=true`).
 `npm install <pkg>` will therefore record an exact version, not a caret — that
 is deliberate for a security-sensitive service. Upgrades should be their own
 reviewable commit.
+
+---
+
+## Running against Supabase
+
+Docker Postgres stays the database for development and for the test suite.
+This is for pointing the **API** at a hosted Supabase database — a pilot
+deployment, or a shared database two machines can reach.
+
+Mosquitto is unaffected and still runs in Docker.
+
+### 1. Two URLs, not one
+
+| Variable | Supabase pooler | Port | Used by |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | Transaction | 6543 | the API at runtime |
+| `DIRECT_URL` | Session | 5432 | `prisma migrate`, `prisma db seed` |
+
+Migrate cannot run through the transaction pooler: it holds an advisory lock
+for the whole run, runs `CREATE EXTENSION`, and wraps DDL in long transactions,
+none of which survive a pooler that can move you to a different backend between
+statements. `prisma.config.ts` refuses a 6543 URL with a message saying so
+rather than half-applying a migration.
+
+Use the **session pooler** for `DIRECT_URL`, not the direct host
+(`db.[PROJECT-REF].supabase.co`) — that one is IPv6-only and fails from most
+IPv4 networks.
+
+Both URLs need `sslmode=require`. Get them from Project Settings → Database →
+Connection string; the exact shapes are in `apps/api/.env.example`.
+
+### 2. Set the environment
+
+Put the two URLs in `apps/api/.env`. **Leave `TEST_DATABASE_URL` pointing at
+Docker** — the suite truncates every table, and it refuses to start if that
+variable names a non-local host.
+
+```powershell
+# Edit apps/api/.env in your editor: set DATABASE_URL and DIRECT_URL.
+# Do not echo them into the terminal — the password is in them.
+notepad apps\api\.env
+```
+
+### 3. Apply the schema
+
+```powershell
+cd apps\api
+npx prisma migrate deploy
+```
+
+Eighteen migrations, including `CREATE EXTENSION IF NOT EXISTS btree_gist`
+(needed by the booking overlap constraint) and the Row Level Security
+migration described below. `migrate deploy` only applies what is pending and
+never resets anything.
+
+### 4. Create the admin account
+
+`SEED_ADMIN_PASSWORD` must be 12+ characters. The seed reads these from
+`apps/api/.env`, so set them there rather than on the command line, where they
+would land in your PowerShell history.
+
+```powershell
+cd apps\api
+npm run db:seed
+```
+
+### 5. Start the API and check it
+
+```powershell
+npm run dev:api
+```
+
+```powershell
+# In a second terminal. Expect exactly {"status":"ok"}.
+curl.exe http://localhost:4000/api/v1/health
+```
+
+`/health` runs `SELECT 1` with a 2-second timeout, so it is a real check of the
+pooled connection and not just of the process being alive. The body carries
+nothing else — no database name, no timings, no gateway mode — because the
+endpoint is typically public.
+
+**`{"status":"degraded"}` always means Postgres**, never a device and never a
+broker: the gateway is not part of this check. Against a remote database the
+2-second timeout is usually what trips, so a cold pooler can report `degraded`
+on the first request and `ok` on the next.
+
+### Pool size
+
+`connection_limit` in `DATABASE_URL` sets the `node-postgres` pool size — see
+`src/lib/prisma.ts`, which reads it. Supabase's guides say `connection_limit=1`,
+which is advice for serverless functions that are frozen between invocations.
+This API is a long-lived process with an outbox worker and two sweepers, and a
+pool of one serialises every one of them behind each other. Start around 10 and
+keep it below the pooler's own limit.
+
+### The Data API must stay unused
+
+Supabase exposes every table in `public` over HTTP (PostgREST) using the
+project's `anon` key, which is public by design. This application never uses
+it, so migration `20261023000000_enable_rls_deny_data_api` enables Row Level
+Security on all fourteen application tables **with no policies**, and revokes
+the `anon` and `authenticated` grants as well. The result is that the Data API
+can read nothing.
+
+Prisma connects as `postgres`, which owns those tables and carries
+`BYPASSRLS`, so the application is unaffected — proven by
+`src/lib/rls.test.ts` rather than assumed.
+
+Two rules follow, and `docs/decisions.md` records them:
+
+- **Never add a permissive policy for `anon`.** It would open the table to the
+  public key.
+- **Never put the `service_role` key in this application.** It bypasses RLS
+  and would hand a leaked frontend key full table access; the app has no use
+  for it, since it holds the database password already.
 
 ---
 
@@ -221,8 +441,13 @@ browser, as part of a booking order response.
 
 ### 2. Set the rates
 
+Rates are **per safe size**. A renter picks a size before a duration, and the
+size decides the price.
+
 ```
-RENTAL_HOURLY_RATE_PAISE=10000   # paise/hour, so 10000 = ₹100/hour
+RENTAL_HOURLY_RATE_SMALL_PAISE=6000     # paise/hour, so 6000 = ₹60/hour
+RENTAL_HOURLY_RATE_MEDIUM_PAISE=10000   # ₹100/hour
+RENTAL_HOURLY_RATE_LARGE_PAISE=16000    # ₹160/hour
 RENTAL_MIN_HOURS=1
 RENTAL_MAX_HOURS=24
 
@@ -239,11 +464,29 @@ Every amount is computed server-side from these on every order. The client
 never sends an amount, and a request body that tries to is rejected by a
 `.strict()` schema.
 
-**These five are snapshotted onto each booking at creation**
-(`hourlyRatePaise`, `overstayMultiplierBps`, `graceMinutes`, `capHours`,
-`collectionWindowMinutes`), so changing any of them never re-prices a booking
+**These are snapshotted onto each booking at creation** — `safeSize`,
+`hourlyRatePaise`, `overstayMultiplierBps`, `graceMinutes`, `capHours`,
+`collectionWindowMinutes` — so changing any of them never re-prices a booking
 that is already running. The multiplier is basis points rather than a decimal
 because money must never touch a float.
+
+The **size** is snapshotted for the same reason as the rate: reclassifying a
+cabinet in the admin panel (Devices → Size) must not retroactively change what
+a renter is recorded as having booked. `Device.size` is a fact about inventory;
+`Booking.safeSize` is a fact about the contract. That is also why
+reclassification is allowed while a safe is occupied.
+
+`RENTAL_HOURLY_RATE_PAISE` — the single flat rate from before sizes existed —
+is still honoured as the default for the **medium** rate when that is unset, so
+an older `.env` keeps charging exactly what it charged. Every device that
+predates sizes was backfilled to `MEDIUM`, and medium is priced at the old flat
+rate, so the migration re-priced nothing.
+
+A renter who asks for a size with nothing free gets **409
+`SIZE_NOT_AVAILABLE`** naming the sizes that *are* — never a different size
+than the one they chose. `/book` disables an unavailable size up front, so that
+refusal is normally only reached when somebody takes the last one while the
+page is open.
 
 All of these are **provisional placeholders**, not business decisions — see the
 open questions in `CLAUDE.md`.
@@ -569,6 +812,15 @@ event carries a `failureReason` from a fixed enum. Neither ever contains the
 code.
 
 ## Hardware: the MQTT gateway and the simulator
+
+> **PARKED as of 2026-10-24.** `DEVICE_GATEWAY=mqtt` is refused at boot in
+> every environment, so none of the commands in this section will run as
+> written until it is un-parked — set `MQTT_PARKED = false` in
+> `apps/api/src/config/env.ts`. The code, the simulator, the dev broker and
+> every test are untouched and still pass. The decision was to finish the
+> website first and integrate an ESP32 afterwards; see **Website-only
+> development** above and `docs/decisions.md`. This section is kept verbatim
+> because it is the instruction sheet the hardware phase restarts from.
 
 The wire protocol is **`docs/device-protocol.md`** — approved 2026-10-19, and
 the document a firmware developer implements against. This section is how to
