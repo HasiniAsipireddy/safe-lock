@@ -893,8 +893,23 @@ There is no `NEXT_PUBLIC_RAZORPAY_KEY_ID`: the key id comes back from the
 booking order endpoints, so the browser holds no payment config of its own.
 
 ## Database hosting: Docker for dev, Supabase as an option
-- **Development and the entire test suite run on local Docker Postgres (5433).**
-  Supabase is a runtime option for the API, not a replacement for either.
+- **The entire test suite runs on local Docker Postgres (5433).** Supabase is a
+  runtime option for the **API**, not a replacement for the container.
+- **Moving the app to Supabase does not retire Docker**, and this is the
+  question that keeps coming up. The suite truncates all fourteen tables in
+  every `beforeEach` and runs `prisma migrate deploy` in `globalSetup` — both
+  unconditionally destructive, neither asking first — so
+  `src/test/localDatabaseGuard.ts` **refuses to start** when
+  `TEST_DATABASE_URL` names a host off its allow-list. A dev machine pointed at
+  Supabase therefore still runs `docker compose up -d postgres`, for
+  `safelock_test` alone. Running `DATABASE_URL`/`DIRECT_URL` on Supabase while
+  the suite runs on Docker is the **supported** arrangement — those two are
+  deliberately unchecked, because failing the tests over where the dev server
+  connects would make the guard worse than the problem. The only sound way to
+  drop the container is a native PostgreSQL 16 on localhost (allow-listed, but
+  on 5432 — compose uses 5433 precisely to avoid that clash). A second Supabase
+  project for tests is **not** an option: it needs the guard weakened, and then
+  one typo truncates production.
 - **Two URLs.** `DATABASE_URL` is the application's connection — on Supabase,
   the **transaction** pooler (6543). `DIRECT_URL` is for `prisma migrate` /
   `db seed` — the **session** pooler (5432). Migrate holds an advisory lock for
@@ -933,7 +948,9 @@ Target runtime is **Node 22 LTS** (`.nvmrc`, root `package.json` `engines`).
 Setup and Razorpay/webhook instructions are in `README.md`.
 ```
 npm install
-npm run db:up                                # PostgreSQL 16 in Docker, host port 5433
+npm run db:up                                # PostgreSQL 16 in Docker, host port 5433.
+                                             # STILL REQUIRED on Supabase: `npm test`
+                                             # only ever runs against safelock_test.
 npm run dev:api                              # tsx watch, :4000  (separate terminal)
 npm run dev:web                              # next dev,   :3000  (separate terminal)
 npm --workspace apps/api run prisma:migrate  # prisma migrate dev

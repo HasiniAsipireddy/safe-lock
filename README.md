@@ -38,7 +38,9 @@ phone still has no password-reset channel — the one real gap, tracked in
 
 - **Node 22 LTS** (`.nvmrc`). Newer versions work but print an `EBADENGINE`
   warning — see `docs/decisions.md`.
-- **Docker** — the dev database runs in a container.
+- **Docker** — the dev database runs in a container. **Still required even if
+  you point the API at Supabase**: the test suite only ever runs against a
+  local database. See [Docker is still required](#docker-is-still-required).
 - npm 10+ (this repo uses npm workspaces, not pnpm).
 - **PostgreSQL with the `btree_gist` extension available.** The booking
   migration runs `CREATE EXTENSION IF NOT EXISTS btree_gist` itself, which the
@@ -228,6 +230,11 @@ npm --workspace apps/api run db:cleanup-tokens    # prune dead refresh tokens
 npm run db:up / db:down / db:reset                # db:reset wipes the volume
 ```
 
+`npm test` always runs against the **local** `safelock_test` database, whatever
+`DATABASE_URL` says — so `docker compose up -d postgres` is a prerequisite for
+it even on a machine whose API points at Supabase. See
+[Docker is still required](#docker-is-still-required).
+
 Dependencies are **pinned to exact versions** (`.npmrc` sets `save-exact=true`).
 `npm install <pkg>` will therefore record an exact version, not a caret — that
 is deliberate for a security-sensitive service. Upgrades should be their own
@@ -237,11 +244,61 @@ reviewable commit.
 
 ## Running against Supabase
 
-Docker Postgres stays the database for development and for the test suite.
 This is for pointing the **API** at a hosted Supabase database — a pilot
-deployment, or a shared database two machines can reach.
+deployment, or a shared database two machines can reach. It replaces the
+database the *running app* talks to, and nothing else.
 
-Mosquitto is unaffected and still runs in Docker.
+### Docker is still required
+
+**Moving to Supabase does not retire the Docker container.** The two have
+different jobs and no longer overlap:
+
+| | Database | Why |
+| --- | --- | --- |
+| `npm run dev:api` | Supabase (`DATABASE_URL`) | the running app |
+| `npm --workspace apps/api run prisma:migrate` | Supabase (`DIRECT_URL`) | migrations need a session |
+| `npm test` | **local Docker `safelock_test`** | see below |
+
+The suite cannot run against a hosted database, and that is enforced rather
+than advised. Every test file truncates all fourteen tables in `beforeEach`,
+and `globalSetup` runs `prisma migrate deploy`. Both are unconditionally
+destructive and neither asks first, so
+`apps/api/src/test/localDatabaseGuard.ts` refuses to start if
+`TEST_DATABASE_URL` names a host outside a small **allow-list** of local ones.
+It is an allow-list on purpose: a deny-list containing `supabase` would still
+be satisfied by a bare RDS hostname, and the cost of being wrong here is a
+production database.
+
+So a dev machine running against Supabase still needs Postgres locally, but
+only for `safelock_test`:
+
+```powershell
+docker compose up -d postgres
+```
+
+`DATABASE_URL` and `DIRECT_URL` pointing at Supabase while the suite runs
+against Docker is the **supported** arrangement — the guard deliberately does
+not check those two, because refusing to run the tests just because the dev
+server talks to a hosted database would make the guard a worse problem than the
+one it prevents. What stops Migrate from following them during a test run is
+`globalSetup`, which passes `PRISMA_DATABASE_URL` and strips both from the
+child's environment.
+
+**If you want Docker off the machine entirely**, there is one sound option and
+one to avoid:
+
+- **Install PostgreSQL 16 natively** and create a `safelock_test` database.
+  Nothing in the code changes — `localhost` is on the allow-list. Note the
+  compose file binds **5433** specifically to avoid clashing with a native
+  install, so a native Postgres would be on the default **5432** and
+  `TEST_DATABASE_URL` needs updating to match. The `btree_gist` extension must
+  be available (see Prerequisites).
+- **A second Supabase project for tests** — don't. It requires weakening the
+  guard, and from then on a single mistyped variable truncates production.
+
+Mosquitto is unrelated to any of this and is not needed today — the MQTT
+transport is parked, so `docker compose up -d postgres` is the only container
+worth starting.
 
 ### 1. Two URLs, not one
 
@@ -267,7 +324,8 @@ Connection string; the exact shapes are in `apps/api/.env.example`.
 
 Put the two URLs in `apps/api/.env`. **Leave `TEST_DATABASE_URL` pointing at
 Docker** — the suite truncates every table, and it refuses to start if that
-variable names a non-local host.
+variable names a non-local host. Changing all three together is the mistake the
+guard exists to catch.
 
 ```powershell
 # Edit apps/api/.env in your editor: set DATABASE_URL and DIRECT_URL.
