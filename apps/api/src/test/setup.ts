@@ -1,6 +1,19 @@
 import { afterAll, beforeEach } from 'vitest';
 import { prisma } from '../lib/prisma';
 import { drainDeviceAcks } from '../lib/deviceGateway';
+import { assertLocalTestDatabases } from './localDatabaseGuard';
+
+/**
+ * Checked again here, per file, and not only in `globalSetup`.
+ *
+ * `globalSetup` runs in its own process, so a `vitest` invocation that skips
+ * it — a single file run through an editor extension, a watch-mode worker
+ * restarted after the environment changed — would otherwise reach
+ * `resetDatabase()` with nothing having looked at the URL. The truncation is
+ * three lines below; this is the cheapest possible insurance against it
+ * running somewhere it should not.
+ */
+assertLocalTestDatabases();
 
 /**
  * Per-file test setup: a clean database before every test, and no network.

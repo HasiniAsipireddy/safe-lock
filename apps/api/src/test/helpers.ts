@@ -5,6 +5,7 @@ import {
   WHATSAPP_CONSENT_VERSION,
   bookingPricePaise,
   reservedUntilFrom,
+  type SafeSize,
 } from '@safelock/shared';
 import { createApp, type CreateAppOptions } from '../app';
 import { env } from '../config/env';
@@ -209,8 +210,10 @@ export async function seedDevice(
     online?: boolean;
     lastSeenAt?: Date | null;
     doorState?: 'CLOSED' | 'OPEN' | 'UNKNOWN';
+    /** Defaults to MEDIUM, matching the column default and the backfill. */
+    size?: SafeSize;
   } = {},
-): Promise<{ id: string; serialNumber: string }> {
+): Promise<{ id: string; serialNumber: string; size: SafeSize }> {
   deviceSequence += 1;
   const serialNumber =
     overrides.serialNumber ?? `SAFE-${String(deviceSequence).padStart(4, '0')}`;
@@ -228,23 +231,29 @@ export async function seedDevice(
             ? new Date()
             : null,
       doorState: overrides.doorState ?? 'CLOSED',
+      size: overrides.size ?? 'MEDIUM',
       // A device that has been provisioned, since every command is signed with
       // a key derived for it. The hash is of nothing in particular: no test
       // authenticates to a broker.
       credentialIssuedAt: new Date(),
       ...(overrides.createdAt ? { createdAt: overrides.createdAt } : {}),
     },
-    select: { id: true, serialNumber: true },
+    select: { id: true, serialNumber: true, size: true },
   });
 }
 
 /** Adds `count` devices, oldest first so the booking pick order is predictable. */
-export async function seedDevices(count: number): Promise<Array<{ id: string; serialNumber: string }>> {
-  const devices: Array<{ id: string; serialNumber: string }> = [];
+export async function seedDevices(
+  count: number,
+  overrides: { size?: SafeSize } = {},
+): Promise<Array<{ id: string; serialNumber: string; size: SafeSize }>> {
+  const devices: Array<{ id: string; serialNumber: string; size: SafeSize }> = [];
   const base = Date.now() - count * 1000;
 
   for (let index = 0; index < count; index += 1) {
-    devices.push(await seedDevice({ createdAt: new Date(base + index * 1000) }));
+    devices.push(
+      await seedDevice({ createdAt: new Date(base + index * 1000), ...overrides }),
+    );
   }
   return devices;
 }
@@ -278,22 +287,28 @@ export async function verifyUserPhone(userId: string): Promise<void> {
  * `{ phoneVerified: false }` to build the state that must be refused.
  */
 export async function createUserWithDevice(
-  options: { phoneVerified?: boolean; hours?: number } = {},
+  options: { phoneVerified?: boolean; hours?: number; size?: SafeSize } = {},
 ): Promise<{
   user: TestUser;
   deviceId: string;
   serialNumber: string;
   bookingId: string;
+  size: SafeSize;
 }> {
   const user = await createTestUser();
   if (options.phoneVerified !== false) await verifyUserPhone(user.id);
-  const device = await seedDevice();
+  const size = options.size ?? 'MEDIUM';
+  const device = await seedDevice({ size });
 
+  // The booking's snapshotted size matches the cabinet it is in, which is what
+  // the service guarantees. A test that wants them to disagree — an admin
+  // reclassifying mid-rental — sets them apart explicitly.
   const booking = await seedBooking({
     userId: user.id,
     deviceId: device.id,
     status: 'ACTIVE',
     hours: options.hours ?? 2,
+    safeSize: size,
   });
 
   return {
@@ -301,6 +316,7 @@ export async function createUserWithDevice(
     deviceId: device.id,
     serialNumber: device.serialNumber,
     bookingId: booking.id,
+    size,
   };
 }
 
@@ -370,9 +386,16 @@ export async function seedBooking(input: {
   overstayWaivedAt?: Date | null;
   completedAt?: Date | null;
   completionReason?: 'COLLECTED' | 'COLLECTION_WINDOW_LAPSED' | 'ADMIN_FORCE_COMPLETED' | null;
+  /**
+   * The size booked. Defaults to MEDIUM, which is what every device defaults
+   * to — so a test that does not care about sizes gets a booking whose size
+   * matches its safe, and the old flat rate.
+   */
+  safeSize?: SafeSize;
   rates?: Partial<ReturnType<typeof currentRates>>;
 }): Promise<{ id: string; endsAt: Date | null; reservedUntil: Date }> {
-  const rates = { ...currentRates(), ...input.rates };
+  const safeSize = input.safeSize ?? 'MEDIUM';
+  const rates = { ...currentRates(safeSize), ...input.rates };
   const status = input.status ?? 'ACTIVE';
   const hours = input.hours ?? 2;
   const startsAt = input.startsAt ?? new Date();
@@ -414,6 +437,7 @@ export async function seedBooking(input: {
       reservedUntil,
       pricePaise: bookingPricePaise(rates, hours),
       currency: rates.currency,
+      safeSize,
       hourlyRatePaise: rates.hourlyRatePaise,
       overstayMultiplierBps: rates.overstayMultiplierBps,
       graceMinutes: rates.graceMinutes,

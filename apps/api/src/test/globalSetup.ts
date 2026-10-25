@@ -1,5 +1,6 @@
 import { execSync } from 'node:child_process';
 import { config as loadDotenv } from 'dotenv';
+import { assertLocalTestDatabases } from './localDatabaseGuard';
 
 /**
  * Brings the test database's schema up to date once per run.
@@ -11,30 +12,30 @@ import { config as loadDotenv } from 'dotenv';
 export default function globalSetup(): void {
   loadDotenv();
 
-  const url = process.env.TEST_DATABASE_URL;
-  if (!url) {
-    throw new Error(
-      'TEST_DATABASE_URL is not set. Copy apps/api/.env.example to apps/api/.env and start ' +
-        'the database with `docker compose up -d`.',
-    );
-  }
+  // Refuses a non-local host as well as a non-`*_test` database name. The
+  // message explains which variable to fix; see localDatabaseGuard.ts.
+  assertLocalTestDatabases();
 
-  if (!/safelock_test/.test(url)) {
-    // The suite truncates every table between tests. Refuse to do that to a
-    // database that is not obviously the test one.
-    throw new Error(
-      `Refusing to run: TEST_DATABASE_URL does not point at a *_test database (${redactUrl(url)}).`,
-    );
-  }
+  const url = process.env.TEST_DATABASE_URL as string;
+
+  /**
+   * The child's environment is built rather than inherited.
+   *
+   * `prisma.config.ts` resolves its URL as
+   * `PRISMA_DATABASE_URL ?? DIRECT_URL ?? DATABASE_URL`, and on a machine set
+   * up for Supabase the latter two are hosted. Setting the override is enough
+   * today, but it is the kind of enough that survives exactly until someone
+   * reorders that expression — so the fallbacks are removed outright. Migrate
+   * cannot reach a hosted database from here even if the precedence changes.
+   */
+  const childEnv: NodeJS.ProcessEnv = { ...process.env, PRISMA_DATABASE_URL: url };
+  delete childEnv.DIRECT_URL;
+  delete childEnv.DATABASE_URL;
 
   // A single command string (rather than execFileSync with args + shell) keeps
   // Node from warning about unescaped arguments on Windows.
   execSync('npx prisma migrate deploy', {
     stdio: 'inherit',
-    env: { ...process.env, PRISMA_DATABASE_URL: url },
+    env: childEnv,
   });
-}
-
-function redactUrl(url: string): string {
-  return url.replace(/\/\/[^@]*@/, '//***@');
 }
