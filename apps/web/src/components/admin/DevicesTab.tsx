@@ -5,6 +5,8 @@ import {
   ADMIN_COMMAND_HISTORY_LIMIT,
   BULK_CREATE_MAX_ROWS,
   DEVICE_FLAG_COPY,
+  SAFE_SIZES,
+  SAFE_SIZE_COPY,
   SERIAL_NUMBER_HINT,
   type AdminCommandRow,
   type AdminDeviceRow,
@@ -12,6 +14,7 @@ import {
   type DeviceCredentialResponse,
   type DeviceStatus,
   type Paginated,
+  type SafeSize,
 } from '@safelock/shared';
 import { api } from '@/lib/api';
 import { toUserMessage } from '@/lib/apiError';
@@ -151,6 +154,11 @@ export function DevicesTab({ onInventoryChange }: { onInventoryChange?: () => vo
       key: 'serial',
       header: 'Serial',
       cell: (device) => <span className="font-mono font-semibold">{device.serialNumber}</span>,
+    },
+    {
+      key: 'size',
+      header: 'Size',
+      cell: (device) => <SizeCell device={device} onChanged={load} />,
     },
     {
       key: 'status',
@@ -609,20 +617,100 @@ function CredentialPanel({
   );
 }
 
+/**
+ * The size of one cabinet, editable in place.
+ *
+ * A `<select>` in the row rather than a dialog, because reclassifying is a
+ * correction — somebody typed the wrong thing, or the label on the shelf was
+ * read wrong — and a correction should cost one interaction. There is no
+ * confirmation step for the same reason: it changes no live booking (each
+ * snapshots its own size and rate), it is fully reversible, and it is audited
+ * with both the old and new value.
+ *
+ * Disabled for a retired safe, which the API also refuses: it will never be
+ * booked again, so the field would imply the inventory is being kept current
+ * when nothing depends on it.
+ */
+function SizeCell({
+  device,
+  onChanged,
+}: {
+  device: AdminDeviceRow;
+  onChanged: () => void;
+}) {
+  const toast = useToast();
+  const [saving, setSaving] = useState(false);
+  const retired = device.status === 'RETIRED';
+
+  async function change(size: SafeSize) {
+    if (size === device.size || saving) return;
+    setSaving(true);
+
+    try {
+      await api.patch(`/admin/devices/${device.id}/size`, { size });
+      toast.success(
+        `${device.serialNumber} is now ${SAFE_SIZE_COPY[size].label.toLowerCase()}. Live bookings are unchanged.`,
+      );
+      onChanged();
+    } catch (error) {
+      toast.error(toUserMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (retired) {
+    return (
+      <span className="text-slate-500 dark:text-slate-400">
+        {SAFE_SIZE_COPY[device.size].label}
+      </span>
+    );
+  }
+
+  return (
+    <select
+      aria-label={`Size of ${device.serialNumber}`}
+      value={device.size}
+      disabled={saving}
+      onChange={(event) => void change(event.target.value as SafeSize)}
+      className="min-h-9 rounded-lg border border-slate-300 bg-white px-2 text-sm text-slate-900 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+    >
+      {SAFE_SIZES.map((option) => (
+        <option key={option} value={option}>
+          {SAFE_SIZE_COPY[option].label}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 function AddDeviceForm({ onCreated }: { onCreated: () => void }) {
   const toast = useToast();
   const [serial, setSerial] = useState('');
+  /**
+   * No preselection, and the submit button stays disabled until a size is
+   * chosen.
+   *
+   * Defaulting to medium would be the convenient thing and the wrong one: size
+   * decides what the cabinet is rented at, so a silent default prices
+   * mis-registered stock incorrectly until somebody notices. Making it a
+   * deliberate choice costs one click.
+   */
+  const [size, setSize] = useState<SafeSize | ''>('');
   const [submitting, setSubmitting] = useState(false);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (submitting) return;
+    if (submitting || !size) return;
     setSubmitting(true);
 
     try {
-      await api.post('/admin/devices', { serialNumber: serial });
-      toast.success(`Added ${serial.trim().toUpperCase()} to the inventory.`);
+      await api.post('/admin/devices', { serialNumber: serial, size });
+      toast.success(
+        `Added ${serial.trim().toUpperCase()} (${SAFE_SIZE_COPY[size].label.toLowerCase()}) to the inventory.`,
+      );
       setSerial('');
+      setSize('');
       onCreated();
     } catch (error) {
       toast.error(toUserMessage(error));
@@ -646,12 +734,33 @@ function AddDeviceForm({ onCreated }: { onCreated: () => void }) {
             spellCheck={false}
           />
         </div>
+        <div className="sm:w-40">
+          <label
+            htmlFor="device-size"
+            className="block text-sm font-medium text-slate-900 dark:text-slate-100"
+          >
+            Size
+          </label>
+          <select
+            id="device-size"
+            value={size}
+            onChange={(event) => setSize(event.target.value as SafeSize | '')}
+            className="mt-1 min-h-12 w-full rounded-xl border border-slate-300 bg-white px-3 text-base text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          >
+            <option value="">Choose…</option>
+            {SAFE_SIZES.map((option) => (
+              <option key={option} value={option}>
+                {SAFE_SIZE_COPY[option].label}
+              </option>
+            ))}
+          </select>
+        </div>
         <Button
           type="submit"
           fullWidth={false}
           loading={submitting}
           loadingText="Adding…"
-          disabled={!serial.trim()}
+          disabled={!serial.trim() || !size}
           className="sm:w-auto"
         >
           Add
@@ -664,6 +773,8 @@ function AddDeviceForm({ onCreated }: { onCreated: () => void }) {
 function BulkAddForm({ onCompleted }: { onCompleted: () => void }) {
   const toast = useToast();
   const [text, setText] = useState('');
+  /** One size for the whole batch — a delivery is identical units. */
+  const [size, setSize] = useState<SafeSize | ''>('');
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<BulkCreateResult | null>(null);
 
@@ -676,13 +787,14 @@ function BulkAddForm({ onCompleted }: { onCompleted: () => void }) {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (submitting || tooMany || lines.length === 0) return;
+    if (submitting || tooMany || lines.length === 0 || !size) return;
     setSubmitting(true);
     setResult(null);
 
     try {
       const response = await api.post<BulkCreateResult>('/admin/devices/bulk', {
         serialNumbers: lines,
+        size,
       });
       setResult(response);
 
@@ -721,6 +833,27 @@ function BulkAddForm({ onCompleted }: { onCompleted: () => void }) {
           />
         </label>
 
+        <label className="flex flex-col gap-1.5 text-sm sm:max-w-xs">
+          <span className="font-semibold text-slate-700 dark:text-slate-300">
+            Size for every row
+          </span>
+          <select
+            value={size}
+            onChange={(event) => setSize(event.target.value as SafeSize | '')}
+            className="min-h-12 rounded-xl border border-slate-300 bg-white px-3 text-base text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          >
+            <option value="">Choose…</option>
+            {SAFE_SIZES.map((option) => (
+              <option key={option} value={option}>
+                {SAFE_SIZE_COPY[option].label}
+              </option>
+            ))}
+          </select>
+          <span className="text-xs text-slate-500 dark:text-slate-400">
+            Importing mixed stock? Do one import per size.
+          </span>
+        </label>
+
         <p
           className={
             tooMany
@@ -737,7 +870,7 @@ function BulkAddForm({ onCompleted }: { onCompleted: () => void }) {
           type="submit"
           loading={submitting}
           loadingText="Adding…"
-          disabled={lines.length === 0 || tooMany}
+          disabled={lines.length === 0 || tooMany || !size}
         >
           Add {lines.length > 0 ? `${lines.length} ` : ''}device{lines.length === 1 ? '' : 's'}
         </Button>

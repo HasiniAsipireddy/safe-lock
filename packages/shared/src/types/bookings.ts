@@ -7,6 +7,24 @@
  */
 
 /**
+ * How big a safe is, and therefore what it costs per hour.
+ *
+ * Three sizes, a closed set, and an **enum rather than a number of litres**:
+ * the price is per size, the inventory is stocked per size, and a renter
+ * chooses from a menu. A dimension field would invite arithmetic nobody wants
+ * — "which safes are at least 20 litres" is not a question this product asks,
+ * and it would make every price lookup a range query.
+ *
+ * Ordered small to large, which several places rely on: the booking page lists
+ * them in this order, and {@link SAFE_SIZES} is the one definition of that
+ * order so a new size cannot appear in a different place in each list.
+ */
+export type SafeSize = 'SMALL' | 'MEDIUM' | 'LARGE';
+
+/** Every size, smallest first. The canonical order for any list of sizes. */
+export const SAFE_SIZES: readonly SafeSize[] = ['SMALL', 'MEDIUM', 'LARGE'];
+
+/**
  * Where a booking is in its life.
  *
  * Six states, and the set is deliberately closed. Note what is **not** here: a
@@ -85,6 +103,17 @@ export type PaymentReviewReason =
  * because money must never touch a float.
  */
 export interface RateSnapshot {
+  /**
+   * The rate for **this booking's size**, copied at creation.
+   *
+   * Which is why introducing sizes needed no new snapshot field and no change
+   * to any pricing function: the snapshot already answered "what does this
+   * booking cost per hour", and size only changes where that number comes
+   * from. A live small booking keeps its small rate even if an admin later
+   * re-classifies the safe it is sitting in, because the number was copied
+   * rather than looked up — the same property that stops an env change
+   * re-pricing it.
+   */
   hourlyRatePaise: number;
   /** 10000 = 1.0×. 15000 = 1.5×. */
   overstayMultiplierBps: number;
@@ -110,6 +139,15 @@ export interface BookingSummary {
   effectiveStatus: BookingStatus;
   serialNumber: string;
   deviceId: string;
+  /**
+   * The size booked, snapshotted onto the booking rather than read from the
+   * device.
+   *
+   * Same reasoning as the rate beside it: an admin re-classifying a safe must
+   * not change what a running booking says the renter paid for. The device's
+   * current size is a fact about inventory; this is a fact about the contract.
+   */
+  safeSize: SafeSize;
   startsAt: string;
   /** Null while `PENDING_PAYMENT`: the clock starts when the money lands. */
   endsAt: string | null;
@@ -148,14 +186,72 @@ export interface CurrentBookingResponse {
   quote: BookingQuote;
 }
 
-/** What a new booking would cost, and the rules that would apply to it. */
+/**
+ * One size on offer: what it costs, and whether there is one to rent.
+ *
+ * `options` is a full price list rather than just `hourlyRatePaise`, because
+ * the booking page must never multiply: the server states the price of every
+ * (size, duration) pair it would accept, and the UI reads one off. That rule
+ * predates sizes — it is why `BookingQuote.options` existed — and sizes simply
+ * make it a price list per size instead of one list.
+ */
+export interface SafeSizeOffer {
+  size: SafeSize;
+  hourlyRatePaise: number;
+  /**
+   * Whether a safe of this size is free for the shortest bookable window
+   * **right now**.
+   *
+   * Advisory, and deliberately so: it is a read taken before the user has
+   * chosen a duration, and the authority is the exclusion constraint at
+   * creation. Its job is to stop the page offering a size that will certainly
+   * refuse — a disabled card with a reason beats a 409 after a duration has
+   * been chosen. A size that is free here can still be gone by the time the
+   * booking is submitted, which is what `SIZE_NOT_AVAILABLE` is for.
+   */
+  available: boolean;
+  /** Price per allowed duration at this size. Integer paise. */
+  options: Array<{ hours: number; pricePaise: number }>;
+  /** Per-hour overstay charge at this size. */
+  overstayHourlyPaise: number;
+}
+
+/**
+ * What a new booking would cost, and the rules that would apply to it.
+ *
+ * The flow the page implements is **size first, then hours**, so the payload is
+ * shaped for it: pick a size, then read its duration prices. Everything that
+ * does not vary by size — the grace period, the cap, the collection window —
+ * stays on `rates`, because stating it three times would invite the three
+ * copies to disagree.
+ */
 export interface BookingQuote {
+  /**
+   * The size-independent rules, plus a representative `hourlyRatePaise`.
+   *
+   * **The rate here is the medium one** and exists only so this type stays
+   * compatible with callers that predate sizes. Anything pricing a booking
+   * must read `sizes[].options`; see `overstayHourlyPaise` below.
+   */
   rates: RateSnapshot;
   minHours: number;
   maxHours: number;
-  /** Price per allowed duration, so the UI does no money arithmetic. */
+  /** Every size, smallest first, each with its own price list. */
+  sizes: SafeSizeOffer[];
+  /**
+   * Price per allowed duration **at the medium size**.
+   *
+   * Retained so nothing that read it before sizes existed silently breaks.
+   * New code reads the chosen size's `options` instead.
+   *
+   * @deprecated Use `sizes[].options`.
+   */
   options: Array<{ hours: number; pricePaise: number }>;
-  /** Per-hour overstay charge, derived from the rate and multiplier. */
+  /**
+   * Per-hour overstay charge **at the medium size**.
+   *
+   * @deprecated Use `sizes[].overstayHourlyPaise`.
+   */
   overstayHourlyPaise: number;
 }
 

@@ -48,11 +48,27 @@ export function normaliseSerial(raw: string): string {
 
 // --- Admin write bodies ------------------------------------------------------
 
+/**
+ * The size of a cabinet being registered or reclassified.
+ *
+ * **Required on create, with no default**, unlike the column — which defaults
+ * to `MEDIUM` only so the backfill of pre-existing rows had somewhere to land.
+ * An admin adding stock knows which shelf they are holding, and a silent
+ * default here would price a large safe as a medium until somebody noticed.
+ */
+export const deviceSizeSchema = z.enum(['SMALL', 'MEDIUM', 'LARGE'], {
+  message: 'Choose a size: small, medium or large',
+});
+
 export const createDeviceSchema = z
   .object({
     serialNumber: serialNumberSchema,
+    size: deviceSizeSchema,
   })
   .strict();
+
+/** `PATCH /admin/devices/:id/size` — reclassifying a cabinet already in stock. */
+export const updateDeviceSizeSchema = z.object({ size: deviceSizeSchema }).strict();
 
 export const bulkCreateDevicesSchema = z
   .object({
@@ -68,6 +84,14 @@ export const bulkCreateDevicesSchema = z
         BULK_CREATE_MAX_ROWS,
         `Too many rows: at most ${BULK_CREATE_MAX_ROWS} serial numbers per request`,
       ),
+    /**
+     * One size for the whole batch.
+     *
+     * A bulk import is a delivery of identical units, so a per-row size would
+     * be a CSV column nobody fills in correctly. Importing mixed stock is two
+     * imports.
+     */
+    size: deviceSizeSchema,
   })
   .strict();
 
@@ -180,6 +204,7 @@ export const listAuditQuerySchema = z.object({
 
 export type CreateDeviceInput = z.infer<typeof createDeviceSchema>;
 export type BulkCreateDevicesInput = z.infer<typeof bulkCreateDevicesSchema>;
+export type UpdateDeviceSizeInput = z.infer<typeof updateDeviceSizeSchema>;
 export type ListDevicesQuery = z.infer<typeof listDevicesQuerySchema>;
 export type ListUsersQuery = z.infer<typeof listUsersQuerySchema>;
 export type ListPaymentsQuery = z.infer<typeof listPaymentsQuerySchema>;

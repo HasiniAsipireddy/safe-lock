@@ -361,11 +361,12 @@ describe('a system lock nobody is waiting on', () => {
     const user = await createTestUser();
     await verifyUserPhone(user.id);
 
-    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 2 });
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 2, size: 'MEDIUM' });
 
-    // The only safe in the fleet is the escalated one.
-    expect(response.status).toBe(409);
-    expect(response.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+    // The only safe in the fleet is the escalated one — out of service, not
+    // occupied, so the refusal says so.
+    expect(response.status).toBe(503);
+    expect(response.body.error.code).toBe('NO_DEVICES_IN_SERVICE');
   });
 });
 

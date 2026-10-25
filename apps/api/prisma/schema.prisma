@@ -29,6 +29,18 @@ enum PaymentStatus {
 ///
 /// `ASSIGNED` is gone with the purchase model: a device is no longer owned by
 /// anybody, and occupancy is a property of its bookings.
+/// How big a safe is, and therefore what it costs per hour.
+/// Mirrors `SafeSize` in @safelock/shared.
+///
+/// An enum, not a volume: the price is per size, stock is counted per size, and
+/// a renter picks from a menu of three. A litres column would turn every price
+/// lookup into a range query to answer a question nobody asks.
+enum SafeSize {
+  SMALL
+  MEDIUM
+  LARGE
+}
+
 enum DeviceStatus {
   /// In the pool and bookable.
   AVAILABLE
@@ -431,6 +443,15 @@ model Device {
   id           String       @id @default(cuid())
   serialNumber String       @unique
   status       DeviceStatus @default(AVAILABLE)
+
+  /// How big this cabinet is. Drives the hourly rate and the booking pick.
+  ///
+  /// Defaults to `MEDIUM`, which is also what every row existing before this
+  /// column was added was backfilled to — the rate `MEDIUM` carries is the flat
+  /// rate those safes were already being rented at, so the backfill re-prices
+  /// nothing. An admin reclassifies from the Devices tab; doing so does **not**
+  /// change any live booking, which snapshots its own size and rate.
+  size SafeSize @default(MEDIUM)
   /// A safe ships locked, so a device in stock defaults to LOCKED and
   /// allocation re-asserts it. The UI must show the device's actual state,
   /// never "what the last button press implied" — hence lockStateUpdatedAt,
@@ -525,7 +546,13 @@ model Device {
   commands         Command[]
 
   /// Supports the "oldest AVAILABLE first" device pick.
+  ///
+  /// `size` leads because the pick now always filters on it — a renter asks for
+  /// a size before a duration — and `createdAt` trails so the chosen size is
+  /// still allocated oldest-first within itself. The two-column form above is
+  /// kept for the admin inventory list, which filters on status alone.
   @@index([status, createdAt])
+  @@index([status, size, createdAt])
 }
 
 /// One row per lock/unlock event, append-only.
@@ -1007,6 +1034,12 @@ model Booking {
   currency   String @default("INR")
 
   /// --- Rate snapshot. Config changes must never re-price a live booking. ---
+  ///
+  /// The size is part of the snapshot for exactly the same reason the rate is:
+  /// an admin re-classifying a cabinet mid-rental must not retroactively change
+  /// what the renter is recorded as having booked. `Device.size` is a fact about
+  /// inventory; this is a fact about the contract.
+  safeSize                SafeSize @default(MEDIUM)
   hourlyRatePaise         Int
   /// Basis points: 15000 = 1.5x. Never a float.
   overstayMultiplierBps   Int

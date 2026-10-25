@@ -4,6 +4,7 @@ import {
   bookingPricePaise,
   overstayHourlyPaise,
   reservedUntilFrom,
+  type SafeSize,
 } from '@safelock/shared';
 import { prisma } from '../../lib/prisma';
 import { resetRazorpayClient } from '../../lib/razorpay';
@@ -22,6 +23,7 @@ import {
 } from '../../test/helpers';
 import { resetRazorpayMock } from '../../test/razorpayMock';
 import { currentRates } from './booking.service';
+import { sweepBookings } from './booking.sweeper';
 
 vi.mock('razorpay', () => import('../../test/razorpayMock'));
 
@@ -36,9 +38,9 @@ function get(url: string, cookie: string) {
   return request(app()).get(url).set('Cookie', cookie);
 }
 
-/** Books a safe through the real endpoint. */
-async function book(user: TestUser, hours = 2) {
-  const response = await post('/api/v1/bookings', user.cookie).send({ hours });
+/** Books a safe through the real endpoint. Medium unless a test says otherwise. */
+async function book(user: TestUser, hours = 2, size: SafeSize = 'MEDIUM') {
+  const response = await post('/api/v1/bookings', user.cookie).send({ hours, size });
   expect(response.status).toBe(201);
   return response.body.booking as {
     id: string;
@@ -69,7 +71,7 @@ describe('GET /api/v1/bookings/current', () => {
     expect(response.status).toBe(200);
     expect(response.body.booking).toBeNull();
 
-    const rates = currentRates();
+    const rates = currentRates('MEDIUM');
     expect(response.body.quote).toMatchObject({
       minHours: env.RENTAL_MIN_HOURS,
       maxHours: env.RENTAL_MAX_HOURS,
@@ -116,7 +118,7 @@ describe('POST /api/v1/bookings', () => {
     const user = await createTestUser();
     const device = await seedDevice();
 
-    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 3 });
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 3, size: 'MEDIUM' });
 
     expect(response.status).toBe(201);
     expect(response.body.booking).toMatchObject({
@@ -125,7 +127,7 @@ describe('POST /api/v1/bookings', () => {
       deviceId: device.id,
       serialNumber: device.serialNumber,
       hours: 3,
-      pricePaise: bookingPricePaise(currentRates(), 3),
+      pricePaise: bookingPricePaise(currentRates('MEDIUM'), 3),
     });
 
     // The clock has not started: endsAt is null until the money lands.
@@ -145,7 +147,7 @@ describe('POST /api/v1/bookings', () => {
      */
     const provisionalEnd = new Date(row.startsAt.getTime() + 3 * 60 * 60 * 1000);
     expect(row.reservedUntil.getTime()).toBe(
-      reservedUntilFrom(currentRates(), provisionalEnd).getTime(),
+      reservedUntilFrom(currentRates('MEDIUM'), provisionalEnd).getTime(),
     );
   });
 
@@ -172,7 +174,10 @@ describe('POST /api/v1/bookings', () => {
     await seedDevice();
 
     for (const hours of [0, 25, 1.5, -1]) {
-      const response = await post('/api/v1/bookings', user.cookie).send({ hours });
+      const response = await post('/api/v1/bookings', user.cookie).send({
+        hours,
+        size: 'MEDIUM',
+      });
       expect(response.status, `hours=${hours}`).toBe(400);
     }
   });
@@ -183,7 +188,7 @@ describe('POST /api/v1/bookings', () => {
 
     await book(user, 1);
 
-    const second = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+    const second = await post('/api/v1/bookings', user.cookie).send({ hours: 1, size: 'MEDIUM' });
 
     expect(second.status).toBe(409);
     expect(second.body.error.code).toBe('BOOKING_ALREADY_EXISTS');
@@ -202,8 +207,22 @@ describe('POST /api/v1/bookings', () => {
       startsAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
     });
 
-    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1, size: 'MEDIUM' });
     expect(response.status).toBe(201);
+  });
+
+  /**
+   * An empty fleet is not a booking conflict, and saying "every safe is
+   * booked" when there is no safe at all is a sentence with no true reading.
+   */
+  it('says so plainly when no safes are set up at all', async () => {
+    const user = await createTestUser();
+
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1, size: 'MEDIUM' });
+
+    expect(response.status).toBe(503);
+    expect(response.body.error.code).toBe('NO_DEVICES_IN_SERVICE');
+    expect(response.body.error.message).not.toMatch(/booked|shorter/i);
   });
 
   it('refuses when every safe is taken', async () => {
@@ -213,10 +232,126 @@ describe('POST /api/v1/bookings', () => {
 
     await book(first, 2);
 
-    const response = await post('/api/v1/bookings', second.cookie).send({ hours: 2 });
+    const response = await post('/api/v1/bookings', second.cookie).send({ hours: 2, size: 'MEDIUM' });
 
     expect(response.status).toBe(409);
     expect(response.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+  });
+
+  /**
+   * The case that was broken in a dev database and had no test: one free safe,
+   * the shortest duration the product sells, and a 201.
+   *
+   * Worth its own test despite looking like the happy path every other case
+   * assumes, because the refusal it guards against was indistinguishable from
+   * "every safe is booked" — and the advice that refusal gave, to try a
+   * shorter booking, is impossible to follow at `RENTAL_MIN_HOURS`. A test
+   * that only ever books 2 hours cannot catch that.
+   */
+  it('books the shortest allowed duration when a safe is free', async () => {
+    const user = await createTestUser();
+    await seedDevice();
+
+    const response = await post('/api/v1/bookings', user.cookie).send({
+      hours: env.RENTAL_MIN_HOURS,
+      size: 'MEDIUM',
+    });
+
+    expect(response.status).toBe(201);
+    expect(response.body.booking.hours).toBe(env.RENTAL_MIN_HOURS);
+    expect(response.body.booking.status).toBe('PENDING_PAYMENT');
+  });
+
+  /**
+   * Never suggest a remedy the user has already taken.
+   *
+   * At the shortest duration "try a shorter booking" is not advice, it is a
+   * dead end — and the user reading it has no way to know the suggestion was
+   * generated without looking at what they asked for.
+   */
+  it('does not suggest a shorter booking when the shortest was already asked for', async () => {
+    const [occupant, waiting] = [await createTestUser(), await createTestUser()];
+    await seedDevice();
+    await book(occupant, env.RENTAL_MIN_HOURS);
+
+    const refused = await post('/api/v1/bookings', waiting.cookie).send({
+      hours: env.RENTAL_MIN_HOURS,
+      size: 'MEDIUM',
+    });
+
+    expect(refused.status).toBe(409);
+    expect(refused.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+    expect(refused.body.error.message).not.toMatch(/shorter/i);
+
+    // And the longer case still gets the suggestion that can actually work.
+    const longer = await post('/api/v1/bookings', waiting.cookie).send({ hours: 2, size: 'MEDIUM' });
+    expect(longer.body.error.message).toMatch(/shorter/i);
+  });
+
+  /**
+   * A hold is a promise with a deadline, and once the deadline passes the safe
+   * is free — **on the clock, not on the sweeper getting round to it**. Every
+   * other read in the system derives status from `now`; the pick is a read
+   * too, and a safe withheld for the rest of a sweep interval is a safe we
+   * refused to rent for no reason.
+   *
+   * Asserted both ways round: before the deadline the hold really does hold.
+   */
+  it('frees the safe as soon as an unpaid hold lapses, with no sweep in between', async () => {
+    const [first, second] = [await createTestUser(), await createTestUser()];
+    const device = await seedDevice();
+
+    const held = await book(first, env.RENTAL_MIN_HOURS);
+    expect(held.deviceId).toBe(device.id);
+
+    // While the hold stands, the safe is genuinely taken.
+    const tooSoon = await post('/api/v1/bookings', second.cookie).send({ hours: 1, size: 'MEDIUM' });
+    expect(tooSoon.status).toBe(409);
+    expect(tooSoon.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+
+    // Push the deadline into the past and run no sweeper.
+    await prisma.booking.update({
+      where: { id: held.id },
+      data: { holdExpiresAt: new Date(Date.now() - 60_000) },
+    });
+
+    const response = await post('/api/v1/bookings', second.cookie).send({ hours: 1, size: 'MEDIUM' });
+
+    expect(response.status).toBe(201);
+    expect(response.body.booking.deviceId).toBe(device.id);
+
+    // The booking path released it itself rather than waiting for a sweep,
+    // and it is EXPIRED_UNPAID — never COMPLETED, which would claim somebody
+    // collected their belongings.
+    const lapsed = await prisma.booking.findUniqueOrThrow({ where: { id: held.id } });
+    expect(lapsed.status).toBe('EXPIRED_UNPAID');
+    expect(lapsed.completionReason).toBeNull();
+  });
+
+  /**
+   * And the same thing once the sweeper has written it down, which is the path
+   * that actually runs in production.
+   */
+  it('frees the safe once a lapsed hold has been swept to EXPIRED_UNPAID', async () => {
+    const [first, second] = [await createTestUser(), await createTestUser()];
+    const device = await seedDevice();
+
+    const held = await book(first, env.RENTAL_MIN_HOURS);
+
+    await prisma.booking.update({
+      where: { id: held.id },
+      data: { holdExpiresAt: new Date(Date.now() - 60_000) },
+    });
+    const swept = await sweepBookings();
+    expect(swept.expired).toBe(1);
+
+    const response = await post('/api/v1/bookings', second.cookie).send({
+      hours: env.RENTAL_MIN_HOURS,
+      size: 'MEDIUM',
+    });
+
+    expect(response.status).toBe(201);
+    expect(response.body.booking.deviceId).toBe(device.id);
   });
 
   it('gives two users booking at once different safes', async () => {
@@ -224,8 +359,8 @@ describe('POST /api/v1/bookings', () => {
     await seedDevices(2);
 
     const [first, second] = await Promise.all([
-      post('/api/v1/bookings', a.cookie).send({ hours: 1 }),
-      post('/api/v1/bookings', b.cookie).send({ hours: 1 }),
+      post('/api/v1/bookings', a.cookie).send({ hours: 1, size: 'MEDIUM' }),
+      post('/api/v1/bookings', b.cookie).send({ hours: 1, size: 'MEDIUM' }),
     ]);
 
     expect(first.status).toBe(201);
@@ -238,10 +373,12 @@ describe('POST /api/v1/bookings', () => {
     const device = await seedDevice();
     await prisma.device.update({ where: { id: device.id }, data: { status: 'RETIRED' } });
 
-    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1, size: 'MEDIUM' });
 
-    expect(response.status).toBe(409);
-    expect(response.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+    // Not "every safe is booked": the fleet is a single retired unit, and no
+    // booking is involved in refusing it.
+    expect(response.status).toBe(503);
+    expect(response.body.error.code).toBe('NO_DEVICES_IN_SERVICE');
   });
 
   /**
@@ -256,10 +393,10 @@ describe('POST /api/v1/bookings', () => {
     const user = await createTestUser();
     await seedDevice({ online: false });
 
-    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1, size: 'MEDIUM' });
 
-    expect(response.status).toBe(409);
-    expect(response.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+    expect(response.status).toBe(503);
+    expect(response.body.error.code).toBe('NO_DEVICES_IN_SERVICE');
   });
 
   /**
@@ -275,10 +412,10 @@ describe('POST /api/v1/bookings', () => {
       lastSeenAt: new Date(Date.now() - (DEVICE_OFFLINE_AFTER_MS + 60_000)),
     });
 
-    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1, size: 'MEDIUM' });
 
-    expect(response.status).toBe(409);
-    expect(response.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+    expect(response.status).toBe(503);
+    expect(response.body.error.code).toBe('NO_DEVICES_IN_SERVICE');
   });
 
   /**
@@ -294,10 +431,10 @@ describe('POST /api/v1/bookings', () => {
     const user = await createTestUser();
     await seedDevice({ doorState: 'UNKNOWN' });
 
-    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1, size: 'MEDIUM' });
 
-    expect(response.status).toBe(409);
-    expect(response.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+    expect(response.status).toBe(503);
+    expect(response.body.error.code).toBe('NO_DEVICES_IN_SERVICE');
   });
 
   /**
@@ -317,7 +454,7 @@ describe('POST /api/v1/bookings', () => {
     });
     await seedDevice();
 
-    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+    const response = await post('/api/v1/bookings', user.cookie).send({ hours: 1, size: 'MEDIUM' });
 
     expect(response.status).toBe(201);
     expect(response.body.booking.deviceId).toBe(oldest.id);
@@ -332,7 +469,7 @@ describe('POST /api/v1/bookings', () => {
     const user = await createTestUser();
     const device = await seedDevice();
 
-    const created = await post('/api/v1/bookings', user.cookie).send({ hours: 1 });
+    const created = await post('/api/v1/bookings', user.cookie).send({ hours: 1, size: 'MEDIUM' });
     expect(created.status).toBe(201);
 
     await prisma.device.update({
@@ -486,7 +623,7 @@ describe('POST /api/v1/bookings/:id/cancel', () => {
     expect(response.body.booking.status).toBe('CANCELLED');
 
     // The safe is immediately bookable by someone else.
-    const rebooked = await post('/api/v1/bookings', next.cookie).send({ hours: 2 });
+    const rebooked = await post('/api/v1/bookings', next.cookie).send({ hours: 2, size: 'MEDIUM' });
     expect(rebooked.status).toBe(201);
     expect(rebooked.body.booking.deviceId).toBe(booking.deviceId);
   });
@@ -568,7 +705,7 @@ describe('POST /api/v1/bookings/:id/collect', () => {
     expect(device.status).toBe('AVAILABLE');
 
     const nextRenter = await createTestUser();
-    const refused = await post('/api/v1/bookings', nextRenter.cookie).send({ hours: 1 });
+    const refused = await post('/api/v1/bookings', nextRenter.cookie).send({ hours: 1, size: 'MEDIUM' });
     expect(refused.status).toBe(409);
     expect(refused.body.error.code).toBe('NO_DEVICES_AVAILABLE');
   });
@@ -711,7 +848,7 @@ describe('booking orders', () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({
-      amount: bookingPricePaise(currentRates(), 3),
+      amount: bookingPricePaise(currentRates('MEDIUM'), 3),
       currency: 'INR',
       purpose: 'BOOKING',
       keyId: env.RAZORPAY_KEY_ID,
@@ -777,7 +914,7 @@ describe('booking orders', () => {
     expect(response.status).toBe(200);
     expect(response.body.purpose).toBe('OVERSTAY');
     // Two chargeable hours at the overstay rate.
-    expect(response.body.amount).toBe(2 * overstayHourlyPaise(currentRates()));
+    expect(response.body.amount).toBe(2 * overstayHourlyPaise(currentRates('MEDIUM')));
 
     const expiresAt = new Date(response.body.quoteExpiresAt as string);
     const ttlMs = expiresAt.getTime() - Date.now();

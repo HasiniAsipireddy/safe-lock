@@ -12,6 +12,7 @@ import type {
   DeviceStatus,
   DeviceSummary,
   DoorState,
+  SafeSize,
 } from '@safelock/shared';
 import { DEVICE_OFFLINE_AFTER_MS, env } from '../../config/env';
 import { snapshotOf, type BookingRow } from '../bookings/booking.mapper';
@@ -28,6 +29,7 @@ import { snapshotOf, type BookingRow } from '../bookings/booking.mapper';
 export const DEVICE_SUMMARY_SELECT = {
   id: true,
   serialNumber: true,
+  size: true,
   lockState: true,
   lockStateUpdatedAt: true,
   online: true,
@@ -47,6 +49,7 @@ export const DEVICE_SUMMARY_SELECT = {
 export const ADMIN_DEVICE_SELECT = {
   id: true,
   serialNumber: true,
+  size: true,
   status: true,
   lockState: true,
   lockStateUpdatedAt: true,
@@ -119,6 +122,7 @@ export const ADMIN_DEVICE_SELECT = {
 interface DeviceSummaryRow {
   id: string;
   serialNumber: string;
+  size: SafeSize;
   lockState: 'LOCKED' | 'UNLOCKED' | 'UNKNOWN';
   lockStateUpdatedAt: Date | null;
   online: boolean;
@@ -157,6 +161,7 @@ export function toDeviceSummary(
   return {
     id: device.id,
     serialNumber: device.serialNumber,
+    size: device.size,
     lockState: device.lockState,
     lockStateUpdatedAt: device.lockStateUpdatedAt
       ? device.lockStateUpdatedAt.toISOString()

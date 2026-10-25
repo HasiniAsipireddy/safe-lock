@@ -3,6 +3,7 @@ import {
   bulkCreateDevicesSchema,
   clearInspectionSchema,
   createDeviceSchema,
+  updateDeviceSizeSchema,
   emptyBodySchema,
   forceCompleteBookingSchema,
   listAuditQuerySchema,
@@ -27,6 +28,7 @@ import {
   postClearPaymentReview,
   postDevice,
   postDevicesBulk,
+  patchDeviceSize,
   postDeviceCredential,
   postForceCompleteBooking,
   postRetireDevice,
@@ -63,7 +65,22 @@ export function createAdminRouter(limiters: Limiters): Router {
     limiters.adminWrite,
     validateBody(bulkCreateDevicesSchema),
     postDevicesBulk,
-  postDeviceCredential,
+  );
+
+  /**
+   * Reclassifies a cabinet's size.
+   *
+   * `PATCH`, not `POST`: it changes one field of an existing resource rather
+   * than creating anything. Allowed while the safe is occupied — a live
+   * booking snapshotted its own size and rate, so correcting a mislabelled
+   * shelf cannot re-price a running rental — and refused for a retired one,
+   * which will never be booked again.
+   */
+  router.patch(
+    '/devices/:id/size',
+    limiters.adminWrite,
+    validateBody(updateDeviceSizeSchema),
+    patchDeviceSize,
   );
 
   /**

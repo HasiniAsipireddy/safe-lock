@@ -1,5 +1,7 @@
 import {
   ERROR_CODES,
+  SAFE_SIZES,
+  SAFE_SIZE_COPY,
   bookingPricePaise,
   effectiveBookingStatus,
   overstayHourlyPaise,
@@ -9,8 +11,13 @@ import {
   type ExtensionAvailability,
   type ExtensionRefusalReason,
   type RateSnapshot,
+  type SafeSize,
 } from '@safelock/shared';
-import { DEVICE_OFFLINE_AFTER_MS, env } from '../../config/env';
+import {
+  DEVICE_OFFLINE_AFTER_MS,
+  RENTAL_HOURLY_RATE_PAISE_BY_SIZE,
+  env,
+} from '../../config/env';
 import { HttpError, conflict } from '../../lib/httpError';
 import { logger } from '../../lib/logger';
 import { prisma, type PrismaTransaction } from '../../lib/prisma';
@@ -48,11 +55,89 @@ import { cancelDeadlineMessages, cancelPending, scheduleFor } from './booking.me
 
 // --- Errors ------------------------------------------------------------------
 
-const noDevices = () =>
+/**
+ * Every safe is in service and occupied for the requested window.
+ *
+ * The advice is conditional on there being advice to give. "Try a shorter
+ * booking" is useless at the shortest duration the product sells — it names a
+ * remedy the user has already taken — so at `RENTAL_MIN_HOURS` the suggestion
+ * becomes the one thing that can actually change, which is when they come
+ * back.
+ */
+const noDevicesFree = (hours: number) =>
   conflict(
     ERROR_CODES.NO_DEVICES_AVAILABLE,
-    'Every safe is booked for that period. Please try a shorter booking or come back later.',
+    hours > env.RENTAL_MIN_HOURS
+      ? 'Every safe is booked for that period. Please try a shorter booking or come back later.'
+      : 'Every safe is booked for that period. Please try a later time or check back soon.',
   );
+
+/**
+ * Nothing is rentable at all, which is **not** the same fact and must not wear
+ * the same words.
+ *
+ * Saying "every safe is booked" when the truth is "no safe is reachable" is a
+ * false claim about our own fleet: it sends the user to retry a duration that
+ * was never the problem, and it hides an outage behind a message that reads
+ * like ordinary demand. A `503` so that monitoring sees it as the outage it
+ * is; the counts go to the log, never to the client, since how small the fleet
+ * is is nobody's business but ours.
+ */
+const noDevicesInService = (fleet: { registered: number; operable: number }) =>
+  new HttpError({
+    status: 503,
+    code: ERROR_CODES.NO_DEVICES_IN_SERVICE,
+    message:
+      fleet.registered === 0
+        ? 'No safes are set up yet. Please check back soon.'
+        : 'No safe is available to rent right now. This is a problem at our end, not with your booking. Please check back soon.',
+    logContext: { registeredDevices: fleet.registered, operableDevices: fleet.operable },
+  });
+
+/**
+ * The requested size is not available, but another size is.
+ *
+ * Its own error rather than `NO_DEVICES_AVAILABLE`, because "every safe is
+ * booked, try a shorter stay" is both false and discouraging when a large one
+ * is standing empty. The sizes that *are* free go in `fields` so the booking
+ * page can offer them as one click rather than making the user guess.
+ *
+ * `outOfStock` changes only the wording: a size we hold none of is not a size
+ * that will free up later, so promising "try again shortly" would be a promise
+ * about inventory we do not have.
+ */
+const sizeNotAvailable = (
+  size: SafeSize,
+  alternatives: readonly SafeSize[],
+  outOfStock: boolean,
+) => {
+  const requested = SAFE_SIZE_COPY[size].label.toLowerCase();
+  const offered = alternatives.map((other) => SAFE_SIZE_COPY[other].label.toLowerCase());
+  const last = offered.at(-1) ?? '';
+  const list =
+    offered.length === 1 ? last : `${offered.slice(0, -1).join(', ')} and ${last}`;
+
+  return new HttpError({
+    status: 409,
+    code: ERROR_CODES.SIZE_NOT_AVAILABLE,
+    message: outOfStock
+      ? `We do not have a ${requested} safe available. ${capitalise(list)} ${
+          offered.length === 1 ? 'is' : 'are'
+        } available for that period.`
+      : `Every ${requested} safe is booked for that period. ${capitalise(list)} ${
+          offered.length === 1 ? 'is' : 'are'
+        } available instead.`,
+    /**
+     * A machine-readable list beside the sentence, so the page can render
+     * buttons rather than parse prose. `fields` is the existing channel for
+     * "which input was the problem, and what would be accepted".
+     */
+    fields: { size: alternatives.join(',') },
+    logContext: { requestedSize: size, availableSizes: alternatives, outOfStock },
+  });
+};
+
+const capitalise = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
 
 const alreadyBooked = () =>
   conflict(
@@ -100,10 +185,19 @@ function isOverlapViolation(error: unknown): boolean {
 
 // --- Config ------------------------------------------------------------------
 
-/** The live rates, for quoting a **new** booking. Never for re-pricing one. */
-export function currentRates(): RateSnapshot {
+/**
+ * The live rates for one size, for quoting a **new** booking. Never for
+ * re-pricing one.
+ *
+ * Takes a size because the hourly rate is the only figure that varies by it —
+ * the grace period, the cap, the multiplier and the collection window are
+ * properties of the rental policy, not of the cabinet. Keeping them shared is
+ * what stops "the large safe has a different grace period" becoming true by
+ * accident.
+ */
+export function currentRates(size: SafeSize): RateSnapshot {
   return {
-    hourlyRatePaise: env.RENTAL_HOURLY_RATE_PAISE,
+    hourlyRatePaise: RENTAL_HOURLY_RATE_PAISE_BY_SIZE[size],
     overstayMultiplierBps: env.OVERSTAY_MULTIPLIER_BPS,
     graceMinutes: env.OVERSTAY_GRACE_MINUTES,
     capHours: env.OVERSTAY_CAP_HOURS,
@@ -112,28 +206,96 @@ export function currentRates(): RateSnapshot {
   };
 }
 
-/**
- * What a new booking would cost and the rules that would apply.
- *
- * The price of every allowed duration is computed here so the UI does no money
- * arithmetic of its own — and so the overstay rate can be stated plainly
- * *before* anyone pays, which is the point of showing it at all.
- */
-export function quote(): BookingQuote {
-  const rates = currentRates();
+/** Every allowed duration priced at one size. */
+function priceList(rates: RateSnapshot): Array<{ hours: number; pricePaise: number }> {
   const options: Array<{ hours: number; pricePaise: number }> = [];
 
   for (let hours = env.RENTAL_MIN_HOURS; hours <= env.RENTAL_MAX_HOURS; hours += 1) {
     options.push({ hours, pricePaise: bookingPricePaise(rates, hours) });
   }
 
+  return options;
+}
+
+/**
+ * What a new booking would cost and the rules that would apply.
+ *
+ * Every (size, duration) pair the server would accept is priced here so the UI
+ * does no money arithmetic of its own — and so the overstay rate can be stated
+ * plainly *before* anyone pays, which is the point of showing it at all.
+ *
+ * ## Why this reads the database now
+ * It used to be pure config. It takes an optional availability lookup because
+ * the page's first question is "which sizes can I have?", and a size card that
+ * cannot be booked should say so rather than lead somebody through a duration
+ * picker into a 409. Passing `null` gives the price list with every size
+ * marked available, which is what a caller with no database handy wants.
+ */
+export async function quote(options: { now?: Date } = {}): Promise<BookingQuote> {
+  const now = options.now ?? new Date();
+  const free = await availableSizes(now);
+
+  const sizes = SAFE_SIZES.map((size) => {
+    const rates = currentRates(size);
+
+    return {
+      size,
+      hourlyRatePaise: rates.hourlyRatePaise,
+      available: free.has(size),
+      options: priceList(rates),
+      overstayHourlyPaise: overstayHourlyPaise(rates),
+    };
+  });
+
+  // Medium, for the two deprecated fields that predate sizes.
+  const mediumRates = currentRates('MEDIUM');
+
   return {
-    rates,
+    rates: mediumRates,
     minHours: env.RENTAL_MIN_HOURS,
     maxHours: env.RENTAL_MAX_HOURS,
-    options,
-    overstayHourlyPaise: overstayHourlyPaise(rates),
+    sizes,
+    options: priceList(mediumRates),
+    overstayHourlyPaise: overstayHourlyPaise(mediumRates),
   };
+}
+
+/**
+ * Which sizes have at least one safe free for the shortest bookable window.
+ *
+ * **Advisory, and no locks taken.** The authority on whether a safe is free is
+ * the exclusion constraint at creation; this exists so the booking page can
+ * grey out a size instead of letting somebody pick a duration for one that is
+ * fully booked. It deliberately asks about `RENTAL_MIN_HOURS` rather than a
+ * duration the user has not chosen yet: the shortest window is the most
+ * permissive, so a size marked unavailable here is unavailable at every
+ * duration — which is the only direction in which being approximate is safe.
+ */
+async function availableSizes(now: Date): Promise<Set<SafeSize>> {
+  const minimumEnd = new Date(now.getTime() + env.RENTAL_MIN_HOURS * 60 * 60 * 1000);
+  const freshSince = new Date(now.getTime() - DEVICE_OFFLINE_AFTER_MS);
+  // The widest reservation the shortest booking could produce, so a size is
+  // not called free on a window narrower than one would actually claim.
+  const until = reservedUntilFrom(currentRates('MEDIUM'), minimumEnd);
+
+  const rows = await prisma.$queryRaw<Array<{ size: SafeSize }>>`
+    SELECT DISTINCT d."size"
+    FROM "Device" d
+    WHERE d."status" = 'AVAILABLE'
+      AND d."online" = true
+      AND d."lastSeenAt" IS NOT NULL
+      AND d."lastSeenAt" > ${freshSince}::timestamp
+      AND d."doorState" <> 'UNKNOWN'
+      AND NOT EXISTS (
+        SELECT 1 FROM "Booking" b
+        WHERE b."deviceId" = d."id"
+          AND b."status" IN ('PENDING_PAYMENT', 'ACTIVE', 'OVERSTAY')
+          AND tsrange(b."startsAt", b."reservedUntil", '[)')
+              && tsrange(${now}::timestamp, ${until}::timestamp, '[)')
+      )
+  `;
+
+  return new Set(rows.map((row) => row.size));
 }
 
 // --- Reads -------------------------------------------------------------------
@@ -209,10 +371,13 @@ export interface CreateBookingResult {
 export async function createBooking(input: {
   userId: string;
   hours: number;
+  size: SafeSize;
   now?: Date;
 }): Promise<CreateBookingResult> {
   const now = input.now ?? new Date();
-  const rates = currentRates();
+  // Priced from the requested size, and snapshotted below, so this booking's
+  // rate is fixed before a device is even chosen.
+  const rates = currentRates(input.size);
 
   if (input.hours < env.RENTAL_MIN_HOURS || input.hours > env.RENTAL_MAX_HOURS) {
     throw new HttpError({
@@ -235,7 +400,15 @@ export async function createBooking(input: {
       });
       if (live) throw alreadyBooked();
 
-      const deviceId = await pickAvailableDeviceId(tx, now, reservedUntilFrom(rates, provisionalEnd));
+      await releaseLapsedHolds(tx, now);
+
+      const deviceId = await pickAvailableDeviceId(
+        tx,
+        now,
+        reservedUntilFrom(rates, provisionalEnd),
+        input.hours,
+        input.size,
+      );
 
       const created = await tx.booking.create({
         data: {
@@ -250,7 +423,9 @@ export async function createBooking(input: {
           reservedUntil: reservedUntilFrom(rates, provisionalEnd),
           pricePaise: bookingPricePaise(rates, input.hours),
           currency: rates.currency,
-          // Snapshot, so later config changes never touch this booking.
+          // Snapshot, so later config changes never touch this booking — and
+          // so re-classifying the cabinet never changes what was booked.
+          safeSize: input.size,
           hourlyRatePaise: rates.hourlyRatePaise,
           overstayMultiplierBps: rates.overstayMultiplierBps,
           graceMinutes: rates.graceMinutes,
@@ -266,10 +441,78 @@ export async function createBooking(input: {
     return { booking: toBookingSummary(row, now) };
   } catch (error) {
     if (isUniqueViolation(error)) throw alreadyBooked();
-    // Two users racing for the last safe: the loser gets a clean answer.
-    if (isOverlapViolation(error)) throw noDevices();
+    // Two users racing for the last safe: the loser gets a clean answer. This
+    // one really is "taken" — the constraint fired on an overlap, so a safe
+    // was there and somebody else got it.
+    if (isOverlapViolation(error)) throw noDevicesFree(input.hours);
     throw error;
   }
+}
+
+/**
+ * Releases holds whose deadline has passed, in the booking's own transaction.
+ *
+ * Every other read in the system derives a booking's status from the clock
+ * (`effectiveBookingStatus`) and the sweeper only writes down what a read
+ * already knows. The pick cannot do that, for a reason worth recording: the
+ * safe is held by `Booking_device_no_overlap`, whose predicate is
+ * `status IN (…)`, and an exclusion constraint cannot consult `now()` — so
+ * ignoring a lapsed hold in the query would merely move the refusal from the
+ * pick to the constraint. The row has to actually be released.
+ *
+ * Which makes this the one place the booking path reconciles rather than
+ * derives, and it is the same conditional update the sweeper's first step
+ * performs — `status` is a precondition, so a payment landing in this instant
+ * cannot be overwritten. Without it a lapsed hold withholds a safe for up to
+ * `BOOKING_SWEEP_INTERVAL_MS`, which is the sweeper deciding something.
+ */
+async function releaseLapsedHolds(tx: PrismaTransaction, now: Date): Promise<void> {
+  await tx.booking.updateMany({
+    where: { status: 'PENDING_PAYMENT', holdExpiresAt: { lte: now } },
+    data: { status: 'EXPIRED_UNPAID', completedAt: now, reservedUntil: now },
+  });
+}
+
+/**
+ * Which **other** sizes have a safe free for this exact window.
+ *
+ * Runs only on the failure path, so it costs nothing in the normal case, and
+ * takes no locks: it answers "what should we offer this person instead", and a
+ * suggestion does not need to be reserved. The same window as the pick that
+ * just failed, rather than the minimum window {@link availableSizes} uses —
+ * here we know the duration the user actually asked for, so the offer can be
+ * true of it.
+ */
+async function freeSizesExcluding(
+  tx: PrismaTransaction,
+  from: Date,
+  until: Date,
+  freshSince: Date,
+  exclude: SafeSize,
+): Promise<SafeSize[]> {
+  const rows = await tx.$queryRaw<Array<{ size: SafeSize }>>`
+    SELECT DISTINCT d."size"
+    FROM "Device" d
+    WHERE d."status" = 'AVAILABLE'
+      AND d."size" <> ${exclude}::"SafeSize"
+      AND d."online" = true
+      AND d."lastSeenAt" IS NOT NULL
+      AND d."lastSeenAt" > ${freshSince}::timestamp
+      AND d."doorState" <> 'UNKNOWN'
+      AND NOT EXISTS (
+        SELECT 1 FROM "Booking" b
+        WHERE b."deviceId" = d."id"
+          AND b."status" IN ('PENDING_PAYMENT', 'ACTIVE', 'OVERSTAY')
+          AND tsrange(b."startsAt", b."reservedUntil", '[)')
+              && tsrange(${from}::timestamp, ${until}::timestamp, '[)')
+      )
+  `;
+
+  const found = new Set(rows.map((row) => row.size));
+
+  // Returned in the canonical small-to-large order, not whatever order the
+  // planner produced, so the sentence reads the same way every time.
+  return SAFE_SIZES.filter((size) => found.has(size));
 }
 
 /**
@@ -302,6 +545,10 @@ async function pickAvailableDeviceId(
   tx: PrismaTransaction,
   from: Date,
   until: Date,
+  /** Only ever used to word the refusal — never to choose a safe. */
+  hours: number,
+  /** The size the renter asked for. A hard filter, never a preference. */
+  size: SafeSize,
 ): Promise<string> {
   /**
    * The same two-part test `isDeviceOnline` applies: the device's own claim,
@@ -330,6 +577,11 @@ async function pickAvailableDeviceId(
     SELECT d."id"
     FROM "Device" d
     WHERE d."status" = 'AVAILABLE'
+      -- The requested size, and only it. A renter who asked for a small safe
+      -- is not handed a large one: they would be charged the small rate for
+      -- stock worth more, and a size nobody can book because it keeps being
+      -- given away as an upgrade is stock that earns nothing.
+      AND d."size" = ${size}::"SafeSize"
       AND d."online" = true
       AND d."lastSeenAt" IS NOT NULL
       AND d."lastSeenAt" > ${freshSince}::timestamp
@@ -348,8 +600,65 @@ async function pickAvailableDeviceId(
   `;
 
   const next = rows[0];
-  if (!next) throw noDevices();
-  return next.id;
+  if (next) return next.id;
+
+  /**
+   * Nothing matched — and *why* decides what the user is told.
+   *
+   * The query above folds five conditions into one empty result, so on its own
+   * it cannot distinguish a fully-booked fleet from a fleet that is entirely
+   * offline. One of those is the user's problem and one is ours. A second
+   * query, run only on the failure path, counts how many safes are rentable
+   * **ignoring bookings entirely**: if that is zero, no window of any length
+   * would have found one.
+   *
+   * It costs a count on a path that was about to throw, and it takes no locks.
+   */
+  const [fleet] = await tx.$queryRaw<
+    Array<{ registered: bigint; operable: bigint; operableAtSize: bigint }>
+  >`
+    SELECT
+      count(*) FILTER (WHERE d."status" <> 'RETIRED') AS registered,
+      count(*) FILTER (
+        WHERE d."status" = 'AVAILABLE'
+          AND d."online" = true
+          AND d."lastSeenAt" IS NOT NULL
+          AND d."lastSeenAt" > ${freshSince}::timestamp
+          AND d."doorState" <> 'UNKNOWN'
+      ) AS operable,
+      count(*) FILTER (
+        WHERE d."status" = 'AVAILABLE'
+          AND d."size" = ${size}::"SafeSize"
+          AND d."online" = true
+          AND d."lastSeenAt" IS NOT NULL
+          AND d."lastSeenAt" > ${freshSince}::timestamp
+          AND d."doorState" <> 'UNKNOWN'
+      ) AS "operableAtSize"
+    FROM "Device" d
+  `;
+
+  const registered = Number(fleet?.registered ?? 0);
+  const operable = Number(fleet?.operable ?? 0);
+  const operableAtSize = Number(fleet?.operableAtSize ?? 0);
+
+  if (operable === 0) throw noDevicesInService({ registered, operable });
+
+  /**
+   * Nothing of this size is rentable at all — we stock none, or every one is
+   * retired, inspecting or unreachable — while other sizes are fine.
+   *
+   * Told apart from "this size is booked out" because the remedy differs: no
+   * duration and no amount of waiting produces a size we do not have, so the
+   * only useful thing to say is which sizes exist. The counts stay in the log;
+   * how much stock we hold is nobody's business but ours.
+   */
+  const alternatives = await freeSizesExcluding(tx, from, until, freshSince, size);
+
+  if (alternatives.length > 0) {
+    throw sizeNotAvailable(size, alternatives, operableAtSize === 0);
+  }
+
+  throw noDevicesFree(hours);
 }
 
 // --- Activation (payment captured) -------------------------------------------
@@ -1110,4 +1419,11 @@ export async function adminWaiveOverstay(input: {
   };
 }
 
-export { bookingNotFound, noDevices, overstayDue, stateInvalid, isOverlapViolation };
+export {
+  bookingNotFound,
+  noDevicesFree,
+  noDevicesInService,
+  overstayDue,
+  stateInvalid,
+  isOverlapViolation,
+};

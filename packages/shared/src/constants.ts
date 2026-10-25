@@ -85,8 +85,39 @@ export const ERROR_CODES = {
   BOOKING_ALREADY_EXISTS: 'BOOKING_ALREADY_EXISTS',
   /** The action needs a booking in a state this one is not in. */
   BOOKING_STATE_INVALID: 'BOOKING_STATE_INVALID',
-  /** Every safe is booked for the requested window. */
+  /**
+   * Safes are in service, and every one of them is occupied for the requested
+   * window. The request is the thing that could change: a different duration
+   * or a later time may succeed.
+   */
   NO_DEVICES_AVAILABLE: 'NO_DEVICES_AVAILABLE',
+  /**
+   * Every safe **of the requested size** is occupied, but another size is
+   * free.
+   *
+   * Its own code rather than reusing `NO_DEVICES_AVAILABLE`, because the
+   * remedy is different and it is the only remedy the user can act on
+   * immediately: "every safe is booked, try a shorter stay" is wrong and
+   * discouraging when a large one is sitting there empty. The error body names
+   * the sizes that *are* free, so the page can offer them.
+   *
+   * It should also be **rare**: the quote marks a size unavailable before
+   * anyone picks a duration. This is the race — somebody took the last medium
+   * between the page loading and the booking being submitted — and the
+   * exclusion constraint is what makes it a clean refusal rather than a double
+   * booking.
+   */
+  SIZE_NOT_AVAILABLE: 'SIZE_NOT_AVAILABLE',
+  /**
+   * **No safe is currently rentable at all** — the fleet is empty, or every
+   * unit is retired, under inspection, unreachable, or not reporting its door
+   * sensor. Deliberately distinct from `NO_DEVICES_AVAILABLE`: nothing about
+   * the request is wrong and no duration would help, so telling someone to
+   * try a shorter booking would be advice that cannot work. A `503`, because
+   * a fleet nobody can rent is an outage and should not hide in the same
+   * bucket as an ordinary booking conflict.
+   */
+  NO_DEVICES_IN_SERVICE: 'NO_DEVICES_IN_SERVICE',
   /**
    * The device was taken by another booking between this one being created and
    * its payment arriving. The payment is flagged for a manual refund.
@@ -319,3 +350,36 @@ export const ADMIN_COMMAND_HISTORY_LIMIT = 20;
  * registered accounts.
  */
 export const GENERIC_LOGIN_ERROR = 'Invalid credentials. Please check your details and try again.';
+
+/**
+ * How each safe size is described to a renter, and to an admin.
+ *
+ * Here rather than in a component for the reason `NOTIFICATION_COPY` is: the
+ * API owns the fact (which size, what it costs), the UI owns the phrasing, and
+ * the booking page, the dashboard card and the admin inventory table must not
+ * drift into three different words for the same shelf.
+ *
+ * **`fits` deliberately names no measurements.** Writing "fits a 15-inch
+ * laptop" would be a claim about hardware that has not been specced — the
+ * units are not ordered yet, and a promise about what fits is the sort of
+ * thing a customer measures us against. These say what a size is *for*, which
+ * is true of any plausible cabinet, and `docs/decisions.md` records that real
+ * dimensions must replace them before launch.
+ */
+export const SAFE_SIZE_COPY: Record<
+  'SMALL' | 'MEDIUM' | 'LARGE',
+  { label: string; fits: string }
+> = {
+  SMALL: {
+    label: 'Small',
+    fits: 'A phone, a wallet, keys and documents.',
+  },
+  MEDIUM: {
+    label: 'Medium',
+    fits: 'A handbag, a camera or a couple of books.',
+  },
+  LARGE: {
+    label: 'Large',
+    fits: 'A backpack, a helmet or bulkier belongings.',
+  },
+};

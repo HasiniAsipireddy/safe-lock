@@ -272,7 +272,7 @@ describe('POST /api/v1/payments/webhook', () => {
       .post('/api/v1/bookings')
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', user.cookie)
-      .send({ hours: 2 });
+      .send({ hours: 2, size: 'MEDIUM' });
     expect(created.status).toBe(201);
 
     const bookingId: string = created.body.booking.id;

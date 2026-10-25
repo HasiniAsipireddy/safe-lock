@@ -23,11 +23,11 @@ import {
  */
 const ADMIN_ROUTES = [
   { method: 'get' as const, path: '/api/v1/admin/devices' },
-  { method: 'post' as const, path: '/api/v1/admin/devices', body: { serialNumber: 'SAFE-7777' } },
+  { method: 'post' as const, path: '/api/v1/admin/devices', body: { serialNumber: 'SAFE-7777', size: 'MEDIUM' } },
   {
     method: 'post' as const,
     path: '/api/v1/admin/devices/bulk',
-    body: { serialNumbers: ['SAFE-7778'] },
+    body: { serialNumbers: ['SAFE-7778'], size: 'MEDIUM' },
   },
   {
     method: 'post' as const,
@@ -217,7 +217,7 @@ describe('POST /api/v1/admin/devices', () => {
       .post('/api/v1/admin/devices')
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', admin.cookie)
-      .send({ serialNumber: '  safe-abcd  ' });
+      .send({ serialNumber: '  safe-abcd  ', size: 'MEDIUM' });
 
     expect(response.status).toBe(201);
     expect(response.body.device.serialNumber).toBe('SAFE-ABCD');
@@ -236,7 +236,7 @@ describe('POST /api/v1/admin/devices', () => {
       .post('/api/v1/admin/devices')
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', admin.cookie)
-      .send({ serialNumber: 'NOT-A-SERIAL!' });
+      .send({ serialNumber: 'NOT-A-SERIAL!', size: 'MEDIUM' });
 
     expect(response.status).toBe(400);
     expect(response.body.error.code).toBe('VALIDATION_ERROR');
@@ -251,7 +251,7 @@ describe('POST /api/v1/admin/devices', () => {
       .post('/api/v1/admin/devices')
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', admin.cookie)
-      .send({ serialNumber: 'safe-dup1' });
+      .send({ serialNumber: 'safe-dup1', size: 'MEDIUM' });
 
     expect(response.status).toBe(409);
     expect(response.body.error.code).toBe('DUPLICATE_SERIAL');
@@ -267,7 +267,7 @@ describe('POST /api/v1/admin/devices/bulk', () => {
       .post('/api/v1/admin/devices/bulk')
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', admin.cookie)
-      .send({ serialNumbers: ['SAFE-0002', 'SAFE-0001', 'bad', 'safe-0002'] });
+      .send({ serialNumbers: ['SAFE-0002', 'SAFE-0001', 'bad', 'safe-0002'], size: 'MEDIUM' });
 
     expect(response.status).toBe(201);
     expect(response.body).toMatchObject({ created: 1, duplicates: 2, invalid: 1 });
@@ -301,7 +301,7 @@ describe('POST /api/v1/admin/devices/bulk', () => {
       .post('/api/v1/admin/devices/bulk')
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', admin.cookie)
-      .send({ serialNumbers: ['SAFE-1111', 'SAFE-2222'] });
+      .send({ serialNumbers: ['SAFE-1111', 'SAFE-2222'], size: 'MEDIUM' });
 
     const audit = await prisma.auditLog.findFirst({
       where: { action: 'device.bulk_created' },
@@ -665,10 +665,12 @@ describe('POST /api/v1/admin/devices/:id/clear-inspection', () => {
       .post('/api/v1/bookings')
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', nextRenter.cookie)
-      .send({ hours: 1 });
+      .send({ hours: 1, size: 'MEDIUM' });
 
-    expect(refused.status).toBe(409);
-    expect(refused.body.error.code).toBe('NO_DEVICES_AVAILABLE');
+    // The safe is under inspection, so it is out of service rather than
+    // booked — and a renter must not be told to try a shorter booking for it.
+    expect(refused.status).toBe(503);
+    expect(refused.body.error.code).toBe('NO_DEVICES_IN_SERVICE');
 
     await request(app())
       .post(`/api/v1/admin/devices/${deviceId}/clear-inspection`)
@@ -680,7 +682,7 @@ describe('POST /api/v1/admin/devices/:id/clear-inspection', () => {
       .post('/api/v1/bookings')
       .set('Origin', TEST_ORIGIN)
       .set('Cookie', nextRenter.cookie)
-      .send({ hours: 1 });
+      .send({ hours: 1, size: 'MEDIUM' });
 
     expect(allowed.status).toBe(201);
     expect(allowed.body.booking.deviceId).toBe(deviceId);
@@ -1633,7 +1635,7 @@ describe('admin routes are covered by the Origin check', () => {
       .post('/api/v1/admin/devices')
       .set('Origin', 'https://evil.example.com')
       .set('Cookie', admin.cookie)
-      .send({ serialNumber: 'SAFE-EVIL' });
+      .send({ serialNumber: 'SAFE-EVIL', size: 'MEDIUM' });
 
     expect(response.status).toBe(403);
     expect(response.body.error.code).toBe('CSRF_ORIGIN_REJECTED');
@@ -1646,7 +1648,7 @@ describe('admin routes are covered by the Origin check', () => {
     const response = await request(app())
       .post('/api/v1/admin/devices')
       .set('Cookie', admin.cookie)
-      .send({ serialNumber: 'SAFE-NOORIGIN' });
+      .send({ serialNumber: 'SAFE-NOORIGIN', size: 'MEDIUM' });
 
     expect(response.status).toBe(403);
     expect(await prisma.device.count()).toBe(0);
@@ -1664,7 +1666,7 @@ describe('admin write rate limiting', () => {
         .post('/api/v1/admin/devices')
         .set('Origin', TEST_ORIGIN)
         .set('Cookie', admin.cookie)
-        .send({ serialNumber: serial });
+        .send({ serialNumber: serial, size: 'MEDIUM' });
 
     expect((await create('SAFE-RL01')).status).toBe(201);
     expect((await create('SAFE-RL02')).status).toBe(201);

@@ -33,17 +33,32 @@ export const bookingHoursSchema = z.coerce
   .min(BOOKING_HOURS_FLOOR, `Minimum booking is ${BOOKING_HOURS_FLOOR} hour`)
   .max(BOOKING_HOURS_CEILING, `Maximum booking is ${BOOKING_HOURS_CEILING} hours`);
 
+/** The three sizes, as a request-body value. */
+export const safeSizeSchema = z.enum(['SMALL', 'MEDIUM', 'LARGE']);
+
 /**
  * `POST /bookings`.
  *
- * **Carries no price and no times.** The duration is the only thing a client
- * chooses; the rate, the start and the end all come from the server. A body
- * with `pricePaise` or `endsAt` is rejected by `.strict()` rather than
- * silently ignored — the same rule `POST /payments/order` has always had.
+ * **Carries no price and no times.** The size and the duration are the only
+ * things a client chooses; the rate, the start and the end all come from the
+ * server. A body with `pricePaise` or `endsAt` is rejected by `.strict()`
+ * rather than silently ignored — the same rule `POST /payments/order` has
+ * always had, and the reason adding a size did not also add a price field: a
+ * client naming its own size is choosing from a menu, a client naming its own
+ * price is setting it.
  */
-export const createBookingSchema = z.object({ hours: bookingHoursSchema }).strict();
+export const createBookingSchema = z
+  .object({ hours: bookingHoursSchema, size: safeSizeSchema })
+  .strict();
 
-/** `POST /bookings/:id/extend`. Same rule: hours only. */
+/**
+ * `POST /bookings/:id/extend`. Still hours only, and deliberately **no size**.
+ *
+ * An extension buys more time in the safe the renter is already using — their
+ * belongings are in it. Accepting a size here would imply we could move them,
+ * and the price comes from the booking's own snapshot regardless, so a size in
+ * this body could only ever contradict the booking it extends.
+ */
 export const extendBookingSchema = z.object({ hours: bookingHoursSchema }).strict();
 
 /** `POST /bookings/:id/collect`, `/cancel`, and the order endpoints. */

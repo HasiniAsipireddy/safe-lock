@@ -6,6 +6,7 @@ import {
   type BookingStatus,
   type BookingSummary,
   type RateSnapshot,
+  type SafeSize,
 } from '@safelock/shared';
 
 /**
@@ -31,6 +32,7 @@ export const BOOKING_SELECT = {
   reservedUntil: true,
   pricePaise: true,
   currency: true,
+  safeSize: true,
   hourlyRatePaise: true,
   overstayMultiplierBps: true,
   graceMinutes: true,
@@ -57,6 +59,7 @@ export interface BookingRow {
   reservedUntil: Date;
   pricePaise: number;
   currency: string;
+  safeSize: SafeSize;
   hourlyRatePaise: number;
   overstayMultiplierBps: number;
   graceMinutes: number;
@@ -134,6 +137,7 @@ export function toBookingSummary(row: BookingRow, now = new Date()): BookingSumm
     effectiveStatus: effective,
     serialNumber: row.device.serialNumber,
     deviceId: row.deviceId,
+    safeSize: row.safeSize,
     startsAt: row.startsAt.toISOString(),
     endsAt: row.endsAt ? row.endsAt.toISOString() : null,
     holdExpiresAt: row.holdExpiresAt ? row.holdExpiresAt.toISOString() : null,

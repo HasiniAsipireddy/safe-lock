@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import {
+  SAFE_SIZE_COPY,
   formatInr,
   overstayHourlyPaise,
   type BookingOrderResponse,
@@ -116,8 +117,8 @@ function PendingBooking({
             Safe {booking.serialNumber} is held for you
           </h2>
           <p className="mt-1 text-sm text-slate-700 dark:text-slate-300">
-            {booking.hours} hour{booking.hours === 1 ? '' : 's'} ·{' '}
-            {formatInr(booking.pricePaise)}
+            {SAFE_SIZE_COPY[booking.safeSize].label} · {booking.hours} hour
+            {booking.hours === 1 ? '' : 's'} · {formatInr(booking.pricePaise)}
           </p>
         </div>
         <BookingStatusBadge status="PENDING_PAYMENT" />
@@ -285,6 +286,12 @@ function RunningBooking({
           </h2>
           <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">
             Safe {booking.serialNumber}
+          </p>
+          {/* The size the renter booked, from the booking's own snapshot — not
+              from the device, so re-classifying a cabinet mid-rental never
+              changes what this says they paid for. */}
+          <p className="text-sm text-slate-600 dark:text-slate-400">
+            {SAFE_SIZE_COPY[booking.safeSize].label} safe
           </p>
         </div>
         <BookingStatusBadge status={booking.effectiveStatus} />

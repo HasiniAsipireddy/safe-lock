@@ -1,6 +1,11 @@
 import type { PaymentStatus } from './payments';
 import type { UserRole } from './auth';
-import type { BookingStatus, PaymentPurpose, PaymentReviewReason } from './bookings';
+import type {
+  BookingStatus,
+  PaymentPurpose,
+  PaymentReviewReason,
+  SafeSize,
+} from './bookings';
 import type {
   CommandActor,
   CommandFailureCategory,
@@ -34,6 +39,15 @@ export type LockState = 'LOCKED' | 'UNLOCKED' | 'UNKNOWN';
 export interface DeviceSummary {
   id: string;
   serialNumber: string;
+  /**
+   * How big this cabinet is.
+   *
+   * Shown on the dashboard beside the serial, because a renter looking at
+   * "your safe" should be able to confirm they were given what they booked —
+   * and because a booking's `safeSize` is a snapshot, the two disagreeing is
+   * exactly the kind of thing worth being able to see.
+   */
+  size: SafeSize;
   lockState: LockState;
   /** ISO timestamp of the last confirmed lock-state change, or null. */
   lockStateUpdatedAt: string | null;
@@ -124,6 +138,8 @@ export interface UnlockRequestResponse {
 export interface AdminDeviceRow {
   id: string;
   serialNumber: string;
+  /** How big this cabinet is, and therefore which price list it is rented at. */
+  size: SafeSize;
   status: DeviceStatus;
   lockState: LockState;
   lockStateUpdatedAt: string | null;

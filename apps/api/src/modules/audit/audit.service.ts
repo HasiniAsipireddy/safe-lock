@@ -125,6 +125,14 @@ export const AUDIT_ACTIONS = {
   // --- Devices / allocation -------------------------------------------------
   DEVICE_CREATED: 'device.created',
   DEVICE_BULK_CREATED: 'device.bulk_created',
+  /**
+   * A cabinet was reclassified to a different size.
+   *
+   * Audited because it is the one device write that changes what future
+   * renters are **charged**, and "who made the large safes cheap" needs an
+   * answer. The row carries the old and new size, both enum values.
+   */
+  DEVICE_SIZE_CHANGED: 'device.size_changed',
   DEVICE_ALLOCATED: 'device.allocated',
   /** An allocation attempt that was refused. Metadata carries the error code. */
   DEVICE_ALLOCATION_FAILED: 'device.allocation.failed',

@@ -69,7 +69,7 @@ export function createBookingsRouter(limiters: Limiters): Router {
       const response: CurrentBookingResponse = {
         booking,
         extension: row ? await extensionAvailability(row, now) : null,
-        quote: quote(),
+        quote: await quote({ now }),
       };
       res.status(200).json(response);
     } catch (error) {
@@ -115,18 +115,23 @@ export function createBookingsRouter(limiters: Limiters): Router {
     validateBody(createBookingSchema),
     async (req, res, next) => {
       const userId = req.user!.id;
-      const { hours } = req.body as CreateBookingInput;
+      const { hours, size } = req.body as CreateBookingInput;
       const context = auditContext(req);
 
       try {
-        const { booking } = await createBooking({ userId, hours });
+        const { booking } = await createBooking({ userId, hours, size });
 
         await writeAudit({
           action: AUDIT_ACTIONS.BOOKING_CREATED,
           userId,
           deviceId: booking.deviceId,
           ...context,
-          metadata: { bookingId: booking.id, hours, pricePaise: booking.pricePaise },
+          metadata: {
+            bookingId: booking.id,
+            hours,
+            size,
+            pricePaise: booking.pricePaise,
+          },
         });
 
         res.status(201).json({ booking });
@@ -137,6 +142,10 @@ export function createBookingsRouter(limiters: Limiters): Router {
           ...context,
           metadata: {
             failed: true,
+            // The requested size is an enum value, so it is audit-safe and it
+            // is the one thing that makes a refusal diagnosable: a run of
+            // SIZE_NOT_AVAILABLE for one size is a stocking problem.
+            size,
             code: error instanceof HttpError ? error.code : 'INTERNAL_ERROR',
           },
         });

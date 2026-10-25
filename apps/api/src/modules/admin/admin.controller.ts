@@ -9,6 +9,7 @@ import type {
   ListDevicesQuery,
   ListPaymentsQuery,
   ListUsersQuery,
+  UpdateDeviceSizeInput,
   WaiveOverstayInput,
 } from '@safelock/shared';
 import { HttpError } from '../../lib/httpError';
@@ -74,20 +75,21 @@ export const postDevice: RequestHandler = async (req, res, next) => {
   const body = req.body as CreateDeviceInput;
 
   try {
-    const device = await deviceService.createDevice(body.serialNumber);
+    const device = await deviceService.createDevice(body.serialNumber, body.size);
 
     await writeAudit({
       action: AUDIT_ACTIONS.DEVICE_CREATED,
       userId: req.user!.id,
       deviceId: device.id,
       ...auditContext(req),
-      metadata: { serialNumber: device.serialNumber },
+      metadata: { serialNumber: device.serialNumber, size: device.size },
     });
 
     res.status(201).json({ device });
   } catch (error) {
     await auditFailure(req, AUDIT_ACTIONS.DEVICE_CREATED, error, {
       serialNumber: body?.serialNumber,
+      size: body?.size,
     });
     next(error);
   }
@@ -97,7 +99,7 @@ export const postDevicesBulk: RequestHandler = async (req, res, next) => {
   const body = req.body as BulkCreateDevicesInput;
 
   try {
-    const result = await deviceService.bulkCreateDevices(body.serialNumbers);
+    const result = await deviceService.bulkCreateDevices(body.serialNumbers, body.size);
 
     await writeAudit({
       action: AUDIT_ACTIONS.DEVICE_BULK_CREATED,
@@ -106,6 +108,7 @@ export const postDevicesBulk: RequestHandler = async (req, res, next) => {
       // Counts, not the serial list: a 500-row paste does not belong in a log.
       metadata: {
         submitted: body.serialNumbers.length,
+        size: body.size,
         created: result.created,
         duplicates: result.duplicates,
         invalid: result.invalid,
@@ -116,6 +119,46 @@ export const postDevicesBulk: RequestHandler = async (req, res, next) => {
   } catch (error) {
     await auditFailure(req, AUDIT_ACTIONS.DEVICE_BULK_CREATED, error, {
       submitted: body?.serialNumbers?.length ?? 0,
+    });
+    next(error);
+  }
+};
+
+/**
+ * Reclassifying a cabinet's size.
+ *
+ * Audited with both the old and the new value, because this is the one device
+ * write that changes what future renters are **charged** — and "who made the
+ * large safes cheap" needs an answer. Allowed while the safe is occupied: a
+ * live booking snapshotted its own size and rate, so nothing about the current
+ * rental moves.
+ */
+export const patchDeviceSize: RequestHandler = async (req, res, next) => {
+  const deviceId = routeParam(req, 'id');
+  const body = req.body as UpdateDeviceSizeInput;
+
+  try {
+    const before = await deviceService.getDeviceSize(deviceId);
+    const device = await deviceService.updateDeviceSize(deviceId, body.size);
+
+    await writeAudit({
+      action: AUDIT_ACTIONS.DEVICE_SIZE_CHANGED,
+      userId: req.user!.id,
+      deviceId,
+      ...auditContext(req),
+      metadata: {
+        changedByAdminId: req.user!.id,
+        serialNumber: device.serialNumber,
+        from: before,
+        to: device.size,
+      },
+    });
+
+    res.status(200).json({ device });
+  } catch (error) {
+    await auditFailure(req, AUDIT_ACTIONS.DEVICE_SIZE_CHANGED, error, {
+      deviceId,
+      to: body?.size,
     });
     next(error);
   }

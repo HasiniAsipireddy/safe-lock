@@ -193,10 +193,10 @@ describe('a payment that arrives after the hold lapsed', () => {
       userId: user.id,
       bookingId: booking.id,
       purpose: 'BOOKING',
-      amount: currentRates().hourlyRatePaise,
+      amount: currentRates('MEDIUM').hourlyRatePaise,
     });
 
-    await capture(payment.orderId, currentRates().hourlyRatePaise, 'evt_late_inspect');
+    await capture(payment.orderId, currentRates('MEDIUM').hourlyRatePaise, 'evt_late_inspect');
 
     const row = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(row.reviewReason).toBe('BOOKING_EXPIRED_DEVICE_TAKEN');
@@ -221,10 +221,10 @@ describe('a payment that arrives after the hold lapsed', () => {
       userId: user.id,
       bookingId: booking.id,
       purpose: 'BOOKING',
-      amount: currentRates().hourlyRatePaise,
+      amount: currentRates('MEDIUM').hourlyRatePaise,
     });
 
-    await capture(payment.orderId, currentRates().hourlyRatePaise, 'evt_cancelled');
+    await capture(payment.orderId, currentRates('MEDIUM').hourlyRatePaise, 'evt_cancelled');
 
     const row = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(row.status).toBe('PAID');
@@ -254,7 +254,7 @@ describe('a payment that arrives after the hold lapsed', () => {
       hours: 2,
     });
 
-    const amount = currentRates().hourlyRatePaise;
+    const amount = currentRates('MEDIUM').hourlyRatePaise;
     const payment = await seedPayment({
       userId: user.id,
       bookingId: booking.id,
@@ -297,7 +297,7 @@ describe('an overstay payment against an expired quote', () => {
     const { user, bookingId } = await createUserWithDevice();
     await pushIntoOverstay(bookingId, 2);
 
-    const fee = 2 * overstayHourlyPaise(currentRates());
+    const fee = 2 * overstayHourlyPaise(currentRates('MEDIUM'));
     const payment = await seedPayment({
       userId: user.id,
       bookingId,
@@ -330,7 +330,7 @@ describe('an overstay payment against an expired quote', () => {
     const { user, bookingId } = await createUserWithDevice();
 
     // Quoted at one hour, but by capture time three have accrued.
-    const quotedFee = overstayHourlyPaise(currentRates());
+    const quotedFee = overstayHourlyPaise(currentRates('MEDIUM'));
     const payment = await seedPayment({
       userId: user.id,
       bookingId,
@@ -370,7 +370,7 @@ describe('an overstay payment against an expired quote', () => {
 
     const { user, bookingId, deviceId } = await createUserWithDevice();
 
-    const quotedFee = overstayHourlyPaise(currentRates());
+    const quotedFee = overstayHourlyPaise(currentRates('MEDIUM'));
     const payment = await seedPayment({
       userId: user.id,
       bookingId,
@@ -422,7 +422,7 @@ describe('an overstay payment against an expired quote', () => {
       .set('Cookie', user.cookie)
       .send({});
     expect(requote.status).toBe(200);
-    expect(requote.body.amount).toBe(4 * overstayHourlyPaise(currentRates()));
+    expect(requote.body.amount).toBe(4 * overstayHourlyPaise(currentRates('MEDIUM')));
   });
 
   /**
@@ -438,7 +438,7 @@ describe('an overstay payment against an expired quote', () => {
     const { user, bookingId } = await createUserWithDevice();
     await pushIntoOverstay(bookingId, 1);
 
-    const fee = overstayHourlyPaise(currentRates());
+    const fee = overstayHourlyPaise(currentRates('MEDIUM'));
     const payment = await seedPayment({
       userId: user.id,
       bookingId,
@@ -463,7 +463,7 @@ describe('an overstay payment against an expired quote', () => {
     const { user, bookingId } = await createUserWithDevice();
     await pushIntoOverstay(bookingId, 1);
 
-    const fee = overstayHourlyPaise(currentRates());
+    const fee = overstayHourlyPaise(currentRates('MEDIUM'));
     await prisma.booking.update({
       where: { id: bookingId },
       data: { status: 'OVERSTAY', overstaySettledAt: new Date(), overstayPaidPaise: fee },
@@ -496,7 +496,7 @@ describe('an overstay payment against an expired quote', () => {
       data: { status: 'OVERSTAY', overstayWaivedAt: new Date() },
     });
 
-    const fee = overstayHourlyPaise(currentRates());
+    const fee = overstayHourlyPaise(currentRates('MEDIUM'));
     const payment = await seedPayment({
       userId: user.id,
       bookingId,
@@ -524,7 +524,7 @@ describe('an extension payment', () => {
 
     const before = await prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
 
-    const amount = currentRates().hourlyRatePaise * 2;
+    const amount = currentRates('MEDIUM').hourlyRatePaise * 2;
     const payment = await seedPayment({
       userId: user.id,
       bookingId,
@@ -560,7 +560,7 @@ describe('an extension payment', () => {
 
     const before = await prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
 
-    const amount = currentRates().hourlyRatePaise;
+    const amount = currentRates('MEDIUM').hourlyRatePaise;
     const payment = await seedPayment({
       userId: user.id,
       bookingId,
@@ -588,7 +588,7 @@ describe('an extension payment', () => {
       data: { status: 'COMPLETED', completedAt: new Date(), completionReason: 'COLLECTED' },
     });
 
-    const amount = currentRates().hourlyRatePaise;
+    const amount = currentRates('MEDIUM').hourlyRatePaise;
     const payment = await seedPayment({
       userId: user.id,
       bookingId,

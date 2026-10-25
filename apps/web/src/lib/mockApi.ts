@@ -14,12 +14,14 @@
 import {
   DEVICE_EVENT_LABELS,
   ERROR_CODES,
+  SAFE_SIZES,
   GENERIC_LOGIN_ERROR,
   HISTORY_DEFAULT_LIMIT,
   HISTORY_MAX_LIMIT,
   NOTIFICATION_COPY,
   OTP_MAX_ATTEMPTS,
   OTP_RESEND_COOLDOWN_SECONDS,
+  type SafeSize,
   OTP_TTL_MS,
   PASSWORD_RESET_TTL_MS,
   PHONE_OTP_MAX_ATTEMPTS,
@@ -129,6 +131,28 @@ const MOCK_RATES: RateSnapshot = {
   currency: 'INR',
 };
 
+/**
+ * The mock's per-size hourly rates, mirroring the API's env defaults.
+ *
+ * Medium equals {@link MOCK_RATES}'s rate, exactly as the real config does, so
+ * a mock booking with no explicit size is priced identically to one made
+ * before sizes existed.
+ */
+const MOCK_SIZE_RATES: Record<SafeSize, number> = {
+  SMALL: 6_000,
+  MEDIUM: 10_000,
+  LARGE: 16_000,
+};
+
+/**
+ * Which sizes the mock pretends to have in stock.
+ *
+ * All three, so every path through the booking page is reachable in mock mode.
+ * Drop one from this set to exercise the disabled-card and
+ * `SIZE_NOT_AVAILABLE` branches by hand.
+ */
+const MOCK_SIZES_IN_STOCK: readonly SafeSize[] = ['SMALL', 'MEDIUM', 'LARGE'];
+
 const MOCK_MIN_HOURS = 1;
 const MOCK_MAX_HOURS = 24;
 /** Mirrors BOOKING_HOLD_MINUTES. */
@@ -193,6 +217,7 @@ export const MOCK_DEMO_CREDENTIALS = {
 interface MockDevice {
   id: string;
   serialNumber: string;
+  size: SafeSize;
   status: DeviceStatus;
   lockState: LockState;
   lockStateUpdatedAt: string | null;
@@ -216,14 +241,22 @@ interface MockDevice {
  */
 const devices: MockDevice[] = [
   makeMockDevice('SAFE-0001', 0),
-  makeMockDevice('SAFE-0002', 1),
-  { ...makeMockDevice('SAFE-0003', 2), status: 'RETIRED' },
+  makeMockDevice('SAFE-0002', 1, 'SMALL'),
+  { ...makeMockDevice('SAFE-0003', 2, 'LARGE'), status: 'RETIRED' },
+  // A free large one, so picking Large in mock mode actually works. Without it
+  // the only large cabinet is retired and the card would always be disabled.
+  makeMockDevice('SAFE-0004', 3, 'LARGE'),
 ];
 
-function makeMockDevice(serialNumber: string, ageIndex: number): MockDevice {
+function makeMockDevice(
+  serialNumber: string,
+  ageIndex: number,
+  size: SafeSize = 'MEDIUM',
+): MockDevice {
   return {
     id: `dev_mock_${serialNumber.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
     serialNumber,
+    size,
     status: 'AVAILABLE',
     // Mirrors the API: a safe in stock is locked, not of unknown state.
     lockState: 'LOCKED',
@@ -271,6 +304,8 @@ interface MockBooking {
   userId: string;
   deviceId: string;
   status: BookingStatus;
+  /** Snapshotted at creation, exactly as the API stores it. */
+  safeSize: SafeSize;
   hours: number;
   startsAt: string;
   endsAt: string | null;
@@ -350,6 +385,7 @@ function toMockBookingSummary(booking: MockBooking, now = new Date()): BookingSu
     effectiveStatus: mockEffectiveStatus(booking, now),
     serialNumber: device?.serialNumber ?? 'UNKNOWN',
     deviceId: booking.deviceId,
+    safeSize: booking.safeSize,
     startsAt: booking.startsAt,
     endsAt: booking.endsAt,
     holdExpiresAt: booking.holdExpiresAt,
@@ -370,17 +406,37 @@ function toMockBookingSummary(booking: MockBooking, now = new Date()): BookingSu
   };
 }
 
-function mockQuote(): BookingQuote {
+/** Every allowed duration priced at one size. */
+function mockPriceList(rates: RateSnapshot): Array<{ hours: number; pricePaise: number }> {
   const options: Array<{ hours: number; pricePaise: number }> = [];
   for (let hours = MOCK_MIN_HOURS; hours <= MOCK_MAX_HOURS; hours += 1) {
-    options.push({ hours, pricePaise: bookingPricePaise(MOCK_RATES, hours) });
+    options.push({ hours, pricePaise: bookingPricePaise(rates, hours) });
   }
+  return options;
+}
 
+/** The rates a given size is rented at. Only the hourly figure varies. */
+function mockRatesFor(size: SafeSize): RateSnapshot {
+  return { ...MOCK_RATES, hourlyRatePaise: MOCK_SIZE_RATES[size] };
+}
+
+function mockQuote(): BookingQuote {
   return {
     rates: MOCK_RATES,
     minHours: MOCK_MIN_HOURS,
     maxHours: MOCK_MAX_HOURS,
-    options,
+    sizes: SAFE_SIZES.map((size) => {
+      const rates = mockRatesFor(size);
+
+      return {
+        size,
+        hourlyRatePaise: rates.hourlyRatePaise,
+        available: MOCK_SIZES_IN_STOCK.includes(size),
+        options: mockPriceList(rates),
+        overstayHourlyPaise: overstayHourlyPaise(rates),
+      };
+    }),
+    options: mockPriceList(MOCK_RATES),
     overstayHourlyPaise: overstayHourlyPaise(MOCK_RATES),
   };
 }
@@ -1247,9 +1303,9 @@ function requireMockBooking(bookingId: string, userId: string): MockBooking {
  * constraint. It can only be an approximation: there is no concurrency in a
  * single browser tab, so this demonstrates the rule rather than enforcing it.
  */
-function pickMockDevice(from: Date, until: Date): MockDevice | undefined {
+function pickMockDevice(from: Date, until: Date, size: SafeSize): MockDevice | undefined {
   return devices
-    .filter((device) => device.status === 'AVAILABLE')
+    .filter((device) => device.status === 'AVAILABLE' && device.size === size)
     .filter(
       (device) =>
         !bookings.some(
@@ -1265,9 +1321,9 @@ function pickMockDevice(from: Date, until: Date): MockDevice | undefined {
 
 function handleMockCreateBooking(body: unknown): CreateBookingResponse {
   const account = requireAccount();
-  const input = (body ?? {}) as { hours?: unknown };
+  const input = (body ?? {}) as { hours?: unknown; size?: unknown };
 
-  const parsed = createBookingSchema.safeParse({ hours: input.hours });
+  const parsed = createBookingSchema.safeParse({ hours: input.hours, size: input.size });
   if (!parsed.success) {
     return fail(
       400,
@@ -1275,7 +1331,7 @@ function handleMockCreateBooking(body: unknown): CreateBookingResponse {
       parsed.error.issues[0]?.message ?? 'Choose how long you need the safe for.',
     );
   }
-  const { hours } = parsed.data;
+  const { hours, size } = parsed.data;
 
   if (liveBookingFor(account.user.id)) {
     return fail(
@@ -1289,14 +1345,20 @@ function handleMockCreateBooking(body: unknown): CreateBookingResponse {
   // `endsAt` stays null until the money lands, so the hold reserves the whole
   // intended window from a *provisional* end.
   const provisionalEnd = new Date(now.getTime() + hours * MS_PER_HOUR);
-  const reservedUntil = reservedUntilFrom(MOCK_RATES, provisionalEnd);
+  const rates = mockRatesFor(size);
+  const reservedUntil = reservedUntilFrom(rates, provisionalEnd);
 
-  const device = pickMockDevice(now, reservedUntil);
+  const device = pickMockDevice(now, reservedUntil, size);
   if (!device) {
+    // Worded exactly as the API words it: at the shortest duration there is no
+    // shorter booking to suggest. The mock fleet is always reachable, so this
+    // is the only one of the API's two refusals it can produce.
     return fail(
       409,
       ERROR_CODES.NO_DEVICES_AVAILABLE,
-      'Every safe is booked for that period. Please try a shorter booking or come back later.',
+      hours > MOCK_MIN_HOURS
+        ? 'Every safe is booked for that period. Please try a shorter booking or come back later.'
+        : 'Every safe is booked for that period. Please try a later time or check back soon.',
     );
   }
 
@@ -1306,14 +1368,15 @@ function handleMockCreateBooking(body: unknown): CreateBookingResponse {
     userId: account.user.id,
     deviceId: device.id,
     status: 'PENDING_PAYMENT',
+    safeSize: size,
     hours,
     startsAt: now.toISOString(),
     endsAt: null,
     holdExpiresAt: new Date(now.getTime() + MOCK_HOLD_MINUTES * MS_PER_MINUTE).toISOString(),
     reservedUntil: reservedUntil.toISOString(),
-    pricePaise: bookingPricePaise(MOCK_RATES, hours),
-    currency: MOCK_RATES.currency,
-    rates: MOCK_RATES,
+    pricePaise: bookingPricePaise(rates, hours),
+    currency: rates.currency,
+    rates,
     overstaySettledAt: null,
     overstayPaidPaise: 0,
     overstayWaivedAt: null,
@@ -1815,6 +1878,7 @@ function toAdminDevice(device: MockDevice): AdminDeviceRow {
   return {
     id: device.id,
     serialNumber: device.serialNumber,
+    size: device.size,
     status: device.status,
     lockState: device.lockState,
     lockStateUpdatedAt: device.lockStateUpdatedAt,
@@ -1880,6 +1944,7 @@ function toDeviceSummary(device: MockDevice): DeviceSummary {
   return {
     id: device.id,
     serialNumber: device.serialNumber,
+    size: device.size,
     lockState: device.lockState,
     lockStateUpdatedAt: device.lockStateUpdatedAt,
     online: device.online,

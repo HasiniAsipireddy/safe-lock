@@ -209,7 +209,14 @@ function NoBooking() {
         const response = await api.get<CurrentBookingResponse>('/bookings/current', {
           signal: controller.signal,
         });
-        setHourlyRatePaise(response.quote.rates.hourlyRatePaise);
+        /**
+         * The **cheapest** size, which is what makes the word "From" below
+         * true. Reading `quote.rates.hourlyRatePaise` would show the medium
+         * rate and call it a floor, which it is not.
+         */
+        setHourlyRatePaise(
+          Math.min(...response.quote.sizes.map((offer) => offer.hourlyRatePaise)),
+        );
       } catch {
         // The price is a nicety here; the button works regardless, and /book
         // loads the quote properly with its own error state.

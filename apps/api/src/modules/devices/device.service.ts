@@ -9,6 +9,7 @@ import {
   type BulkCreateRowResult,
   type ListDevicesQuery,
   type Paginated,
+  type SafeSize,
   normaliseSerial,
   serialNumberSchema,
 } from '@safelock/shared';
@@ -269,11 +270,21 @@ export async function retireDevice(deviceId: string): Promise<RetireDeviceResult
 
 // --- Inventory ---------------------------------------------------------------
 
-/** Creates one device. Serial is normalised by the schema before it gets here. */
-export async function createDevice(serialNumber: string): Promise<AdminDeviceRow> {
+/**
+ * Creates one device. Serial is normalised by the schema before it gets here.
+ *
+ * The size is required by the schema rather than defaulted, so registering
+ * stock is always a deliberate statement about which shelf it is: the column's
+ * `MEDIUM` default exists for the backfill of rows that predate sizes, not as
+ * a guess to apply to new hardware.
+ */
+export async function createDevice(
+  serialNumber: string,
+  size: SafeSize,
+): Promise<AdminDeviceRow> {
   try {
     const device = await prisma.device.create({
-      data: { serialNumber },
+      data: { serialNumber, size },
       select: ADMIN_DEVICE_SELECT,
     });
     return toAdminDeviceRow(device);
@@ -288,6 +299,61 @@ export async function createDevice(serialNumber: string): Promise<AdminDeviceRow
   }
 }
 
+/** The size on record, for an audit row that can say what changed. */
+export async function getDeviceSize(deviceId: string): Promise<SafeSize | null> {
+  const device = await prisma.device.findUnique({
+    where: { id: deviceId },
+    select: { size: true },
+  });
+
+  return device?.size ?? null;
+}
+
+/**
+ * Reclassifies a cabinet already in the inventory.
+ *
+ * **Deliberately does not touch any booking.** A live booking snapshotted its
+ * own `safeSize` and `hourlyRatePaise` at creation, so correcting a mislabelled
+ * shelf cannot retroactively change what a renter is recorded as having booked
+ * or what they were charged — the same property that stops an env change
+ * re-pricing a running rental. The new size applies to the *next* booking.
+ *
+ * Which is why this is allowed while a safe is occupied: the alternative is an
+ * admin unable to fix a data-entry error for up to 24 hours, and there is
+ * nothing to protect by refusing.
+ */
+export async function updateDeviceSize(
+  deviceId: string,
+  size: SafeSize,
+): Promise<AdminDeviceRow> {
+  const existing = await prisma.device.findUnique({
+    where: { id: deviceId },
+    select: { id: true, status: true },
+  });
+
+  if (!existing) throw notFound('No safe with that id.');
+
+  /**
+   * A retired safe is off the fleet and will never be booked again, so
+   * reclassifying one is a write with no effect — and accepting it would let
+   * the inventory list imply retired stock is being kept current.
+   */
+  if (existing.status === 'RETIRED') {
+    throw conflict(
+      ERROR_CODES.DEVICE_NOT_OPERABLE,
+      'This safe has been retired. Its size can no longer be changed.',
+    );
+  }
+
+  const device = await prisma.device.update({
+    where: { id: deviceId },
+    data: { size },
+    select: ADMIN_DEVICE_SELECT,
+  });
+
+  return toAdminDeviceRow(device);
+}
+
 /**
  * Bulk import, reported per row.
  *
@@ -296,7 +362,10 @@ export async function createDevice(serialNumber: string): Promise<AdminDeviceRow
  * both the duplicate check and insertion, so `safe-0001` and `SAFE-0001`
  * collide as the same device rather than creating two.
  */
-export async function bulkCreateDevices(rawSerials: string[]): Promise<BulkCreateResult> {
+export async function bulkCreateDevices(
+  rawSerials: string[],
+  size: SafeSize,
+): Promise<BulkCreateResult> {
   if (rawSerials.length > BULK_CREATE_MAX_ROWS) {
     // Also enforced by the zod schema; kept here so a direct service call
     // cannot bypass the cap.
@@ -368,7 +437,7 @@ export async function bulkCreateDevices(rawSerials: string[]): Promise<BulkCreat
     // skipDuplicates covers the narrow race where another admin inserts the
     // same serial between the check above and this write.
     await prisma.device.createMany({
-      data: toInsert.map((serialNumber) => ({ serialNumber })),
+      data: toInsert.map((serialNumber) => ({ serialNumber, size })),
       skipDuplicates: true,
     });
   }

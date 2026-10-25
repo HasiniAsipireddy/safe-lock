@@ -33,7 +33,7 @@ async function startOrder(
     .post('/api/v1/bookings')
     .set('Origin', TEST_ORIGIN)
     .set('Cookie', user.cookie)
-    .send({ hours });
+    .send({ hours, size: 'MEDIUM' });
   expect(created.status).toBe(201);
 
   const bookingId: string = created.body.booking.id;
