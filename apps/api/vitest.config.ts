@@ -57,6 +57,18 @@ export default defineConfig({
       DEVICE_COMMAND_KEY_VERSION: '1',
 
       /**
+       * Pinned, not inherited.
+       *
+       * Everything below assumes the suite runs on the mock gateway, and that
+       * used to hold only because no `.env` set `DEVICE_GATEWAY` and the
+       * schema default is `mock` — an invariant resting on the *absence* of a
+       * line in an untracked file. A developer pointing their local API at the
+       * dev broker would silently move the whole suite onto MQTT, where every
+       * command fails to publish instead of acking.
+       */
+      DEVICE_GATEWAY: 'mock',
+
+      /**
        * Broker settings, so `MqttDeviceGateway` can be *constructed and
        * started* in its unit test against a stubbed `mqtt.connect` — exactly
        * as the Cloud API WhatsApp client is unit-tested against a stubbed
