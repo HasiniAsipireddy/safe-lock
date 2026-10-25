@@ -20,17 +20,27 @@ export { MqttDeviceGateway } from './mqtt.gateway';
  * implementation is in use is a decision made here and nowhere else — no route
  * and no service knows.
  *
- * Resolved once at module load rather than per call: the MQTT gateway holds a
+ * Resolved once at module load rather than per call: a transport may hold a
  * broker connection, and reconnecting per command is not a thing to retrofit
  * later. Note that constructing it does **not** connect — that is `start`,
  * which the server calls, which is what keeps a broker connection out of the
  * test suite.
+ *
+ * ## `mock` is currently the only reachable case
+ * `MqttDeviceGateway` is **parked**, not deleted: the env schema refuses
+ * `DEVICE_GATEWAY=mqtt` in every environment while there is no hardware to
+ * talk to, so this switch cannot select it. The case stays here, and the class
+ * and its tests stay on disk, because the ESP32 work resumes from them rather
+ * than from a blank file — see `docs/decisions.md` (2026-10-24) and
+ * `docs/device-protocol.md`.
  */
 function resolveGateway(): DeviceGateway {
   switch (env.DEVICE_GATEWAY) {
     case 'mock':
       return new MockDeviceGateway();
     case 'mqtt':
+      // Unreachable while the transport is parked — the env schema refuses the
+      // value. Left wired so un-parking is one deletion in `env.ts`.
       return new MqttDeviceGateway();
     default:
       // Unreachable: the env schema is an enum. Kept so adding a value to that

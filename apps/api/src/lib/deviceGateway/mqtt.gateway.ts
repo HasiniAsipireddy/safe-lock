@@ -106,18 +106,23 @@ export class MqttDeviceGateway implements DeviceGateway {
       void handling.finally(() => this.inFlight.delete(handling));
     });
 
+    const endpoint = brokerEndpoint(url);
+
     client.on('error', (error) => {
       // Logged, never thrown: mqtt.js reconnects on its own, and an
       // unhandled error here would take the process down over a broker blip.
-      logger.error({ reason: error.message }, 'MQTT client error');
+      logger.error(
+        { ...endpoint, ...describeMqttError(error) },
+        'MQTT client error',
+      );
     });
 
     client.on('reconnect', () => {
-      logger.warn('Reconnecting to the MQTT broker');
+      logger.warn(endpoint, 'Reconnecting to the MQTT broker');
     });
 
     client.on('close', () => {
-      logger.warn('MQTT connection closed');
+      logger.warn(endpoint, 'MQTT connection closed');
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -127,7 +132,28 @@ export class MqttDeviceGateway implements DeviceGateway {
       };
       const onError = (error: Error) => {
         client.removeListener('connect', onConnect);
-        reject(new DeviceCommandError(`Could not connect to the broker: ${error.message}`));
+
+        /**
+         * Logged here as well as rejected, because the rejection is a single
+         * string and this is where the diagnosis lives.
+         *
+         * `server.ts` catches the rejection and logs `error.message` — which
+         * for the commonest failure of all, a broker that is simply not
+         * running on localhost, is the **empty string**: Node raises an
+         * `AggregateError` whose own message is blank and whose `errors` array
+         * holds the real `ECONNREFUSED` per address family. That produced the
+         * notorious `"reason": ""` log line, which says nothing at all.
+         */
+        logger.error(
+          { ...endpoint, ...describeMqttError(error) },
+          'Could not connect to the MQTT broker',
+        );
+
+        reject(
+          new DeviceCommandError(
+            `Could not connect to the broker: ${describeMqttError(error).reason}`,
+          ),
+        );
       };
 
       client.once('connect', onConnect);
@@ -285,4 +311,127 @@ export class MqttDeviceGateway implements DeviceGateway {
 function serverClientId(): string {
   const suffix = Math.random().toString(36).slice(2, 10);
   return `safelock-api-${suffix}`;
+}
+
+// --- Logging a broker failure usefully ---------------------------------------
+
+/** One underlying connection failure, as a log line's worth of fields. */
+interface MqttErrorCause {
+  code: string | null;
+  reason: string;
+  /** The address actually dialled. A host and port, never a credential. */
+  address: string | null;
+  port: number | null;
+}
+
+/** What we log about a broker failure. Never a username, password or URL. */
+export interface MqttErrorDetail {
+  /** `ECONNREFUSED`, `ENOTFOUND`, a CONNACK reason code — or null. */
+  code: string | null;
+  /** Never empty: falls back to the error's name, then to a fixed string. */
+  reason: string;
+  /** Present when the error is an `AggregateError`. One entry per attempt. */
+  causes?: MqttErrorCause[];
+}
+
+/**
+ * Turns whatever mqtt.js emitted into something a log line can answer with.
+ *
+ * ## Why this exists
+ * `logger.error({ reason: error.message })` is a reasonable thing to write and
+ * is useless for the single commonest failure in development: nothing
+ * listening on `localhost:1883`. Node resolves localhost to both `::1` and
+ * `127.0.0.1`, attempts both, and raises an **`AggregateError` whose own
+ * `message` is the empty string** with the two real `ECONNREFUSED` errors
+ * hanging off `.errors`. The log then says `"reason": ""` and an operator has
+ * no thread to pull.
+ *
+ * So: the code, a message that is never blank, and every entry of `errors`
+ * flattened into its own small object.
+ *
+ * ## What it deliberately does not carry
+ * No username, no password, no connection URL. The caller supplies host and
+ * port separately via {@link brokerEndpoint} — an address is a diagnosis, a
+ * credential is a device identity, and the two must never share a log line.
+ */
+export function describeMqttError(error: unknown): MqttErrorDetail {
+  if (!(error instanceof Error)) {
+    return { code: null, reason: typeof error === 'string' && error ? error : 'unknown' };
+  }
+
+  const detail: MqttErrorDetail = {
+    code: readCode(error),
+    // An AggregateError's message is empty; its name is not.
+    reason: error.message || error.name || 'unknown',
+  };
+
+  /**
+   * `AggregateError` structurally rather than by `instanceof`.
+   *
+   * mqtt.js and Node both produce aggregate-shaped errors, and an
+   * `instanceof` check against the global would miss one constructed in
+   * another realm — which is precisely the kind of thing that turns a log
+   * message into an empty string again.
+   */
+  const nested: unknown = (error as { errors?: unknown }).errors;
+
+  if (Array.isArray(nested) && nested.length > 0) {
+    detail.causes = nested.map((cause) => ({
+      code: readCode(cause),
+      reason:
+        cause instanceof Error
+          ? cause.message || cause.name || 'unknown'
+          : String(cause ?? 'unknown'),
+      address: readString(cause, 'address'),
+      port: readNumber(cause, 'port'),
+    }));
+
+    /**
+     * Promote the first cause's code when the aggregate has none of its own,
+     * so a dashboard filtering on `code` still finds `ECONNREFUSED`.
+     */
+    detail.code ??= detail.causes[0]?.code ?? null;
+  }
+
+  return detail;
+}
+
+/**
+ * The broker's host and port, and nothing else.
+ *
+ * Parsed from the URL rather than logged raw, because `MQTT_URL` may carry
+ * credentials in its userinfo — `mqtts://user:pass@host` is legal and the sort
+ * of thing that ends up in an env file. A log line gets the two fields that
+ * help and none that leak. An unparseable URL yields nulls rather than falling
+ * back to the raw string, which would reintroduce exactly that risk.
+ */
+export function brokerEndpoint(url: string): { host: string | null; port: number | null } {
+  try {
+    const parsed = new URL(url);
+    const port = parsed.port ? Number(parsed.port) : null;
+
+    return {
+      host: parsed.hostname || null,
+      port: Number.isInteger(port) ? port : null,
+    };
+  } catch {
+    return { host: null, port: null };
+  }
+}
+
+function readCode(value: unknown): string | null {
+  const code = (value as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && code) return code;
+  if (typeof code === 'number') return String(code);
+  return null;
+}
+
+function readString(value: unknown, key: string): string | null {
+  const read = (value as Record<string, unknown> | null)?.[key];
+  return typeof read === 'string' && read ? read : null;
+}
+
+function readNumber(value: unknown, key: string): number | null {
+  const read = (value as Record<string, unknown> | null)?.[key];
+  return typeof read === 'number' && Number.isFinite(read) ? read : null;
 }

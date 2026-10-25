@@ -57,6 +57,14 @@ export function UnlockDialog({
   const [status, setStatus] = useState<string | null>(null);
   /** Null once the code is unusable — the user must resend before retrying. */
   const [expired, setExpired] = useState(false);
+  /**
+   * True when a resend cannot help either, so even that button goes away.
+   *
+   * Distinct from `expired`, which means "this code is dead, ask for another".
+   * This means "there is no code to ask for" — the safe cannot be reached —
+   * and the remedy is not in this dialog.
+   */
+  const [unavailable, setUnavailable] = useState(false);
   const [cooldown, setCooldown] = useState(0);
   const [devHint, setDevHint] = useState<string | null>(null);
 
@@ -92,6 +100,23 @@ export function UnlockDialog({
       setStep('entry');
       setStatus(null);
       setError(toUserMessage(cause));
+
+      /**
+       * An unreachable safe means no code will ever arrive, however many times
+       * you ask.
+       *
+       * The API refuses the *request* — before a code is generated, on purpose
+       * — so there is nothing to type and nothing a resend can achieve. A
+       * "Resend code" button that cannot work is worse than no button: it
+       * invites someone to spend their three-codes-per-ten-minutes finding
+       * that out. The API's sentence stays on screen; the controls just stop
+       * promising. `Lock` is unaffected, as always.
+       */
+      if (cause instanceof ApiError && cause.code === 'DEVICE_OFFLINE') {
+        setUnavailable(true);
+        setExpired(true);
+        setCooldown(0);
+      }
     } finally {
       setPending(false);
       inFlight.current = false;
@@ -110,6 +135,7 @@ export function UnlockDialog({
       setCode('');
       setError(null);
       setExpired(false);
+      setUnavailable(false);
       setDevHint(null);
       void sendCode();
     }
@@ -213,9 +239,13 @@ export function UnlockDialog({
             Enter your unlock code
           </h2>
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-            {waiting
-              ? 'Your safe is working on it. This takes a few seconds.'
-              : `We sent a ${OTP_LENGTH}-digit code. It is valid once, and only for a few minutes.`}
+            {/* No code was sent when the request was refused, so this must not
+                claim one was. The refusal itself is in the alert below. */}
+            {unavailable
+              ? 'We could not send an unlock code.'
+              : waiting
+                ? 'Your safe is working on it. This takes a few seconds.'
+                : `We sent a ${OTP_LENGTH}-digit code. It is valid once, and only for a few minutes.`}
           </p>
         </div>
 
@@ -229,7 +259,7 @@ export function UnlockDialog({
           {/* Gone once the code has been accepted: there is no second attempt
               with it, so a set of boxes to retype it into would be a lie about
               what the user can still do. */}
-          {waiting ? null : (
+          {waiting || unavailable ? null : (
             <OtpInput
               value={code}
               onChange={setCode}
@@ -261,7 +291,7 @@ export function UnlockDialog({
           )}
 
           <div className="flex flex-col gap-2">
-            {waiting ? null : (
+            {waiting || unavailable ? null : (
               <>
                 <Button
                   type="submit"
@@ -289,7 +319,7 @@ export function UnlockDialog({
               notification, and the dashboard renders the state it reported.
             */}
             <Button variant="ghost" onClick={onClose} disabled={pending && !waiting}>
-              {waiting ? 'Close and check later' : 'Cancel'}
+              {unavailable ? 'Close' : waiting ? 'Close and check later' : 'Cancel'}
             </Button>
           </div>
         </form>

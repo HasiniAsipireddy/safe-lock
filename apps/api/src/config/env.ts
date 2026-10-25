@@ -11,7 +11,46 @@ import { z } from 'zod';
 const secret = (label: string) =>
   z.string().min(32, `${label} must be at least 32 characters`);
 
-const envSchema = z
+/**
+ * An hourly rate in paise: a positive integer, at least ₹1.
+ *
+ * 100 paise is Razorpay's own floor for an INR order, so a rate below it would
+ * produce orders the gateway refuses — at the shortest bookable duration,
+ * which is the one most likely to be tried first.
+ */
+const hourlyRate = (label: string) =>
+  z.coerce
+    .number()
+    .int(`${label} must be an integer number of paise`)
+    .positive()
+    .min(100, `${label} must be at least 100 (Rs 1)`);
+
+/**
+ * Whether the MQTT transport is parked.
+ *
+ * `true` as of 2026-10-24: the website is being finished first and real
+ * hardware — an ESP32 — comes afterwards, so `DEVICE_GATEWAY=mqtt` is refused
+ * at boot in every environment and `mock` is the only reachable gateway. No
+ * MQTT code is deleted; see the block in the superRefine below, and
+ * `docs/decisions.md`.
+ *
+ * A constant rather than an env var on purpose. "Is there hardware yet" is a
+ * fact about the project, not about a deployment, and making it configurable
+ * would let a half-finished environment switch on a transport nobody has a
+ * device for — which is precisely the thing being prevented. Flip it to
+ * `false` when the hardware phase resumes.
+ */
+const MQTT_PARKED = true;
+
+/**
+ * Exported so the refusals above can be *tested* rather than trusted.
+ *
+ * `env` below is parsed once at module load from the real `process.env`, which
+ * makes "does production refuse this?" untestable without reloading the module
+ * registry. Parsing a synthetic object against this schema asks the question
+ * directly. Nothing in the application should import this — import `env`.
+ */
+export const envSchema = z
   .object({
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
     PORT: z.coerce.number().int().positive().max(65535).default(4000),
@@ -71,6 +110,17 @@ const envSchema = z
 
     DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
     TEST_DATABASE_URL: z.string().optional(),
+    /**
+     * Migrations only, and read by `prisma.config.ts` rather than by anything
+     * here — declared so it is validated and discoverable instead of being an
+     * undocumented string the CLI happens to pick up.
+     *
+     * Optional because it is meaningless locally: with one Postgres and no
+     * pooler it equals `DATABASE_URL`, and `prisma.config.ts` falls back to
+     * exactly that. It matters on Supabase, where the runtime URL is a
+     * transaction pooler Migrate cannot use.
+     */
+    DIRECT_URL: z.string().optional(),
 
     /** Signs the short-lived access token. */
     JWT_ACCESS_SECRET: secret('JWT_ACCESS_SECRET'),
@@ -100,6 +150,12 @@ const envSchema = z
      * Which hardware gateway to talk to. An enum rather than a free string so
      * a typo is a boot failure, not a silent fallback to the mock in
      * production — which would look healthy and open nothing.
+     *
+     * - `mock` — answers like a device and always acks. The only reachable
+     *   value today, and what the whole suite runs on.
+     * - `mqtt` — the real transport, **parked** pending ESP32 integration and
+     *   refused in every environment by the superRefine below. The code and
+     *   its tests are untouched on disk; see `docs/decisions.md` (2026-10-24).
      */
     DEVICE_GATEWAY: z.enum(['mock', 'mqtt']).default('mock'),
 
@@ -349,21 +405,38 @@ const envSchema = z
 
     // --- Rental pricing -------------------------------------------------------
     /**
-     * Hourly rental rate in PAISE. The single source of truth for what a safe
-     * costs — the booking service never reads an amount from a request.
+     * **Legacy**: the single flat hourly rate, from before safes had sizes.
      *
-     * **PROVISIONAL**, exactly like the one-time price it replaces: 10000 paise
-     * (Rs 100/hour) is a development placeholder, not a business decision. It
-     * is snapshotted onto every booking, so changing it never re-prices a live
-     * one. See CLAUDE.md's open questions.
+     * Kept, and kept *meaningful*, rather than deleted: an existing `.env` has
+     * a value here, and a variable that silently stops mattering while still
+     * looking authoritative is its own kind of bug. So it is accepted as the
+     * default for `RENTAL_HOURLY_RATE_MEDIUM_PAISE` — medium being the size
+     * every pre-existing device was backfilled to, so an untouched `.env`
+     * keeps charging exactly what it charged before. An explicit
+     * `RENTAL_HOURLY_RATE_MEDIUM_PAISE` wins.
+     *
+     * Same pattern as `CORS_ORIGINS` → `WEB_ORIGIN`.
+     *
+     * TODO(cleanup): drop once no deployment relies on it.
      */
-    RENTAL_HOURLY_RATE_PAISE: z.coerce
-      .number()
-      .int('RENTAL_HOURLY_RATE_PAISE must be an integer number of paise')
-      .positive()
-      // Razorpay's own floor for an INR order is 100 paise (Rs 1).
-      .min(100, 'RENTAL_HOURLY_RATE_PAISE must be at least 100 (Rs 1)')
-      .default(10_000),
+    RENTAL_HOURLY_RATE_PAISE: hourlyRate('RENTAL_HOURLY_RATE_PAISE').default(10_000),
+
+    /**
+     * Hourly rate per safe size, in PAISE. The only source of truth for what a
+     * safe costs — the booking service never reads an amount from a request,
+     * and the client never multiplies a rate by a duration.
+     *
+     * **PROVISIONAL**, like the flat rate they replace. ₹60/₹100/₹160 was
+     * chosen on 2026-10-25 (`docs/decisions.md`) and keeps medium at the old
+     * flat ₹100, so the backfill re-prices nothing. Not a business decision
+     * anybody has signed off — see CLAUDE.md's open questions.
+     *
+     * Each is snapshotted onto a booking at creation, so changing one never
+     * re-prices a live booking of that size.
+     */
+    RENTAL_HOURLY_RATE_SMALL_PAISE: hourlyRate('RENTAL_HOURLY_RATE_SMALL_PAISE').default(6_000),
+    RENTAL_HOURLY_RATE_MEDIUM_PAISE: hourlyRate('RENTAL_HOURLY_RATE_MEDIUM_PAISE').optional(),
+    RENTAL_HOURLY_RATE_LARGE_PAISE: hourlyRate('RENTAL_HOURLY_RATE_LARGE_PAISE').default(16_000),
 
     /** Shortest and longest a single booking or extension may be. */
     RENTAL_MIN_HOURS: z.coerce.number().int().min(1).max(24).default(1),
@@ -464,7 +537,42 @@ const envSchema = z
      * a compromised broker could forge, which is the single thing the
      * signature exists to prevent.
      */
-    if (value.DEVICE_GATEWAY === 'mqtt') {
+    /**
+     * **The MQTT transport is parked, and this is the one line that parks it.**
+     *
+     * The decision (2026-10-24) is to finish the website first and integrate
+     * real hardware — an ESP32 — afterwards, so there is currently no safe
+     * this software can physically command. Rather than delete a working,
+     * tested transport, it is made unreachable here: `MqttDeviceGateway`,
+     * `lib/deviceProtocol/`, the simulator and `docs/device-protocol.md` all
+     * stay exactly as they are, and the hardware phase resumes from them
+     * instead of from a blank file.
+     *
+     * Refused in **every** environment, not only production, because the
+     * failure it prevents is a local one: with no broker listening, mqtt.js
+     * retries every two seconds forever and every completion lock marches
+     * through three failed attempts into `NEEDS_INSPECTION`, which quietly
+     * makes the device inventory unbookable. Refusing at boot is louder and
+     * cheaper than discovering that an hour later.
+     *
+     * **To un-park:** set {@link MQTT_PARKED} to `false`. Nothing else is
+     * needed — the `resolveGateway` case, the requirements below, the key
+     * derivation and the tests are all still in place.
+     */
+    if (MQTT_PARKED && value.DEVICE_GATEWAY === 'mqtt') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['DEVICE_GATEWAY'],
+        message:
+          'DEVICE_GATEWAY=mqtt is parked pending hardware integration; use DEVICE_GATEWAY=mock. To re-enable, set MQTT_PARKED=false in apps/api/src/config/env.ts (see docs/decisions.md, 2026-10-24)',
+      });
+    }
+
+    /**
+     * Skipped while parked, so the reader is not also told to configure a
+     * broker they have just been refused permission to use.
+     */
+    if (!MQTT_PARKED && value.DEVICE_GATEWAY === 'mqtt') {
       const required = [
         ['MQTT_URL', value.MQTT_URL],
         ['MQTT_USERNAME', value.MQTT_USERNAME],
@@ -552,6 +660,19 @@ const envSchema = z
           'DEVICE_GATEWAY=mock is not allowed in production; it acks every command without a device',
       });
     }
+
+    /**
+     * ## Note: while MQTT is parked, **no value of `DEVICE_GATEWAY` boots in
+     * production.** `mock` is refused here and `mqtt` is refused above.
+     *
+     * That is deliberate and it is not a gap to paper over. A rental product
+     * whose safes cannot be physically opened has nothing to sell, so the
+     * honest state of the codebase today is "not deployable to production",
+     * and the boot failure says so at the earliest possible moment. The fix is
+     * the hardware phase, not a third mode. See `docs/decisions.md`
+     * (2026-10-24).
+     */
+
 
     if (value.DEVICE_COMMAND_HMAC_SECRET?.includes('change_me')) {
       ctx.addIssue({
@@ -711,6 +832,27 @@ export const WEB_ORIGINS: readonly string[] = (env.WEB_ORIGIN ?? env.CORS_ORIGIN
   .split(',')
   .map((origin) => origin.trim().replace(/\/+$/, ''))
   .filter(Boolean);
+
+/**
+ * The hourly rate for each safe size, in paise.
+ *
+ * Resolved once here rather than read per booking, so there is exactly one
+ * place that knows the legacy flat variable can stand in for the medium rate:
+ * `RENTAL_HOURLY_RATE_MEDIUM_PAISE` if set, else the old
+ * `RENTAL_HOURLY_RATE_PAISE`, else the ₹100 default that variable always had.
+ *
+ * Sizes are otherwise independent — small and large have plain defaults —
+ * because only medium has a history to stay compatible with.
+ */
+export const RENTAL_HOURLY_RATE_PAISE_BY_SIZE: Readonly<
+  Record<'SMALL' | 'MEDIUM' | 'LARGE', number>
+> = {
+  SMALL: env.RENTAL_HOURLY_RATE_SMALL_PAISE,
+  // Explicit medium if given, else the legacy flat variable — which keeps its
+  // own Rs 100 default, so this is Rs 100 when neither is set.
+  MEDIUM: env.RENTAL_HOURLY_RATE_MEDIUM_PAISE ?? env.RENTAL_HOURLY_RATE_PAISE,
+  LARGE: env.RENTAL_HOURLY_RATE_LARGE_PAISE,
+};
 
 /**
  * The canonical site base for links in outbound messages, without a trailing
