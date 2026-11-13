@@ -26,19 +26,20 @@ export function AppHeader() {
   const links = [
     { href: '/dashboard', label: 'Dashboard' },
     { href: '/history', label: 'Activity' },
+    { href: '/bookings', label: 'Bookings' },
     { href: '/account', label: 'Account' },
     ...(user.role === 'ADMIN' ? [{ href: '/admin', label: 'Admin' }] : []),
   ];
 
   return (
-    <header className="border-b border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+    <header className="border-b border-brand-800 bg-brand-700 shadow-sm print:hidden">
       <div className="mx-auto flex w-full max-w-5xl items-center gap-4 px-4 py-3 sm:px-6">
         <Link
           href="/dashboard"
-          className="flex items-center gap-2 font-bold tracking-tight text-slate-900 dark:text-white"
+          className="flex shrink-0 items-center gap-2 font-bold tracking-tight whitespace-nowrap text-white"
         >
           <svg
-            className="size-5 text-brand-600 dark:text-brand-400"
+            className="size-5 text-brand-200"
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
@@ -50,7 +51,9 @@ export function AppHeader() {
             <rect x="3" y="11" width="18" height="10" rx="2" />
             <path d="M7 11V7a5 5 0 0 1 10 0v4" />
           </svg>
-          Safe Lock
+          {/* Wordmark hidden on phones so five links and the bell still fit. */}
+          <span className="hidden sm:inline">Safe Lock</span>
+          <span className="sr-only sm:hidden">Safe Lock</span>
         </Link>
 
         <nav aria-label="Main" className="ml-auto">
@@ -63,10 +66,10 @@ export function AppHeader() {
                     href={link.href}
                     aria-current={active ? 'page' : undefined}
                     className={cn(
-                      'inline-flex min-h-10 items-center rounded-lg px-2 text-sm font-semibold transition-colors sm:px-3',
+                      'inline-flex min-h-10 items-center rounded-lg px-2 text-sm font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white sm:px-3',
                       active
-                        ? 'bg-slate-100 text-slate-900 dark:bg-slate-800 dark:text-white'
-                        : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white',
+                        ? 'bg-brand-900 text-white'
+                        : 'text-brand-50 hover:bg-brand-800 hover:text-white',
                     )}
                   >
                     {link.label}

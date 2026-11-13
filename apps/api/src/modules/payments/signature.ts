@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { env } from '../../config/env';
+import { FAKE_CHECKOUT_SIGNATURE, FAKE_ORDER_PREFIX } from '../../lib/razorpay';
 
 /**
  * Razorpay signature verification.
@@ -41,6 +42,16 @@ export function verifyCheckoutSignature(params: {
   paymentId: string;
   signature: string;
 }): boolean {
+  /**
+   * `PAYMENT_PROVIDER=fake` (demo only, refused in production): an order this
+   * server created locally carries no Razorpay signature, so the simulate
+   * button's fixed value stands in for one. Ownership is still checked by the
+   * caller, and a real `order_…` id still needs the real HMAC.
+   */
+  if (env.PAYMENT_PROVIDER === 'fake' && params.orderId.startsWith(FAKE_ORDER_PREFIX)) {
+    return params.signature === FAKE_CHECKOUT_SIGNATURE;
+  }
+
   return timingSafeEqualHex(
     expectedCheckoutSignature(params.orderId, params.paymentId),
     params.signature,

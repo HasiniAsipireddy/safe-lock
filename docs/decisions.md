@@ -2514,3 +2514,117 @@ what it is.
   Unchanged by this step, and still the open question it was.
 - **Tamper reporting**, which the protocol has room for (`TAMPER` and a flag)
   and v1 does not implement.
+
+## 2026-11-12 — ESP32 demo over plain HTTP, and a dev-only phone-verification switch
+
+**Context.** The college demo uses a stock ESP32 (relay on GPIO 23, DHT22 on
+GPIO 4) serving plain HTTP on a phone hotspot. Implementing the signed MQTT
+protocol (`docs/device-protocol.md`) in that firmware is out of scope for the
+demo, and there is no WhatsApp number to deliver codes to.
+
+**Decision.**
+- `DEVICE_GATEWAY=http` (`lib/deviceGateway/http.gateway.ts`) reaches one
+  ESP32 by IP (`ESP32_URL`). It POSTs `/lock` / `/unlock` and polls `/state`
+  with a shared `X-Device-Token`, and relays what it hears to the inbound
+  handler as **signed** acks and state reports — the same move the mock makes —
+  so commands, OTP, audit, history and the §8.3 reconcile run unchanged.
+  Firmware: `firmware/esp32_safelock/` (token in a git-ignored `secrets.h`).
+- `Device.temperatureC` / `humidityPct` / `sensorReadAt` hold the DHT22
+  reading; `DeviceSummary.environment` carries it to the dashboard.
+- `PHONE_VERIFICATION_REQUIRED=false` (+ `NEXT_PUBLIC_REQUIRE_PHONE_VERIFICATION=false`)
+  lets an unverified user unlock. **The one-time code is still required**; it
+  prints to the API console behind `mayPrintOtp`.
+
+**Both are refused in production by the env schema.** The HTTP bridge has no
+TLS, no per-command signature on the wire (a captured `/unlock` replays on that
+LAN), and no door sensor — the gateway reports `CLOSED`, as the mock does. The
+vitest config pins `DEVICE_GATEWAY=mock` and `PHONE_VERIFICATION_REQUIRED=true`
+so a demo `.env` cannot leak into the suite.
+
+## 2026-11-13 — A fully local demo: simulated safe, fake payments, on-screen codes
+
+For the college demo everything runs on one laptop with no external service.
+Three more dev-only switches, **each refused in production by the env schema**:
+
+- `DEVICE_GATEWAY=sim` — `HttpDeviceGateway` driving an in-process
+  `SimulatedEsp32` (a `fetch` that answers as `firmware/esp32_safelock`
+  does, with a random-walk DHT22). Same code path as the real board, so the
+  real ESP32 is one line away (`DEVICE_GATEWAY=http`).
+- `PAYMENT_PROVIDER=fake` — orders are created locally (`order_FAKE…`, no
+  Razorpay call), and `verifyCheckoutSignature` accepts the simulate button's
+  fixed signature **only for those orders**; a real `order_…` still needs the
+  real HMAC. Settlement is the unchanged verify transaction. Web:
+  `NEXT_PUBLIC_FAKE_PAYMENTS=true`.
+- `DEMO_SHOW_OTP=true` — the unlock-request response carries `demoCode` and
+  the dialog shows it. Also behind `mayPrintOtp`. The code is still required,
+  hashed, single-use and attempt-limited; this departs from "never return OTPs
+  in API responses" on purpose, for a demo with no phone channel.
+
+The vitest config pins all of them to their production-safe values.
+
+## 2026-11-13 — Auto-lock, sensor history and alerts, receipts, admin stats
+
+**Auto-lock is timed from the unlock's ack, not `lockStateUpdatedAt`.** That
+column means "last confirmed" and every ESP32 state poll moves it, so a timer
+keyed on it never expires. The ack of the last `UNLOCK` command is the moment
+the bolt opened because *we* opened it. A safe opened with the physical key has
+no such ack and is left alone: we did not open it and cannot know why it is
+open, and §8.3's reconciler already covers a safe open with nobody entitled.
+
+**It is an ordinary system command** (actor `AUTO_LOCK`) and inherits the
+retry-then-`NEEDS_INSPECTION` escalation. That means a safe that refuses to
+auto-lock mid-rental becomes unbookable *and* refuses `UNLOCK` until an admin
+clears it. Accepted: a safe that will not lock is not a safe, and the renter
+can still open it with the physical key.
+
+**Skipped while the door is `OPEN`.** A bolt thrown into an open door secures
+nothing, and the dashboard would then say "Locked".
+
+**The timeout (2 minutes) is a shared constant, not env** — the dashboard
+promises it in words, the same reasoning as the reminder lead times.
+
+**Sensor samples are thinned to one a minute.** The gateway polls every 3s;
+storing every poll is ~29k rows per safe per day for a chart that draws one
+point a minute. Alerts are in-app only (no WhatsApp template exists for them),
+renter only, once per type per 30 minutes, and only for a *paid* booking.
+Retention of `SensorReading` joins the existing open retention question.
+
+**Receipts are not tax invoices** and say so — there is no GSTIN or registered
+business name yet. Printing uses the browser's own print-to-PDF, so there is
+no PDF dependency.
+
+**Admin stats are aggregates only** (no user named) and bucket days in IST.
+Utilisation counts the whole reservation, holds and overstays included,
+because that is the time the safe could not be rented to anyone else.
+
+## 2026-11-13 — Door and vibration sensors, and tamper alerts
+
+**Tampering is judged on the server, and only while the bolt is LOCKED.** The
+firmware reports raw facts (`doorOpen`, a latched `vibration`); the server
+decides what they mean, so the rule can change without reflashing. While
+unlocked, an open door and a bump are the renter using their safe.
+
+**A forced door outranks vibration**, and the wording follows the strength of
+the evidence: "door forced open" is stated as what the sensor reported;
+vibration is "possible tampering", because a renter leaning on the cabinet
+trips it too.
+
+**One incident, one alert.** Readings of the same kind within five minutes
+extend the incident (`Device.lastTamperAt` keeps moving) rather than paging
+the renter every three seconds while someone is still at it.
+
+**It gates nothing.** No lock is sent and no booking changes. A vibration
+sensor will produce false positives, and those must cost a notification, not
+a renter's access to their property.
+
+**Vibration is latched by the firmware until the next `/state`.** A knock
+lasts milliseconds and the poll is every few seconds; without the latch most
+knocks would never be seen.
+
+**Firmware without a reed switch omits `doorOpen`** (`HAS_DOOR_SENSOR 0`) and
+the gateway reports `CLOSED`. An unwired `INPUT_PULLUP` pin reads HIGH, which
+would otherwise look like a door forced open on every poll.
+
+**The demo endpoint exists only for the in-process simulated board.** It makes
+the board *report* something; detection, alerts and audit then run on the
+ordinary path, so a demo shows the real behaviour rather than a staged copy.

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ERROR_CODES, type BookingOrderResponse, type VerifyPaymentResponse } from '@safelock/shared';
 import { api } from './api';
 import { ApiError, toUserMessage } from './apiError';
-import { USE_MOCK_API } from './env';
+import { FAKE_PAYMENTS } from './env';
 import { loadRazorpayCheckout } from './razorpay';
 
 /**
@@ -155,7 +155,7 @@ export function useBookingCheckout(options: BookingCheckoutOptions): UseBookingC
 
       // Mock mode stands in for Checkout with an explicit simulate step, so
       // the whole flow is exercisable without a Razorpay account.
-      if (USE_MOCK_API) {
+      if (FAKE_PAYMENTS) {
         setStage({ kind: 'awaiting-payment', order });
         inFlight.current = false;
         return;

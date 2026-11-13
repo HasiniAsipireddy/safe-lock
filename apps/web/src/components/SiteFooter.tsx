@@ -16,7 +16,7 @@ const LINKS = [
 
 export function SiteFooter() {
   return (
-    <footer className="mt-auto border-t border-slate-200 px-4 py-6 dark:border-slate-800">
+    <footer className="mt-auto bg-brand-800 px-4 py-6 print:hidden">
       <div className="mx-auto flex w-full max-w-2xl flex-col items-center gap-3 text-center">
         <nav aria-label="Legal">
           <ul className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2">
@@ -24,7 +24,7 @@ export function SiteFooter() {
               <li key={link.href}>
                 <Link
                   href={link.href}
-                  className="text-sm text-slate-600 underline-offset-2 hover:text-slate-900 hover:underline dark:text-slate-400 dark:hover:text-slate-100"
+                  className="text-sm text-brand-50 underline-offset-2 hover:text-white hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
                 >
                   {link.label}
                 </Link>
@@ -32,7 +32,7 @@ export function SiteFooter() {
             ))}
           </ul>
         </nav>
-        <p className="text-xs text-slate-500 dark:text-slate-500">
+        <p className="text-xs text-brand-200">
           {/* Replace with the registered business name before launch. */}© {new Date().getFullYear()}{' '}
           [BUSINESS NAME]. Payments processed by Razorpay.
         </p>

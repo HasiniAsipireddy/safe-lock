@@ -87,7 +87,7 @@ export function UnlockDialog({
       setStep('entry');
       setCooldown(result.resendAfterSeconds);
       setStatus(`Code sent. It expires in ${Math.round(result.expiresInSeconds / 60)} minutes.`);
-      setDevHint(USE_MOCK_API ? peekMockUnlockCode() : null);
+      setDevHint(USE_MOCK_API ? peekMockUnlockCode() : (result.demoCode ?? null));
     } catch (cause) {
       setStep('entry');
       setStatus(null);
@@ -256,7 +256,7 @@ export function UnlockDialog({
 
           {devHint && !waiting && (
             <p className="rounded-lg bg-amber-100 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-200">
-              Mock mode code: <span className="font-mono font-bold">{devHint}</span>
+              Demo code: <span className="font-mono font-bold">{devHint}</span>
             </p>
           )}
 

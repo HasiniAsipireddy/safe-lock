@@ -1,4 +1,4 @@
-import type { DeviceEventType, UnlockFailureReason } from '@safelock/shared';
+import type { DeviceEventSource, DeviceEventType, UnlockFailureReason } from '@safelock/shared';
 import type { PrismaTransaction } from '../../lib/prisma';
 
 /**
@@ -21,6 +21,8 @@ export async function recordEvent(
     /** Internal correlation only. In no `select` the history endpoint uses. */
     requestId: string | null;
     failureReason?: UnlockFailureReason | undefined;
+    /** `SYSTEM` for events the server caused on its own (auto-lock). */
+    source?: DeviceEventSource;
   },
 ): Promise<string> {
   const event = await tx.deviceEvent.create({
@@ -28,7 +30,7 @@ export async function recordEvent(
       deviceId: input.deviceId,
       userId: input.userId,
       type: input.type,
-      source: 'WEB',
+      source: input.source ?? 'WEB',
       requestId: input.requestId,
       ...(input.failureReason ? { failureReason: input.failureReason } : {}),
     },

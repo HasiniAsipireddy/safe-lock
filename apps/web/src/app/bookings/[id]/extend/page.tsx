@@ -19,7 +19,7 @@ import { FormError } from '@/components/ui/FormError';
 import { api } from '@/lib/api';
 import { toUserMessage } from '@/lib/apiError';
 import { formatShortDateTime } from '@/lib/datetime';
-import { USE_MOCK_API } from '@/lib/env';
+import { FAKE_PAYMENTS } from '@/lib/env';
 import { MOCK_CHECKOUT_SIGNATURE } from '@/lib/mockApi';
 import { useBookingCheckout } from '@/lib/useBookingCheckout';
 
@@ -231,7 +231,7 @@ function ExtendBookingContent() {
           <CheckoutNotice checkout={checkout} />
 
           <div className="mt-4">
-            {checkout.stage.kind === 'awaiting-payment' && USE_MOCK_API ? (
+            {checkout.stage.kind === 'awaiting-payment' && FAKE_PAYMENTS ? (
               <Button
                 onClick={() =>
                   checkout.simulate(

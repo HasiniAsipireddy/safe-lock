@@ -57,6 +57,19 @@ export default defineConfig({
       DEVICE_COMMAND_KEY_VERSION: '1',
 
       /**
+       * Pinned, not inherited from a developer's .env. A local
+       * `DEVICE_GATEWAY=http` (the ESP32 demo) or
+       * `PHONE_VERIFICATION_REQUIRED=false` (or a fake payment provider, or
+       * on-screen codes) would otherwise route every
+       * command at a board that is not there and silently drop the phone gate
+       * the suite asserts.
+       */
+      DEVICE_GATEWAY: 'mock',
+      PHONE_VERIFICATION_REQUIRED: 'true',
+      PAYMENT_PROVIDER: 'razorpay',
+      DEMO_SHOW_OTP: 'false',
+
+      /**
        * Broker settings, so `MqttDeviceGateway` can be *constructed and
        * started* in its unit test against a stubbed `mqtt.connect` — exactly
        * as the Cloud API WhatsApp client is unit-tested against a stubbed

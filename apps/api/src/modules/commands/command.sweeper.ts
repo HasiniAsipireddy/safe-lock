@@ -4,6 +4,7 @@ import { logger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
 import { AUDIT_ACTIONS, writeAudit } from '../audit/audit.service';
 import { recordEvent } from '../devices/deviceEvents';
+import { sweepAutoLocks } from './autoLock.service';
 import { createCommand, publishCommand, releaseChallenge } from './command.service';
 
 /**
@@ -354,7 +355,9 @@ async function retry(
        * still says *why* a safe is being closed — a completion that was never
        * confirmed reads differently from a safe found open.
        */
-      systemActor: (input.systemActor as 'COMPLETION' | 'SWEEPER' | 'ADMIN' | null) ?? 'SWEEPER',
+      systemActor:
+        (input.systemActor as 'COMPLETION' | 'SWEEPER' | 'ADMIN' | 'AUTO_LOCK' | null) ??
+        'SWEEPER',
       bookingId: input.bookingId,
       now: input.now,
     });
@@ -479,6 +482,11 @@ async function tick(): Promise<void> {
 
     if (result.failed > 0) logger.warn(result, 'Command sweep finished with failures');
     else if (touched > 0) logger.info(result, 'Command sweep');
+
+    // After the sweep, so a lock that just timed out is settled before an
+    // auto-lock decides whether anything is in flight.
+    const autoLocked = await sweepAutoLocks();
+    if (autoLocked > 0) logger.info({ autoLocked }, 'Auto-lock sweep');
   } catch (cause) {
     logger.error(
       { reason: cause instanceof Error ? cause.message : 'unknown' },

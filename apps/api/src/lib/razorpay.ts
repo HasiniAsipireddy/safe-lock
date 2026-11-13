@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import Razorpay from 'razorpay';
 import { ERROR_CODES } from '@safelock/shared';
 import { env } from '../config/env';
@@ -13,6 +14,16 @@ import { logger } from './logger';
  * `RAZORPAY_KEY_SECRET` is read here and in `payments/signature.ts` and
  * nowhere else. It is never logged and never sent to a client.
  */
+
+/** Orders made by `PAYMENT_PROVIDER=fake`. Matches Razorpay's `order_[A-Za-z0-9]+`. */
+export const FAKE_ORDER_PREFIX = 'order_FAKE';
+
+/**
+ * The signature the web's "Simulate a successful payment" button sends —
+ * the same constant the browser mock uses. Accepted only for a fake order,
+ * only while `PAYMENT_PROVIDER=fake`.
+ */
+export const FAKE_CHECKOUT_SIGNATURE = '0'.repeat(64);
 
 let client: Razorpay | null = null;
 
@@ -56,6 +67,16 @@ export async function createRazorpayOrder(params: {
    */
   expireBy?: number;
 }): Promise<CreatedOrder> {
+  if (env.PAYMENT_PROVIDER === 'fake') {
+    // Demo only (refused in production): a local order id, no network call.
+    // Settled by `verifyCheckoutSignature`'s fake branch — see signature.ts.
+    return {
+      id: `${FAKE_ORDER_PREFIX}${crypto.randomBytes(9).toString('hex')}`,
+      amount: params.amountInPaise,
+      currency: params.currency,
+    };
+  }
+
   try {
     const order = await razorpayClient().orders.create({
       amount: params.amountInPaise,

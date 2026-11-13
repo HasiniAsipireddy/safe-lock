@@ -28,7 +28,7 @@ const NOTIFICATION_SELECT = {
 
 interface NotificationRow {
   id: string;
-  type: 'UNLOCK_CONFIRMED' | 'UNLOCK_FAILED_MAX_ATTEMPTS';
+  type: NotificationItem['type'];
   deviceEventId: string | null;
   createdAt: Date;
   readAt: Date | null;

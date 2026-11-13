@@ -70,7 +70,7 @@ export default function AccountPage() {
 
 function Card({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6 dark:border-slate-800 dark:bg-slate-900">
+    <section className="rounded-2xl border border-brand-200 bg-white p-5 sm:p-6 dark:border-slate-800 dark:bg-slate-900">
       <h2 className="text-base font-bold text-slate-900 dark:text-white">{title}</h2>
       <div className="mt-4">{children}</div>
     </section>

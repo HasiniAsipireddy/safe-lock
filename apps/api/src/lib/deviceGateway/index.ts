@@ -1,6 +1,7 @@
 import { env } from '../../config/env';
 import { MockDeviceGateway } from './mock.gateway';
 import { MqttDeviceGateway } from './mqtt.gateway';
+import { HttpDeviceGateway } from './http.gateway';
 import type { DeviceGateway } from './gateway';
 
 export {
@@ -12,6 +13,8 @@ export {
 } from './gateway';
 export { MockDeviceGateway } from './mock.gateway';
 export { MqttDeviceGateway } from './mqtt.gateway';
+export { HttpDeviceGateway } from './http.gateway';
+export { SimulatedEsp32 } from './simulatedEsp32';
 
 /**
  * The gateway the application talks to.
@@ -32,6 +35,10 @@ function resolveGateway(): DeviceGateway {
       return new MockDeviceGateway();
     case 'mqtt':
       return new MqttDeviceGateway();
+    case 'http':
+      return HttpDeviceGateway.fromEnv();
+    case 'sim':
+      return HttpDeviceGateway.simulated();
     default:
       // Unreachable: the env schema is an enum. Kept so adding a value to that
       // enum without an implementation fails loudly at boot.
@@ -61,4 +68,5 @@ export async function drainDeviceAcks(): Promise<void> {
   // handled, not acks waiting to be sent — but the question a caller is asking
   // is the same one, so it gets the same answer.
   if (deviceGateway instanceof MqttDeviceGateway) await deviceGateway.drain();
+  if (deviceGateway instanceof HttpDeviceGateway) await deviceGateway.drain();
 }

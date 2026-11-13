@@ -9,8 +9,10 @@ import type {
   ListDevicesQuery,
   ListPaymentsQuery,
   ListUsersQuery,
+  SimulateDeviceInput,
   WaiveOverstayInput,
 } from '@safelock/shared';
+import { ERROR_CODES } from '@safelock/shared';
 import { HttpError } from '../../lib/httpError';
 import { routeParam } from '../../lib/routeParam';
 import {
@@ -23,6 +25,10 @@ import { adminForceComplete, adminWaiveOverstay } from '../bookings/booking.serv
 import { clearPaymentReview } from '../payments/payments.service';
 import * as deviceService from '../devices/device.service';
 import * as adminService from './admin.service';
+import { deviceGateway } from '../../lib/deviceGateway';
+import { HttpDeviceGateway } from '../../lib/deviceGateway/http.gateway';
+import { prisma } from '../../lib/prisma';
+import { adminStats } from './stats.service';
 
 /**
  * Admin controllers.
@@ -414,6 +420,62 @@ export const getAudit: RequestHandler = async (req, res, next) => {
   try {
     const query = req.query as unknown as ListAuditQuery;
     res.status(200).json(await adminService.listAudit(query));
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getStats: RequestHandler = async (_req, res, next) => {
+  try {
+    res.status(200).json(await adminStats());
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Triggers a demo scenario on the simulated board.
+ *
+ * The scenario changes what the *board* reports; everything after that is the
+ * ordinary path — state poll, tamper detection, notification, audit — so the
+ * demo shows the real behaviour rather than a staged copy of it.
+ */
+export const postSimulateDevice: RequestHandler = async (req, res, next) => {
+  const deviceId = routeParam(req, 'id');
+  const { scenario } = req.body as SimulateDeviceInput;
+
+  try {
+    const device = await prisma.device.findUnique({
+      where: { id: deviceId },
+      select: { serialNumber: true },
+    });
+    if (!device) {
+      throw new HttpError({ status: 404, code: ERROR_CODES.NOT_FOUND, message: 'Device not found.' });
+    }
+
+    const simulated =
+      deviceGateway instanceof HttpDeviceGateway &&
+      deviceGateway.simulatedSerial === device.serialNumber;
+
+    if (!simulated) {
+      throw new HttpError({
+        status: 409,
+        code: ERROR_CODES.SIMULATION_UNAVAILABLE,
+        message:
+          'Demo scenarios only work on the simulated safe (DEVICE_GATEWAY=sim, matching ESP32_SERIAL).',
+      });
+    }
+
+    await (deviceGateway as HttpDeviceGateway).simulate(scenario);
+
+    await writeAudit({
+      action: AUDIT_ACTIONS.ADMIN_DEVICE_SIMULATION,
+      deviceId,
+      ...auditContext(req),
+      metadata: { scenario, triggeredByAdminId: req.user!.id },
+    });
+
+    res.status(200).json({ ok: true, scenario });
   } catch (error) {
     next(error);
   }

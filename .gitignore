@@ -17,3 +17,6 @@ npm-debug.log*
 !.vscode/extensions.json
 *.tsbuildinfo
 coverage/
+
+# ESP32 firmware secrets (Wi-Fi password, device token)
+firmware/**/secrets.h

@@ -10,6 +10,7 @@ import {
   type UnlockFailureReason as StoredUnlockFailureReason,
   type UnlockRequestResponse,
 } from '@safelock/shared';
+import { env } from '../../config/env';
 import { prisma, type PrismaTransaction } from '../../lib/prisma';
 import { HttpError, conflict } from '../../lib/httpError';
 import type { SendOutcome } from '../../lib/whatsapp/send';
@@ -31,7 +32,8 @@ import {
 } from '../commands/command.service';
 import { DEVICE_SUMMARY_SELECT, isDeviceOnline, toDeviceSummary } from './device.mapper';
 import { recordEvent } from './deviceEvents';
-import { deliverOtp, generateOtp, hashOtp, verifyOtp } from './otp.service';
+import { autoLockDueAt } from '../commands/autoLock.service';
+import { deliverOtp, generateOtp, hashOtp, mayPrintOtp, verifyOtp } from './otp.service';
 
 /**
  * Lock and unlock.
@@ -250,7 +252,11 @@ export async function assertCanOperate(
     }),
   ]);
 
-  if (options.requirePhoneVerified && !user?.phoneVerifiedAt) throw phoneNotVerified();
+  // PHONE_VERIFICATION_REQUIRED=false is a dev-only switch (refused in
+  // production by the env schema); the unlock code is still required.
+  if (options.requirePhoneVerified && env.PHONE_VERIFICATION_REQUIRED && !user?.phoneVerifiedAt) {
+    throw phoneNotVerified();
+  }
 
   if (!booking) throw noActiveBooking();
 
@@ -331,7 +337,10 @@ export async function currentDeviceFor(userId: string): Promise<DeviceSummary | 
     select: DEVICE_SUMMARY_SELECT,
   });
 
-  return device ? toDeviceSummary(device) : null;
+  if (!device) return null;
+
+  const now = new Date();
+  return toDeviceSummary(device, now, await autoLockDueAt(device));
 }
 
 // --- Shared helpers ----------------------------------------------------------
@@ -565,6 +574,9 @@ export async function requestUnlock(
     expiresInSeconds: Math.round(OTP_TTL_MS / 1000),
     attemptsAllowed: OTP_MAX_ATTEMPTS,
     resendAfterSeconds: OTP_RESEND_COOLDOWN_SECONDS,
+    // Demo only: DEMO_SHOW_OTP is refused in production by the env schema,
+    // and mayPrintOtp is a second, independent guard on the same question.
+    ...(env.DEMO_SHOW_OTP && mayPrintOtp(env.NODE_ENV) ? { demoCode: code } : {}),
   };
 }
 

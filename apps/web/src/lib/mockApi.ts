@@ -12,7 +12,13 @@
  */
 
 import {
+  ADMIN_STATS_WINDOW_DAYS,
   DEVICE_EVENT_LABELS,
+  SENSOR_ALERT_HUMIDITY_PCT,
+  SENSOR_ALERT_TEMPERATURE_C,
+  type AdminStatsResponse,
+  type MyBookingsResponse,
+  type SensorHistoryResponse,
   ERROR_CODES,
   GENERIC_LOGIN_ERROR,
   HISTORY_DEFAULT_LIMIT,
@@ -615,6 +621,12 @@ export async function mockRequest<T>(
       return handleAdminPayments(query) as T;
     case 'GET /admin/audit':
       return handleAdminAudit(query) as T;
+    case 'GET /admin/stats':
+      return handleMockAdminStats() as T;
+    case 'GET /devices/sensor-history':
+      return handleMockSensorHistory(query) as T;
+    case 'GET /bookings/mine':
+      return { items: [] } as MyBookingsResponse as T;
     default:
       break;
   }
@@ -1827,6 +1839,7 @@ function toAdminDevice(device: MockDevice): AdminDeviceRow {
     firmwareVersion: device.firmwareVersion,
     rssi: device.rssi,
     clockSynced: device.clockSynced,
+    simulatable: false,
     credentialIssued: device.credentialIssuedAt !== null,
     credentialIssuedAt: device.credentialIssuedAt,
     lockCommandFailedAt: device.lockCommandFailedAt,
@@ -1887,6 +1900,65 @@ function toDeviceSummary(device: MockDevice): DeviceSummary {
     // the UI would otherwise render never drifts away from "online".
     lastSeenAt: device.lastSeenAt ?? (device.online ? new Date().toISOString() : null),
     doorState: device.doorState,
+    // A plausible room reading, so mock mode shows the sensor panel.
+    environment: device.online
+      ? { temperatureC: 26.4, humidityPct: 58.2, readAt: new Date().toISOString() }
+      : { temperatureC: null, humidityPct: null, readAt: null },
+    // The mock has no command lifecycle to time an auto-lock from.
+    autoLockAt: null,
+    security: { lastTamperAt: null, lastTamperKind: null },
+  };
+}
+
+// --- Bookings history, sensor chart, admin stats (mock) ---------------------
+//
+// Deliberately thin: enough for the pages to render in mock mode. The real
+// behaviour is the API's, and is tested there.
+
+function handleMockSensorHistory(query: URLSearchParams): SensorHistoryResponse {
+  const hours = Math.min(24, Math.max(1, Number(query.get('hours')) || 6));
+  const now = Date.now();
+  const points = Math.min(hours * 60, 120);
+  const stepMs = (hours * 3_600_000) / points;
+
+  return {
+    serialNumber: 'SAFE-MOCK',
+    samples: Array.from({ length: points }, (_, i) => ({
+      at: new Date(now - (points - 1 - i) * stepMs).toISOString(),
+      temperatureC: Math.round((26 + Math.sin(i / 9) * 1.5) * 10) / 10,
+      humidityPct: Math.round((58 + Math.cos(i / 11) * 4) * 10) / 10,
+    })),
+    thresholds: {
+      temperatureC: SENSOR_ALERT_TEMPERATURE_C,
+      humidityPct: SENSOR_ALERT_HUMIDITY_PCT,
+    },
+  };
+}
+
+function handleMockAdminStats(): AdminStatsResponse {
+  const now = Date.now();
+  return {
+    generatedAt: new Date(now).toISOString(),
+    windowDays: ADMIN_STATS_WINDOW_DAYS,
+    totals: {
+      users: 0,
+      devices: 0,
+      liveBookings: 0,
+      completedBookings: 0,
+      revenuePaise: 0,
+      refundedPaise: 0,
+      needsRefund: 0,
+    },
+    revenueByPurpose: { BOOKING: 0, EXTENSION: 0, OVERSTAY: 0 },
+    perDay: Array.from({ length: ADMIN_STATS_WINDOW_DAYS }, (_, i) => ({
+      date: new Date(now - (ADMIN_STATS_WINDOW_DAYS - 1 - i) * 86_400_000)
+        .toISOString()
+        .slice(0, 10),
+      bookings: 0,
+      revenuePaise: 0,
+    })),
+    devices: [],
+    activity: { unlocks: 0, failedUnlocks: 0, locks: 0, autoLocks: 0, tamperAlerts: 0 },
   };
 }
 

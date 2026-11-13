@@ -54,7 +54,8 @@ export type CommandFailureCategory =
   | 'SUPERSEDED';
 
 /** Mirrors the Prisma `CommandActor` enum. */
-export type CommandActor = 'COMPLETION' | 'SWEEPER' | 'ADMIN';
+/** `AUTO_LOCK`: a safe left open past {@link AUTO_LOCK_AFTER_MINUTES}. */
+export type CommandActor = 'COMPLETION' | 'SWEEPER' | 'ADMIN' | 'AUTO_LOCK';
 
 /** Mirrors the Prisma `DoorState` enum. See the schema on why `UNKNOWN` stays. */
 export type DoorState = 'CLOSED' | 'OPEN' | 'UNKNOWN';

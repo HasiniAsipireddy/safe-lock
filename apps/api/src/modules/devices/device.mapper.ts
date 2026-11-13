@@ -1,4 +1,4 @@
-import { effectiveBookingStatus } from '@safelock/shared';
+import { TAMPER_FLAG_HOURS, effectiveBookingStatus } from '@safelock/shared';
 import type {
   AdminCommandRow,
   AdminDeviceRow,
@@ -12,6 +12,7 @@ import type {
   DeviceStatus,
   DeviceSummary,
   DoorState,
+  TamperKind,
 } from '@safelock/shared';
 import { DEVICE_OFFLINE_AFTER_MS, env } from '../../config/env';
 import { snapshotOf, type BookingRow } from '../bookings/booking.mapper';
@@ -33,6 +34,11 @@ export const DEVICE_SUMMARY_SELECT = {
   online: true,
   lastSeenAt: true,
   doorState: true,
+  temperatureC: true,
+  humidityPct: true,
+  sensorReadAt: true,
+  lastTamperAt: true,
+  lastTamperKind: true,
 } as const;
 
 /**
@@ -53,6 +59,11 @@ export const ADMIN_DEVICE_SELECT = {
   online: true,
   lastSeenAt: true,
   doorState: true,
+  temperatureC: true,
+  humidityPct: true,
+  sensorReadAt: true,
+  lastTamperAt: true,
+  lastTamperKind: true,
   inspectionNote: true,
   inspectionNotedAt: true,
   createdAt: true,
@@ -124,6 +135,11 @@ interface DeviceSummaryRow {
   online: boolean;
   lastSeenAt: Date | null;
   doorState: DoorState;
+  temperatureC: number | null;
+  humidityPct: number | null;
+  sensorReadAt: Date | null;
+  lastTamperAt: Date | null;
+  lastTamperKind: TamperKind | null;
 }
 
 /**
@@ -153,6 +169,8 @@ export function isDeviceOnline(
 export function toDeviceSummary(
   device: DeviceSummaryRow,
   now: Date = new Date(),
+  /** From `autoLockDueAt`; only the renter's view computes it. */
+  autoLockAt: Date | null = null,
 ): DeviceSummary {
   return {
     id: device.id,
@@ -164,6 +182,16 @@ export function toDeviceSummary(
     online: isDeviceOnline(device, now),
     lastSeenAt: device.lastSeenAt ? device.lastSeenAt.toISOString() : null,
     doorState: device.doorState,
+    environment: {
+      temperatureC: device.temperatureC,
+      humidityPct: device.humidityPct,
+      readAt: device.sensorReadAt ? device.sensorReadAt.toISOString() : null,
+    },
+    autoLockAt: autoLockAt ? autoLockAt.toISOString() : null,
+    security: {
+      lastTamperAt: device.lastTamperAt ? device.lastTamperAt.toISOString() : null,
+      lastTamperKind: device.lastTamperKind,
+    },
   };
 }
 
@@ -256,6 +284,15 @@ function deviceFlags(device: AdminDeviceRowSource, now: Date): DeviceFlag[] {
     flags.push('DOOR_STATE_UNKNOWN');
   }
 
+  // Ages out rather than being cleared: an incident is worth an admin's eye
+  // for a day, and there is nothing to "fix" about a knock that has stopped.
+  if (
+    device.lastTamperAt &&
+    now.getTime() - device.lastTamperAt.getTime() < TAMPER_FLAG_HOURS * 3_600_000
+  ) {
+    flags.push('TAMPER_DETECTED');
+  }
+
   return flags;
 }
 
@@ -296,6 +333,7 @@ export function toAdminDeviceRow(
   return {
     ...toDeviceSummary(device, now),
     status: device.status,
+    simulatable: env.DEVICE_GATEWAY === 'sim' && device.serialNumber === env.ESP32_SERIAL,
     createdAt: device.createdAt.toISOString(),
     currentBooking: live ? toCurrentBooking(live) : null,
     inspectionNote: device.inspectionNote,

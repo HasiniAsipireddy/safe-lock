@@ -134,7 +134,7 @@ export interface CommandRecord {
   expiresAt: Date;
   ttlMs: number;
   /** Null for a user command. Non-null is what licenses a retry. */
-  systemActor: 'COMPLETION' | 'SWEEPER' | 'ADMIN' | null;
+  systemActor: 'COMPLETION' | 'SWEEPER' | 'ADMIN' | 'AUTO_LOCK' | null;
   userId: string | null;
   bookingId: string | null;
 }
@@ -144,7 +144,7 @@ export interface CreateCommandInput {
   type: CommandType;
   /** Exactly one of these two. The test for "is anyone waiting on this". */
   userId?: string | null;
-  systemActor?: 'COMPLETION' | 'SWEEPER' | 'ADMIN' | null;
+  systemActor?: 'COMPLETION' | 'SWEEPER' | 'ADMIN' | 'AUTO_LOCK' | null;
   bookingId?: string | null;
   /**
    * Which unlock code bought this command, recorded immutably.

@@ -115,6 +115,7 @@ export async function handleAck(
       systemActor: true,
       challengeId: true,
       expiresAt: true,
+      bookingId: true,
     },
   });
 
@@ -226,6 +227,41 @@ export async function handleAck(
           reason: cause instanceof Error ? cause.message : 'unknown',
         },
         'A device command settled but its owner-facing event could not be written',
+      );
+    }
+  }
+
+  /**
+   * An auto-lock has no `userId` — nobody asked for it — but it happened to
+   * the renter's safe and belongs in their feed, so it is written against the
+   * booking's renter with source `SYSTEM`. Only on success: a failed system
+   * lock is retried and, if it never lands, escalated for an admin.
+   */
+  if (command.systemActor === 'AUTO_LOCK' && command.bookingId && payload.result === 'OK') {
+    try {
+      const booking = await prisma.booking.findUnique({
+        where: { id: command.bookingId },
+        select: { userId: true },
+      });
+      if (booking) {
+        await prisma.$transaction((tx) =>
+          recordEvent(tx, {
+            deviceId: device.id,
+            userId: booking.userId,
+            type: 'AUTO_LOCK',
+            requestId: null,
+            source: 'SYSTEM',
+          }),
+        );
+      }
+    } catch (cause) {
+      logger.error(
+        {
+          commandId: command.id,
+          deviceId: device.id,
+          reason: cause instanceof Error ? cause.message : 'unknown',
+        },
+        'An auto-lock settled but its activity event could not be written',
       );
     }
   }

@@ -99,9 +99,11 @@ export function DeviceStatusBadge({ status }: { status: DeviceStatus }) {
  * badge telling the user they still have a safe they do not have.
  */
 const BOOKING_STATUS_TONE: Record<BookingStatus, Tone> = {
-  PENDING_PAYMENT: 'info',
-  ACTIVE: 'positive',
-  OVERSTAY: 'warning',
+  // Red is the booking colour: a slot is taken and its clock is running.
+  // Green stays reserved for the safe itself being secure.
+  PENDING_PAYMENT: 'danger',
+  ACTIVE: 'danger',
+  OVERSTAY: 'danger',
   COMPLETED: 'neutral',
   CANCELLED: 'neutral',
   EXPIRED_UNPAID: 'neutral',

@@ -45,6 +45,7 @@ const TABLES = [
   'DeviceEvent',
   'UnlockChallenge',
   'Command',
+  'SensorReading',
   'Device',
   'Payment',
   'WebhookEvent',

@@ -2,17 +2,24 @@
 
 import { useEffect, useRef, useState } from 'react';
 import {
+  AUTO_LOCK_AFTER_MINUTES,
+  SENSOR_ALERT_HUMIDITY_PCT,
+  SENSOR_ALERT_TEMPERATURE_C,
+  TAMPER_BANNER_MINUTES,
   commandOutcomeCopy,
   type CommandAcceptedResponse,
   type CommandStatusResponse,
   type DeviceSummary,
+  type MyDeviceResponse,
 } from '@safelock/shared';
 import { LockStateBadge, OnlineBadge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { UnlockDialog } from '@/components/UnlockDialog';
+import { SensorChart } from '@/components/SensorChart';
 import { useAuth } from '@/context/AuthContext';
 import { api } from '@/lib/api';
+import { REQUIRE_PHONE_VERIFICATION } from '@/lib/env';
 import { toUserMessage } from '@/lib/apiError';
 import { awaitCommand } from '@/lib/awaitCommand';
 
@@ -46,7 +53,7 @@ export function SafeCard({
   overstayFeePaise?: number;
 }) {
   const { user } = useAuth();
-  const phoneVerified = user?.phoneVerified ?? false;
+  const phoneVerified = !REQUIRE_PHONE_VERIFICATION || (user?.phoneVerified ?? false);
   const feeDue = overstayFeePaise > 0;
   const [device, setDevice] = useState(initial);
   const [locking, setLocking] = useState(false);
@@ -69,6 +76,31 @@ export function SafeCard({
   const pollAbort = useRef<AbortController | null>(null);
 
   useEffect(() => () => pollAbort.current?.abort(), []);
+
+  /**
+   * Refreshes the safe every few seconds while the tab is visible, so the
+   * sensor readings, online state and a lock state changed elsewhere stay
+   * current. Paused while a command is in flight: that poll owns the state.
+   */
+  useEffect(() => {
+    let cancelled = false;
+
+    const refresh = async () => {
+      if (document.visibilityState !== 'visible' || inFlight.current) return;
+      try {
+        const mine = await api.get<MyDeviceResponse>('/devices/mine');
+        if (!cancelled && mine.device && !inFlight.current) setDevice(mine.device);
+      } catch {
+        // A missed refresh is not worth an error banner; the next one retries.
+      }
+    };
+
+    const timer = window.setInterval(() => void refresh(), DEVICE_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const stateUnavailable = device.lockState === 'UNKNOWN';
 
@@ -167,10 +199,10 @@ export function SafeCard({
   }
 
   return (
-    <section className="rounded-2xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+    <section className="rounded-2xl border border-brand-200 border-l-4 border-l-brand-600 bg-white p-5 shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-sm font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
+          <h2 className="text-sm font-semibold tracking-wide text-brand-700 uppercase">
             Your safe
           </h2>
           <p className="mt-1 font-mono text-lg font-bold text-slate-900 dark:text-white">
@@ -185,7 +217,13 @@ export function SafeCard({
 
       {/* Icon + words. The badge above carries colour; this carries meaning
           for anyone who cannot use colour to tell the two apart. */}
-      <div className="mt-4 flex items-center gap-3 rounded-xl bg-slate-50 p-3 dark:bg-slate-800/50">
+      <div
+        className={
+          device.lockState === 'LOCKED'
+            ? 'mt-4 flex items-center gap-3 rounded-xl bg-brand-50 p-3 ring-1 ring-brand-100'
+            : 'mt-4 flex items-center gap-3 rounded-xl bg-slate-50 p-3'
+        }
+      >
         <LockGlyph state={device.lockState} />
         <div>
           <p className="text-base font-bold text-slate-900 dark:text-white">
@@ -199,14 +237,50 @@ export function SafeCard({
         </div>
       </div>
 
-      <dl className="mt-4 text-sm">
+      <TamperBanner security={device.security} />
+
+      {device.lockState === 'UNLOCKED' && device.autoLockAt ? (
+        <AutoLockCountdown at={device.autoLockAt} />
+      ) : null}
+
+      <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
         <div>
           <dt className="text-slate-500 dark:text-slate-400">Last seen</dt>
           <dd className="mt-0.5 font-medium text-slate-900 dark:text-slate-100">
             {formatTimestamp(device.lastSeenAt)}
           </dd>
         </div>
+        <div>
+          <dt className="text-slate-500 dark:text-slate-400">Door</dt>
+          <dd
+            className={
+              device.doorState === 'OPEN' && device.lockState === 'LOCKED'
+                ? 'mt-0.5 font-bold text-red-700'
+                : 'mt-0.5 font-medium text-slate-900 dark:text-slate-100'
+            }
+          >
+            {DOOR_LABEL[device.doorState]}
+          </dd>
+        </div>
+        <SensorReading
+          label="Temperature"
+          value={device.environment.temperatureC}
+          unit="°C"
+          readAt={device.environment.readAt}
+          warnAt={SENSOR_ALERT_TEMPERATURE_C}
+          warnText="Too hot"
+        />
+        <SensorReading
+          label="Humidity"
+          value={device.environment.humidityPct}
+          unit="%"
+          readAt={device.environment.readAt}
+          warnAt={SENSOR_ALERT_HUMIDITY_PCT}
+          warnText="Too humid"
+        />
       </dl>
+
+      <SensorChart />
 
       <div className="mt-5 flex flex-col gap-2 sm:flex-row">
         <Button
@@ -342,6 +416,156 @@ function LockGlyph({ state }: { state: DeviceSummary['lockState'] }) {
         <path d="M8 10V7a4 4 0 0 1 7.5-2" />
       )}
     </svg>
+  );
+}
+
+const DEVICE_REFRESH_MS = 5_000;
+
+const DOOR_LABEL: Record<DeviceSummary['doorState'], string> = {
+  CLOSED: 'Closed',
+  OPEN: 'Open',
+  UNKNOWN: 'Unknown',
+};
+
+/**
+ * A recent tampering report, worded by strength: a forced door is stated as a
+ * fact the sensor reported, vibration as something that *may* be tampering —
+ * the renter bumping the cabinet trips it too.
+ */
+function TamperBanner({ security }: { security: DeviceSummary['security'] }) {
+  if (!security.lastTamperAt || !security.lastTamperKind) return null;
+
+  const age = Date.now() - new Date(security.lastTamperAt).getTime();
+  if (age > TAMPER_BANNER_MINUTES * 60_000) return null;
+
+  const forced = security.lastTamperKind === 'DOOR_FORCED';
+
+  return (
+    <div
+      role="alert"
+      className="mt-4 flex gap-3 rounded-xl border-2 border-red-600 bg-red-50 p-3 text-sm text-red-900"
+    >
+      <svg
+        className="mt-0.5 size-5 shrink-0"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={2}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+        <path d="M12 9v4" />
+        <path d="M12 17h.01" />
+      </svg>
+      <div>
+        <p className="font-bold">
+          {forced ? 'Door forced open while locked' : 'Possible tampering detected'}
+        </p>
+        <p className="mt-0.5">
+          {forced
+            ? 'Your safe reported its door opening while the lock was engaged'
+            : 'Your safe detected knocking or shaking while it was locked'}{' '}
+          at {formatTimestamp(security.lastTamperAt)}. If this was not you, check on your safe
+          and contact support.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * "Locks itself in 1:42". Ticks locally between the card's 5-second device
+ * refreshes; the deadline itself always comes from the server.
+ */
+function AutoLockCountdown({ at }: { at: string }) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const remainingMs = new Date(at).getTime() - now;
+  const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  const label = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+
+  return (
+    <p
+      role="status"
+      className="mt-3 flex items-center gap-2 rounded-xl bg-amber-50 p-3 text-sm text-amber-900 ring-1 ring-amber-200"
+    >
+      <svg
+        className="size-5 shrink-0"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={2}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" />
+      </svg>
+      {seconds > 0 ? (
+        <span>
+          For safety, your safe locks itself <strong>{AUTO_LOCK_AFTER_MINUTES} minutes</strong>{' '}
+          after it opens. Locking in <strong className="tabular-nums">{label}</strong>.
+        </span>
+      ) : (
+        <span>Locking your safe now…</span>
+      )}
+    </p>
+  );
+}
+
+/** A reading older than this is shown as stale rather than as current. */
+const SENSOR_STALE_MS = 60_000;
+
+function SensorReading({
+  label,
+  value,
+  unit,
+  readAt,
+  warnAt,
+  warnText,
+}: {
+  label: string;
+  value: number | null;
+  unit: string;
+  readAt: string | null;
+  /** The server's alert threshold; at or above it the reading is flagged. */
+  warnAt: number;
+  warnText: string;
+}) {
+  const age = readAt ? Date.now() - new Date(readAt).getTime() : Infinity;
+  const stale = value === null || age > SENSOR_STALE_MS;
+  const warn = !stale && value !== null && value >= warnAt;
+
+  return (
+    <div className="rounded-xl bg-slate-50 p-3 dark:bg-slate-800/50">
+      <dt className="text-slate-500 dark:text-slate-400">{label}</dt>
+      <dd
+        className={
+          warn
+            ? 'mt-0.5 text-xl font-bold text-red-700 dark:text-red-300'
+            : 'mt-0.5 text-xl font-bold text-slate-900 dark:text-slate-100'
+        }
+      >
+        {value === null ? '—' : `${value.toFixed(1)} ${unit}`}
+      </dd>
+      {value === null ? (
+        <p className="text-xs text-slate-500 dark:text-slate-400">No reading yet</p>
+      ) : stale ? (
+        <p className="text-xs text-amber-800 dark:text-amber-200">
+          Last read {formatTimestamp(readAt)}
+        </p>
+      ) : warn ? (
+        <p className="text-xs font-medium text-red-700 dark:text-red-300">⚠ {warnText}</p>
+      ) : null}
+    </div>
   );
 }
 

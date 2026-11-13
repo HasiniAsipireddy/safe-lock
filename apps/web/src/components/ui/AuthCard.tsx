@@ -22,7 +22,7 @@ export function AuthCard({ title, subtitle, children, footer }: AuthCardProps) {
         ) : null}
       </div>
 
-      <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6 dark:border-slate-800 dark:bg-slate-900">
+      <div className="rounded-2xl border border-brand-200 bg-white p-5 shadow-sm sm:p-6 dark:border-slate-800 dark:bg-slate-900">
         {children}
       </div>
 

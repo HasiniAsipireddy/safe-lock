@@ -125,7 +125,7 @@ function DashboardContent() {
 
       {state === 'loading' ? (
         <section
-          className="rounded-2xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900"
+          className="rounded-2xl border border-brand-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900"
           role="status"
           aria-live="polite"
         >
@@ -180,7 +180,7 @@ function DashboardContent() {
           history is their own record and stays readable between bookings. */}
       <Link
         href="/history"
-        className="inline-flex min-h-12 items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-5 text-base font-semibold text-slate-900 transition-colors hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
+        className="inline-flex min-h-12 items-center justify-center gap-2 rounded-xl border border-brand-300 bg-white px-5 text-base font-semibold text-brand-800 transition-colors hover:bg-brand-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
       >
         View activity history
       </Link>
@@ -220,7 +220,7 @@ function NoBooking() {
   }, []);
 
   return (
-    <section className="rounded-2xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+    <section className="rounded-2xl border border-brand-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
       <h2 className="text-base font-bold text-slate-900 dark:text-white">
         You don’t have a safe booked
       </h2>
@@ -231,7 +231,7 @@ function NoBooking() {
 
       <Link
         href="/book"
-        className="mt-4 inline-flex min-h-12 w-full items-center justify-center rounded-xl bg-brand-600 px-5 text-base font-semibold text-white transition-colors hover:bg-brand-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500"
+        className="mt-4 inline-flex min-h-12 w-full items-center justify-center rounded-xl bg-red-600 px-5 text-base font-semibold text-white transition-colors hover:bg-red-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-500"
       >
         Book a safe
       </Link>

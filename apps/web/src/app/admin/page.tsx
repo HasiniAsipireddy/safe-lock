@@ -8,6 +8,7 @@ import { BookingsTab } from '@/components/admin/BookingsTab';
 import { UsersTab } from '@/components/admin/UsersTab';
 import { PaymentsTab } from '@/components/admin/PaymentsTab';
 import { AuditTab } from '@/components/admin/AuditTab';
+import { StatsTab } from '@/components/admin/StatsTab';
 import { cn } from '@/lib/cn';
 
 /**
@@ -34,6 +35,7 @@ const TABS = [
   { id: 'devices', label: 'Devices' },
   { id: 'users', label: 'Users' },
   { id: 'payments', label: 'Payments' },
+  { id: 'stats', label: 'Stats' },
   { id: 'audit', label: 'Audit' },
 ] as const;
 
@@ -103,6 +105,7 @@ function AdminPanel() {
         )}
         {tab === 'users' && <UsersTab refreshKey={inventoryVersion} />}
         {tab === 'payments' && <PaymentsTab />}
+        {tab === 'stats' && <StatsTab />}
         {tab === 'audit' && <AuditTab />}
       </div>
     </main>

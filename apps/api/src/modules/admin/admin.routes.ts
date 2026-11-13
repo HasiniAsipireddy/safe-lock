@@ -10,6 +10,7 @@ import {
   listDevicesQuerySchema,
   listPaymentsQuerySchema,
   listUsersQuerySchema,
+  simulateDeviceSchema,
   waiveOverstaySchema,
 } from '@safelock/shared';
 import { requireAuth } from '../../middleware/auth';
@@ -22,6 +23,7 @@ import {
   getDeviceCommands,
   getDevices,
   getPayments,
+  getStats,
   getUsers,
   postClearInspection,
   postClearPaymentReview,
@@ -30,6 +32,7 @@ import {
   postDeviceCredential,
   postForceCompleteBooking,
   postRetireDevice,
+  postSimulateDevice,
   postWaiveOverstay,
 } from './admin.controller';
 
@@ -102,6 +105,18 @@ export function createAdminRouter(limiters: Limiters): Router {
     postDeviceCredential,
   );
 
+  /**
+   * Demo only: makes the simulated safe report knocking, a forced door or
+   * overheating, so tamper and sensor alerts can be shown without hardware.
+   * 409 for anything that is not the in-process simulated board.
+   */
+  router.post(
+    '/devices/:id/simulate',
+    limiters.adminWrite,
+    validateBody(simulateDeviceSchema),
+    postSimulateDevice,
+  );
+
   router.post(
     '/devices/:id/retire',
     limiters.adminWrite,
@@ -139,6 +154,8 @@ export function createAdminRouter(limiters: Limiters): Router {
   router.get('/users', validateQuery(listUsersQuerySchema), getUsers);
   router.get('/payments', validateQuery(listPaymentsQuerySchema), getPayments);
   router.get('/audit', validateQuery(listAuditQuerySchema), getAudit);
+  /** Aggregates for the Stats tab. Counts and sums only — no user is named. */
+  router.get('/stats', getStats);
 
   return router;
 }

@@ -19,7 +19,7 @@ const VARIANTS: Record<Variant, string> = {
     'bg-brand-600 text-white hover:bg-brand-700 active:bg-brand-800 ' +
     'dark:bg-brand-500 dark:hover:bg-brand-400 dark:active:bg-brand-600',
   secondary:
-    'border border-slate-300 bg-white text-slate-900 hover:bg-slate-50 active:bg-slate-100 ' +
+    'border border-brand-300 bg-white text-brand-800 hover:bg-brand-50 active:bg-brand-100 ' +
     'dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800',
   ghost:
     'text-brand-700 hover:bg-brand-50 active:bg-brand-100 ' +

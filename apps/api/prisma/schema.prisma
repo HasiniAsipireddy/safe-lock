@@ -200,6 +200,8 @@ enum CommandActor {
   SWEEPER
   /// An admin acting on a device directly.
   ADMIN
+  /// A safe left unlocked past AUTO_LOCK_AFTER_MINUTES (@safelock/shared).
+  AUTO_LOCK
 }
 
 /// What happened to a safe. Append-only; the /history page reads these.
@@ -210,11 +212,25 @@ enum DeviceEventType {
   UNLOCK_CONFIRMED
   /// A wrong, expired or exhausted code.
   UNLOCK_FAILED
+  /// The server locked a safe left open past the auto-lock timeout.
+  AUTO_LOCK
+  /// Knocking or shaking while the safe was locked.
+  VIBRATION_DETECTED
+  /// The door sensor reported OPEN while the bolt was LOCKED.
+  DOOR_FORCED
+}
+
+/// What kind of tampering a safe last reported.
+enum TamperKind {
+  VIBRATION
+  DOOR_FORCED
 }
 
 /// Where a device event came from. Mobile and hardware join this later.
 enum DeviceEventSource {
   WEB
+  /// Written by the server on its own initiative (auto-lock).
+  SYSTEM
 }
 
 /// Why an UNLOCK_FAILED event failed.
@@ -377,6 +393,14 @@ enum NotificationType {
   /// An unlock attempt that burned every attempt — a possible tampering
   /// signal, which is why it interrupts the owner. See docs/decisions.md.
   UNLOCK_FAILED_MAX_ATTEMPTS
+  /// The DHT22 crossed SENSOR_ALERT_TEMPERATURE_C. Carries no deviceEventId.
+  SENSOR_TEMPERATURE_HIGH
+  /// The DHT22 crossed SENSOR_ALERT_HUMIDITY_PCT.
+  SENSOR_HUMIDITY_HIGH
+  /// Vibration while locked. Linked to its VIBRATION_DETECTED event.
+  TAMPER_VIBRATION
+  /// Door opened while locked. Linked to its DOOR_FORCED event.
+  TAMPER_DOOR_FORCED
 }
 
 model User {
@@ -466,6 +490,20 @@ model Device {
   /// `BOOT` state report.
   bootId          String?
 
+  /// Last environment reading from the safe's DHT22 (ESP32 HTTP gateway).
+  /// Telemetry only — a measurement, so a float is right here, and nothing
+  /// is gated on it. Null until the first valid reading.
+  temperatureC    Float?
+  humidityPct     Float?
+  sensorReadAt    DateTime?
+
+  /// The last suspected tampering (vibration or a forced door while locked)
+  /// and what kind. Bumped by every such reading, so a continuous incident
+  /// stays one incident; see TAMPER_ALERT_COOLDOWN_MINUTES. Never cleared —
+  /// the admin flag and dashboard banner age out by time instead.
+  lastTamperAt    DateTime?
+  lastTamperKind  TamperKind?
+
   /// Next command sequence number, allocated under the device row lock.
   ///
   /// Strictly increasing per device, and the device persists the highest it has
@@ -523,6 +561,7 @@ model Device {
   unlockChallenges UnlockChallenge[]
   bookings         Booking[]
   commands         Command[]
+  sensorReadings   SensorReading[]
 
   /// Supports the "oldest AVAILABLE first" device pick.
   @@index([status, createdAt])
@@ -1162,4 +1201,23 @@ model AuditLog {
 
   @@index([userId, createdAt])
   @@index([action, createdAt])
+}
+
+/// A stored DHT22 sample, at most one per SENSOR_SAMPLE_INTERVAL_SECONDS per
+/// device. The gateway polls every few seconds; storing every poll would be
+/// ~29k rows a day per safe for a chart that draws one point a minute.
+///
+/// Telemetry, not a security record: nothing is gated on it. Retention is the
+/// same open question as DeviceEvent — nothing deletes these yet.
+model SensorReading {
+  id           String   @id @default(cuid())
+  deviceId     String
+  temperatureC Float
+  humidityPct  Float
+  readAt       DateTime
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  /// The chart's query: one device's readings in a time window.
+  @@index([deviceId, readAt])
 }

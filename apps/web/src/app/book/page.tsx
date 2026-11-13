@@ -147,29 +147,40 @@ function BookContent() {
         </p>
       </header>
 
-      <section className="rounded-2xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
-        <label
-          htmlFor="hours"
-          className="block text-sm font-semibold text-slate-900 dark:text-white"
-        >
-          How long do you need it?
-        </label>
-
-        <select
-          id="hours"
-          value={hours}
-          onChange={(event) => setHours(Number(event.target.value))}
-          className="mt-2 min-h-12 w-full rounded-xl border border-slate-300 bg-white px-3 text-base text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-        >
-          {quote.options.map((option) => (
-            <option key={option.hours} value={option.hours}>
-              {option.hours} hour{option.hours === 1 ? '' : 's'} — {formatInr(option.pricePaise)}
-            </option>
-          ))}
-        </select>
+      <section className="rounded-2xl border border-red-200 border-l-4 border-l-red-600 bg-white p-5 shadow-sm">
+        {/*
+          Time slots as native radio buttons, styled as tappable chips: red is
+          the booking colour. Native inputs keep arrow-key navigation and the
+          screen-reader semantics a hand-rolled button group would have to fake.
+        */}
+        <fieldset>
+          <legend className="block text-sm font-semibold text-slate-900">
+            How long do you need it?
+          </legend>
+          <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
+            {quote.options.map((option) => (
+              <label key={option.hours} className="block cursor-pointer">
+                <input
+                  type="radio"
+                  name="hours"
+                  value={option.hours}
+                  checked={hours === option.hours}
+                  onChange={() => setHours(option.hours)}
+                  className="peer sr-only"
+                />
+                <span className="flex min-h-14 flex-col items-center justify-center rounded-xl border border-red-200 bg-white px-2 py-2 text-center transition-colors peer-checked:border-red-600 peer-checked:bg-red-600 peer-checked:text-white peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-red-500 hover:bg-red-50 peer-checked:hover:bg-red-700">
+                  <span className="text-base font-bold">
+                    {option.hours} hr{option.hours === 1 ? '' : 's'}
+                  </span>
+                  <span className="text-xs opacity-80">{formatInr(option.pricePaise)}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
 
         <p
-          className="mt-4 text-2xl font-bold text-slate-900 dark:text-white"
+          className="mt-5 text-3xl font-bold text-red-600"
           aria-live="polite"
         >
           {selected ? formatInr(selected.pricePaise) : '—'}
@@ -183,7 +194,7 @@ function BookContent() {
           overstay charge is the one surprise this product could spring on
           someone, so it is spelled out while they still have the choice.
         */}
-        <div className="mt-5 rounded-xl bg-slate-50 p-4 dark:bg-slate-800/50">
+        <div className="mt-5 rounded-xl bg-red-50 p-4 ring-1 ring-red-100">
           <h2 className="text-sm font-semibold text-slate-900 dark:text-white">
             If you run over
           </h2>

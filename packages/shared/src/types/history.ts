@@ -87,7 +87,16 @@ export interface HistoryResponse {
  * unlock — or an unlock attempt that burned every attempt — is worth
  * interrupting someone for. See docs/decisions.md.
  */
-export type NotificationType = 'UNLOCK_CONFIRMED' | 'UNLOCK_FAILED_MAX_ATTEMPTS';
+export type NotificationType =
+  | 'UNLOCK_CONFIRMED'
+  | 'UNLOCK_FAILED_MAX_ATTEMPTS'
+  /** The safe's DHT22 crossed an alert threshold. Not about a device event. */
+  | 'SENSOR_TEMPERATURE_HIGH'
+  | 'SENSOR_HUMIDITY_HIGH'
+  /** Knocking or shaking while locked. Linked to its device event. */
+  | 'TAMPER_VIBRATION'
+  /** The door opened while the bolt was locked. */
+  | 'TAMPER_DOOR_FORCED';
 
 export interface NotificationItem {
   id: string;

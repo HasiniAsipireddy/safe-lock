@@ -99,7 +99,7 @@ export function NotificationBell() {
         aria-expanded={open}
         aria-controls={panelId}
         aria-label={label}
-        className="relative inline-flex size-10 items-center justify-center rounded-lg text-slate-600 transition-colors hover:bg-slate-50 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
+        className="relative inline-flex size-10 items-center justify-center rounded-lg text-brand-50 transition-colors hover:bg-brand-800 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
       >
         <svg
           className="size-5"

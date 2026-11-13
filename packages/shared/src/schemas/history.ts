@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import {
+  SENSOR_ALERT_HUMIDITY_PCT,
+  SENSOR_ALERT_TEMPERATURE_C,
+  SENSOR_HISTORY_MAX_HOURS,
+} from '../constants';
 import type { DeviceEventType } from '../types/devices';
 import type { NotificationType, UnlockFailureReason } from '../types/history';
 
@@ -55,6 +60,13 @@ export const historyQuerySchema = z.object({
   limit: limitSchema,
 });
 
+/** Query of `GET /devices/sensor-history`: how many hours back, 1–24. */
+export const sensorHistoryQuerySchema = z.object({
+  hours: z.coerce.number().int().min(1).max(SENSOR_HISTORY_MAX_HOURS).default(6),
+});
+
+export type SensorHistoryQuery = z.infer<typeof sensorHistoryQuerySchema>;
+
 /** Query of `GET /notifications`. Unread-first ordering is not configurable. */
 export const notificationsQuerySchema = z.object({
   limit: limitSchema,
@@ -94,6 +106,9 @@ export const DEVICE_EVENT_LABELS: Record<DeviceEventType, string> = {
   UNLOCK_REQUESTED: 'Unlock code sent',
   UNLOCK_CONFIRMED: 'Safe unlocked',
   UNLOCK_FAILED: 'Unlock failed',
+  AUTO_LOCK: 'Safe auto-locked',
+  VIBRATION_DETECTED: 'Knocking or shaking detected',
+  DOOR_FORCED: 'Door forced open while locked',
 };
 
 /** Why an unlock failed, in words a safe owner can act on. */
@@ -128,5 +143,21 @@ export const NOTIFICATION_COPY: Record<NotificationType, { title: string; body: 
   UNLOCK_FAILED_MAX_ATTEMPTS: {
     title: 'Too many incorrect unlock codes',
     body: 'Someone entered the wrong code too many times and the code was cancelled. If this was not you, contact support.',
+  },
+  SENSOR_TEMPERATURE_HIGH: {
+    title: 'Your safe is getting hot',
+    body: `The temperature inside your safe reached ${SENSOR_ALERT_TEMPERATURE_C}°C or more. Check on heat-sensitive items such as phones or medicine.`,
+  },
+  TAMPER_VIBRATION: {
+    title: 'Someone may be tampering with your safe',
+    body: 'Your safe detected knocking or shaking while it was locked. If this was not you, contact support or check on your safe.',
+  },
+  TAMPER_DOOR_FORCED: {
+    title: 'Your safe door was forced open',
+    body: 'The door sensor reported the door opening while your safe was locked. Check on your safe and contact support now.',
+  },
+  SENSOR_HUMIDITY_HIGH: {
+    title: 'Your safe is very humid',
+    body: `Humidity inside your safe reached ${SENSOR_ALERT_HUMIDITY_PCT}% or more. Check on documents, electronics and anything that can be damaged by moisture.`,
   },
 };

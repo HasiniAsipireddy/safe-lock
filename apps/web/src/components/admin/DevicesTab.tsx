@@ -10,6 +10,7 @@ import {
   type AdminDeviceRow,
   type BulkCreateResult,
   type DeviceCredentialResponse,
+  type SimulationScenario,
   type DeviceStatus,
   type Paginated,
 } from '@safelock/shared';
@@ -236,6 +237,7 @@ export function DevicesTab({ onInventoryChange }: { onInventoryChange?: () => vo
       hideLabelOnMobile: true,
       cell: (device) => (
         <span className="flex flex-wrap gap-2">
+          {device.simulatable ? <SimulationControls device={device} onDone={refresh} /> : null}
           {device.status === 'NEEDS_INSPECTION' && (
             <Button
               variant="secondary"
@@ -783,5 +785,77 @@ function BulkResults({ result }: { result: BulkCreateResult }) {
         ))}
       </ul>
     </div>
+  );
+}
+
+/**
+ * Demo controls for the simulated safe (`DEVICE_GATEWAY=sim`).
+ *
+ * Each button makes the in-process board report something, and everything
+ * after that is the real path: tamper detection, the renter's bell and feed,
+ * the flag on this row, the audit log. Shown only when the API says the row is
+ * simulatable, and refused by the API for anything else.
+ */
+const SCENARIOS: Array<{ id: SimulationScenario; label: string; done: string }> = [
+  {
+    id: 'VIBRATION',
+    label: 'Simulate knocking',
+    done: 'Knocking simulated. If the safe is locked, the renter is alerted.',
+  },
+  {
+    id: 'FORCED_DOOR',
+    label: 'Simulate forced door',
+    done: 'Door forced open for 15 seconds. If the safe is locked, the renter is alerted.',
+  },
+  {
+    id: 'HEAT',
+    label: 'Simulate overheating',
+    done: 'Temperature and humidity spiking for 2 minutes. The renter gets a sensor alert.',
+  },
+];
+
+function SimulationControls({
+  device,
+  onDone,
+}: {
+  device: AdminDeviceRow;
+  onDone: () => void;
+}) {
+  const toast = useToast();
+  const [running, setRunning] = useState<SimulationScenario | null>(null);
+
+  async function run(scenario: (typeof SCENARIOS)[number]) {
+    if (running) return;
+    setRunning(scenario.id);
+    try {
+      await api.post(`/admin/devices/${device.id}/simulate`, { scenario: scenario.id });
+      toast.success(scenario.done);
+      onDone();
+    } catch (error) {
+      toast.error(toUserMessage(error));
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  return (
+    <span className="flex w-full flex-col gap-1.5 rounded-xl border border-dashed border-amber-400 bg-amber-50 p-2">
+      <span className="text-xs font-bold text-amber-900">Demo · simulated safe</span>
+      <span className="flex flex-wrap gap-1.5">
+        {SCENARIOS.map((scenario) => (
+          <Button
+            key={scenario.id}
+            variant="secondary"
+            fullWidth={false}
+            className="min-h-9 px-2.5 text-xs"
+            loading={running === scenario.id}
+            disabled={running !== null && running !== scenario.id}
+            onClick={() => void run(scenario)}
+          >
+            {scenario.label}
+          </Button>
+        ))}
+      </span>
+    </span>
   );
 }

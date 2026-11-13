@@ -57,6 +57,49 @@ export interface DeviceSummary {
    * means the sensor did not report — a fault, never "no sensor fitted".
    */
   doorState: DoorState;
+  /**
+   * The last valid temperature / humidity reading from the safe's sensor
+   * (DHT22 on the ESP32 build), or nulls if it has never reported one.
+   * Telemetry only: nothing is gated on it. `readAt` lets the UI say a
+   * reading is stale rather than present an old number as current.
+   */
+  environment: {
+    temperatureC: number | null;
+    humidityPct: number | null;
+    readAt: string | null;
+  };
+  /**
+   * When the server will lock this safe by itself, if it is still open.
+   * Null when locked, when the door is reported open, or when the unlock was
+   * not one we commanded (a physical key). See `AUTO_LOCK_AFTER_MINUTES`.
+   */
+  autoLockAt: string | null;
+  /**
+   * The last suspected tampering, from the door and vibration sensors. Kept
+   * for {@link TAMPER_FLAG_HOURS}; the dashboard banners anything newer than
+   * {@link TAMPER_BANNER_MINUTES}.
+   */
+  security: {
+    lastTamperAt: string | null;
+    lastTamperKind: TamperKind | null;
+  };
+}
+
+/** One stored DHT22 sample. */
+export interface SensorSample {
+  /** ISO timestamp of the reading. */
+  at: string;
+  temperatureC: number;
+  humidityPct: number;
+}
+
+/** Response body of `GET /devices/sensor-history`. */
+export interface SensorHistoryResponse {
+  /** Null when the caller has no live booking. */
+  serialNumber: string | null;
+  /** Oldest first, at most one per `SENSOR_SAMPLE_INTERVAL_SECONDS`. */
+  samples: SensorSample[];
+  thresholds: { temperatureC: number; humidityPct: number };
 }
 
 /**
@@ -78,10 +121,23 @@ export interface MyDeviceResponse {
  * `UNLOCK_REQUESTED` means a code was sent, not that anything opened.
  * `UNLOCK_FAILED` covers a wrong, expired or exhausted code.
  */
-export type DeviceEventType = 'LOCK' | 'UNLOCK_REQUESTED' | 'UNLOCK_CONFIRMED' | 'UNLOCK_FAILED';
+export type DeviceEventType =
+  | 'LOCK'
+  | 'UNLOCK_REQUESTED'
+  | 'UNLOCK_CONFIRMED'
+  | 'UNLOCK_FAILED'
+  /** The server locked a safe left open past the auto-lock timeout. */
+  | 'AUTO_LOCK'
+  /** Knocking or shaking while the safe was locked — a possible forced entry. */
+  | 'VIBRATION_DETECTED'
+  /** The door sensor reported OPEN while the bolt was LOCKED — forced open. */
+  | 'DOOR_FORCED';
+
+/** What kind of tampering a safe last reported. */
+export type TamperKind = 'VIBRATION' | 'DOOR_FORCED';
 
 /** Where a device event originated. Only the web app for now. */
-export type DeviceEventSource = 'WEB';
+export type DeviceEventSource = 'WEB' | 'SYSTEM';
 
 /**
  * There is no `LockResponse` or `UnlockConfirmResponse` any more.
@@ -111,6 +167,11 @@ export interface UnlockRequestResponse {
   attemptsAllowed: number;
   /** Seconds the client should disable "Resend" for. */
   resendAfterSeconds: number;
+  /**
+   * The code itself — **only** when the API runs with `DEMO_SHOW_OTP=true`,
+   * which the env schema refuses in production. Absent otherwise.
+   */
+  demoCode?: string;
 }
 
 /**
@@ -156,6 +217,11 @@ export interface AdminDeviceRow {
    * normally. Shown so a fleet-wide SNTP problem is visible.
    */
   clockSynced: boolean | null;
+  /**
+   * True when this row is the in-process simulated ESP32 (`DEVICE_GATEWAY=sim`),
+   * so the panel can offer the demo scenarios. Always false for real hardware.
+   */
+  simulatable: boolean;
   /** Whether a credential has been issued. Never the credential itself. */
   credentialIssued: boolean;
   credentialIssuedAt: string | null;
@@ -188,7 +254,9 @@ export type DeviceFlag =
   /** Reported `UNLOCKED` with no booking entitled to have it open (§8.3). */
   | 'UNEXPECTED_UNLOCKED'
   /** The door sensor is not reporting. Units ship with one; this is a fault. */
-  | 'DOOR_STATE_UNKNOWN';
+  | 'DOOR_STATE_UNKNOWN'
+  /** Vibration or a forced door while locked, within `TAMPER_FLAG_HOURS`. */
+  | 'TAMPER_DETECTED';
 
 /**
  * One row of a device's recent-commands expander.
@@ -388,4 +456,11 @@ export const DEVICE_FLAG_COPY: Record<DeviceFlag, { label: string; action: strin
     label: 'Door sensor not reporting',
     action: 'Units ship with a sensor, so this is a fault. The safe cannot be rented until it reports again.',
   },
+  TAMPER_DETECTED: {
+    label: 'Possible forced entry',
+    action: 'The safe reported knocking or its door opening while locked. Check it in person, and check the Audit tab for when.',
+  },
 };
+
+/** The demo scenarios the admin panel can trigger on a simulated safe. */
+export type SimulationScenario = 'VIBRATION' | 'FORCED_DOOR' | 'HEAT';

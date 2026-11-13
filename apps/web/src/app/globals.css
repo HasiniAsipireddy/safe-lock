@@ -1,28 +1,39 @@
 @import 'tailwindcss';
 
-/* Dark mode follows the OS preference (Tailwind v4 default `dark:` variant). */
+/*
+ * Light only: the demo look is white, green and red. `dark:` classes now apply
+ * only under an explicit `.dark` class, which nothing sets — so the OS dark
+ * preference no longer turns the app dark. Delete this line to bring the
+ * old OS-following dark mode back.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
   --font-sans:
     ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
     sans-serif;
 
-  /* Brand — a safe/vault feel: deep slate with an amber accent. */
-  --color-brand-50: #eef5ff;
-  --color-brand-100: #d9e8ff;
-  --color-brand-200: #bcd7ff;
-  --color-brand-300: #8ebdff;
-  --color-brand-400: #5998fb;
-  --color-brand-500: #3475f0;
-  --color-brand-600: #2059dc;
-  --color-brand-700: #1c46b2;
-  --color-brand-800: #1c3c8c;
-  --color-brand-900: #1c376f;
-  --color-brand-950: #152344;
+  /*
+   * Colour language:
+   *   green (brand) — safety: the safe, its lock, primary actions
+   *   red           — bookings and anything counting down
+   *   white         — the base everything sits on
+   */
+  --color-brand-50: #f0fdf4;
+  --color-brand-100: #dcfce7;
+  --color-brand-200: #bbf7d0;
+  --color-brand-300: #86efac;
+  --color-brand-400: #4ade80;
+  --color-brand-500: #22c55e;
+  --color-brand-600: #16a34a;
+  --color-brand-700: #15803d;
+  --color-brand-800: #166534;
+  --color-brand-900: #14532d;
+  --color-brand-950: #052e16;
 }
 
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
 }
 
 html,
@@ -31,17 +42,10 @@ body {
 }
 
 body {
-  background-color: var(--color-slate-50);
+  background-color: var(--color-brand-50);
   color: var(--color-slate-900);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
-}
-
-@media (prefers-color-scheme: dark) {
-  body {
-    background-color: var(--color-slate-950);
-    color: var(--color-slate-100);
-  }
 }
 
 /* Visible focus ring for keyboard users on every interactive element. */

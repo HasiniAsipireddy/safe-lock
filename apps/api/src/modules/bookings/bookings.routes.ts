@@ -4,6 +4,8 @@ import {
   emptyBookingBodySchema,
   extendBookingSchema,
   type BookingDetailResponse,
+  type BookingReceiptResponse,
+  type MyBookingsResponse,
   type CreateBookingInput,
   type CurrentBookingResponse,
   type ExtendBookingInput,
@@ -20,6 +22,7 @@ import {
   createOverstayOrder,
 } from '../payments/booking.payments';
 import { toBookingSummary } from './booking.mapper';
+import { bookingReceipt, myBookings } from './myBookings.service';
 import {
   cancelBooking,
   collectBooking,
@@ -71,6 +74,32 @@ export function createBookingsRouter(limiters: Limiters): Router {
         extension: row ? await extensionAvailability(row, now) : null,
         quote: quote(),
       };
+      res.status(200).json(response);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /**
+   * The caller's bookings, newest first, each with the money that moved for
+   * it. Registered before `/:id` so "mine" is never read as a booking id.
+   */
+  router.get('/mine', requireAuth, limiters.bookingRead, async (req, res, next) => {
+    try {
+      const response: MyBookingsResponse = await myBookings(req.user!.id);
+      res.status(200).json(response);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /** A printable receipt for one of the caller's bookings. 404 for anyone else's. */
+  router.get('/:id/receipt', requireAuth, limiters.bookingRead, async (req, res, next) => {
+    try {
+      const response: BookingReceiptResponse = await bookingReceipt(
+        routeParam(req, 'id'),
+        req.user!.id,
+      );
       res.status(200).json(response);
     } catch (error) {
       next(error);

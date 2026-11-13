@@ -17,6 +17,9 @@ const TONES: Record<DeviceEventType, string> = {
   UNLOCK_REQUESTED: 'bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300',
   UNLOCK_CONFIRMED: 'bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-300',
   UNLOCK_FAILED: 'bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300',
+  AUTO_LOCK: 'bg-brand-100 text-brand-800 dark:bg-brand-950 dark:text-brand-300',
+  VIBRATION_DETECTED: 'bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300',
+  DOOR_FORCED: 'bg-red-600 text-white dark:bg-red-500',
 };
 
 export function EventIcon({ type }: { type: DeviceEventType }) {
@@ -42,6 +45,32 @@ export function EventIcon({ type }: { type: DeviceEventType }) {
           <>
             <rect x="3" y="11" width="18" height="10" rx="2" />
             <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+          </>
+        )}
+        {type === 'VIBRATION_DETECTED' && (
+          <>
+            {/* Shake lines either side of a box: movement, not a lock state. */}
+            <rect x="7" y="6" width="10" height="12" rx="1.5" />
+            <path d="M3 9v6" />
+            <path d="M21 9v6" />
+          </>
+        )}
+        {type === 'DOOR_FORCED' && (
+          <>
+            {/* A door swung open on its hinge, with an exclamation mark. */}
+            <path d="M4 21V3h9l5 3v15" />
+            <path d="M13 3v18" />
+            <path d="M8.5 9v4" />
+            <path d="M8.5 16h.01" />
+          </>
+        )}
+        {type === 'AUTO_LOCK' && (
+          <>
+            {/* A padlock with a clock face: locked, and by the timer. */}
+            <rect x="3" y="11" width="18" height="10" rx="2" />
+            <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+            <circle cx="12" cy="16" r="2.5" />
+            <path d="M12 15v1l.8.6" />
           </>
         )}
         {type === 'UNLOCK_CONFIRMED' && (

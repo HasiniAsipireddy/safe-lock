@@ -113,6 +113,20 @@ export async function deliverOtp(params: {
   }
 
   /**
+   * Dev-only: with `PHONE_VERIFICATION_REQUIRED=false` (refused in production)
+   * a user with no verified WhatsApp number gets the code from the console
+   * print above instead. Treated as delivered only when that print happened —
+   * a code nobody can read must still fail as `OTP_DELIVERY_FAILED`.
+   */
+  if (
+    !env.PHONE_VERIFICATION_REQUIRED &&
+    mayPrintOtp(env.NODE_ENV) &&
+    (!recipient.phoneVerifiedAt || !recipient.phone || !recipient.whatsappConsentAt)
+  ) {
+    return { status: 'SENT', providerMessageId: 'dev-console' };
+  }
+
+  /**
    * The unlock code ignores the daily cap on purpose.
    *
    * Everything else a cap protects — cost, spam — is bounded here by the

@@ -654,6 +654,8 @@ interface DeviceGateway {
   must never read as "you mistyped it". The dialog then polls the command and
   can be dismissed with "Close and check later", which is honest: closing
   stops the polling, not the command.
+- `/bookings` — the renter's bookings with what they paid; each links to
+  `/bookings/[id]/receipt`, printable via the browser ("Save as PDF").
 - `/history` — activity log, grouped by local day, "Load more" (not infinite
   scroll — an endless list has no end for a keyboard or screen reader user).
   Rows are icon **plus** text, never colour alone. The unread bell lives in
@@ -994,6 +996,36 @@ portable to PowerShell, so use two terminals.
    **Still owed:** firmware (out of scope — the simulator stands in), the
    broker chosen for the pilot being stood up (HiveMQ Cloud; §9), and the
    `kv`-mismatch decision in the open questions.
+9b. ✅ **Renter and admin features** (2026-11-13) — **auto-lock**: a safe left
+   unlocked `AUTO_LOCK_AFTER_MINUTES` (2, `@safelock/shared`) after an acked
+   `UNLOCK` gets a system `LOCK` (actor `AUTO_LOCK`), skipped if the door is
+   `OPEN`, the safe is offline, a lock was issued since, or the booking is no
+   longer live; written to the feed as `AUTO_LOCK` with source `SYSTEM`, and
+   counted down on the dashboard from `DeviceSummary.autoLockAt`. Timed from
+   the unlock **ack**, never `lockStateUpdatedAt`, which every state poll
+   moves. **Sensor history and alerts**: `SensorReading` (at most one per
+   minute), `GET /devices/sensor-history?hours=1..24` (never before the
+   caller's booking started), an SVG chart on the safe card, and in-app
+   `SENSOR_TEMPERATURE_HIGH` / `SENSOR_HUMIDITY_HIGH` notifications at
+   45°C / 80% with a 30-minute cooldown, renter only. `SIM_HEAT_SPIKE=true`
+   demos it. **My bookings**: `GET /bookings/mine`, `GET /bookings/:id/receipt`
+   (404 for anyone else's), `/bookings` and a printable receipt page — only
+   `PAID`/`REFUNDED` lines, and labelled "not a tax invoice" until a GSTIN
+   exists. **Admin Stats**: `GET /admin/stats`, aggregates only, days in IST.
+9c. ✅ **Door, vibration and tamper alerts** (2026-11-13) — the ESP32 firmware
+   gains the reed switch (GPIO 27), vibration sensor (GPIO 26, latched between
+   polls) and SSD1306 OLED; `/state` reports `doorOpen` and `vibration`, and
+   the gateway reports the real `doorState`. `security.service.ts` calls a
+   reading **tampering only while the bolt is LOCKED**: door open =
+   `DOOR_FORCED`, vibration = `VIBRATION_DETECTED`. One incident alerts once
+   (`TAMPER_ALERT_COOLDOWN_MINUTES`): a `SYSTEM` event plus a linked bell
+   notification for the live renter, a `TAMPER_DETECTED` admin flag for
+   `TAMPER_FLAG_HOURS`, and an audit row either way. It gates nothing — a
+   false positive costs a notification, never access. In-app only; WhatsApp
+   would need an eleventh template. **Demo**: `POST
+   /admin/devices/:id/simulate` `{ scenario: VIBRATION | FORCED_DOOR | HEAT }`,
+   409 `SIMULATION_UNAVAILABLE` unless it is the `DEVICE_GATEWAY=sim` board;
+   the admin Devices tab shows the buttons on that row only.
 10. Convert to mobile app (reuse `/api/v1`)
 
 **Built in step 7:** WhatsApp phone verification. `phoneVerifiedAt` exists and

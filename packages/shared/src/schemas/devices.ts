@@ -184,3 +184,10 @@ export type ListDevicesQuery = z.infer<typeof listDevicesQuerySchema>;
 export type ListUsersQuery = z.infer<typeof listUsersQuerySchema>;
 export type ListPaymentsQuery = z.infer<typeof listPaymentsQuerySchema>;
 export type ListAuditQuery = z.infer<typeof listAuditQuerySchema>;
+
+/** Body of `POST /admin/devices/:id/simulate`. Simulated safes only. */
+export const simulateDeviceSchema = z
+  .object({ scenario: z.enum(['VIBRATION', 'FORCED_DOOR', 'HEAT']) })
+  .strict();
+
+export type SimulateDeviceInput = z.infer<typeof simulateDeviceSchema>;

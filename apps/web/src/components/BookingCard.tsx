@@ -16,7 +16,7 @@ import { useAuth } from '@/context/AuthContext';
 import { api } from '@/lib/api';
 import { toUserMessage } from '@/lib/apiError';
 import { formatDuration, formatShortDateTime, msUntil } from '@/lib/datetime';
-import { USE_MOCK_API } from '@/lib/env';
+import { FAKE_PAYMENTS } from '@/lib/env';
 import { MOCK_CHECKOUT_SIGNATURE } from '@/lib/mockApi';
 import { useBookingCheckout } from '@/lib/useBookingCheckout';
 
@@ -109,7 +109,7 @@ function PendingBooking({
   }
 
   return (
-    <section className="rounded-2xl border border-brand-300 bg-brand-50 p-5 dark:border-brand-800 dark:bg-brand-950/40">
+    <section className="rounded-2xl border border-red-200 border-l-4 border-l-red-600 bg-white p-5 shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 className="text-base font-bold text-slate-900 dark:text-white">
@@ -131,13 +131,21 @@ function PendingBooking({
       */}
       <p className="mt-3 text-sm text-slate-700 dark:text-slate-300">
         Your {booking.hours}-hour rental starts when your payment goes through — not now. This
-        hold releases the safe in <strong>{formatDuration(holdLeft)}</strong> if it is unpaid.
+        hold releases the safe in <strong className="text-red-700">{formatDuration(holdLeft)}</strong> if it is unpaid.
       </p>
+
+      {booking.holdExpiresAt ? (
+        <CountdownMeter
+          label="Hold expires in"
+          from={booking.createdAt}
+          until={booking.holdExpiresAt}
+        />
+      ) : null}
 
       <CheckoutStatus checkout={checkout} />
 
       <div className="mt-4 flex flex-col gap-2 sm:flex-row">
-        {checkout.stage.kind === 'awaiting-payment' && USE_MOCK_API ? (
+        {checkout.stage.kind === 'awaiting-payment' && FAKE_PAYMENTS ? (
           <Button
             onClick={() =>
               checkout.simulate(
@@ -274,8 +282,8 @@ function RunningBooking({
     <section
       className={
         overstaying
-          ? 'rounded-2xl border border-amber-300 bg-amber-50 p-5 dark:border-amber-800 dark:bg-amber-950/40'
-          : 'rounded-2xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900'
+          ? 'rounded-2xl border border-red-300 border-l-4 border-l-red-700 bg-red-50 p-5 shadow-sm'
+          : 'rounded-2xl border border-red-200 border-l-4 border-l-red-600 bg-white p-5 shadow-sm'
       }
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -301,13 +309,17 @@ function RunningBooking({
           <dt className="text-slate-500 dark:text-slate-400">
             {overstaying ? 'Over by' : 'Time left'}
           </dt>
-          <dd className="mt-0.5 font-medium text-slate-900 dark:text-slate-100">
+          <dd className="mt-0.5 font-semibold text-red-700">
             {overstaying
               ? `${booking.overstayHours} hour${booking.overstayHours === 1 ? '' : 's'} charged`
               : formatDuration(timeLeft)}
           </dd>
         </div>
       </dl>
+
+      {!overstaying && booking.endsAt ? (
+        <CountdownMeter label="Time left" from={booking.startsAt} until={booking.endsAt} />
+      ) : null}
 
       {/* --- Overstaying, fee owed ------------------------------------------ */}
       {feeDue ? (
@@ -340,7 +352,7 @@ function RunningBooking({
           <CheckoutStatus checkout={feeCheckout} />
 
           <div className="mt-3">
-            {feeCheckout.stage.kind === 'awaiting-payment' && USE_MOCK_API ? (
+            {feeCheckout.stage.kind === 'awaiting-payment' && FAKE_PAYMENTS ? (
               <Button
                 onClick={() =>
                   feeCheckout.simulate(
@@ -423,7 +435,7 @@ function RunningBooking({
               </select>
             </div>
 
-            {extendCheckout.stage.kind === 'awaiting-payment' && USE_MOCK_API ? (
+            {extendCheckout.stage.kind === 'awaiting-payment' && FAKE_PAYMENTS ? (
               <Button
                 onClick={() =>
                   extendCheckout.simulate(
@@ -503,6 +515,57 @@ function RunningBooking({
  * minute resolution, so a per-second interval would re-render 59 times for
  * nothing, and nothing a renter decides turns on the seconds digit.
  */
+/**
+ * A red clock that visibly runs down: the remaining time to the second and a
+ * bar draining from full to empty across the whole window.
+ *
+ * Ticks every second for the eye only. It is deliberately **not** a live
+ * region — a screen reader announcing every second would be unusable — and the
+ * minute-level figure next to it is what assistive tech reads.
+ */
+function CountdownMeter({ label, from, until }: { label: string; from: string; until: string }) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const start = new Date(from).getTime();
+  const end = new Date(until).getTime();
+  const total = Math.max(1, end - start);
+  const left = Math.max(0, end - now);
+  const fraction = Math.min(1, left / total);
+
+  return (
+    <div className="mt-4 rounded-xl bg-red-50 p-4 ring-1 ring-red-100" aria-hidden="true">
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="text-xs font-semibold tracking-wide text-red-800 uppercase">{label}</span>
+        <span className="font-mono text-3xl font-bold text-red-600 tabular-nums">
+          {formatClock(left)}
+        </span>
+      </div>
+      <div className="mt-3 h-2.5 overflow-hidden rounded-full bg-red-100">
+        <div
+          className="h-full rounded-full bg-red-600 transition-[width] duration-1000 ease-linear"
+          style={{ width: `${fraction * 100}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** `1:05:09` or `05:09` — the countdown's face. */
+function formatClock(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1_000);
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  const mm = String(minutes).padStart(2, '0');
+  const ss = String(seconds).padStart(2, '0');
+  return hours > 0 ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
 function useCountdown(iso: string | null): number {
   const [remaining, setRemaining] = useState(() => (iso ? msUntil(iso) : 0));
 

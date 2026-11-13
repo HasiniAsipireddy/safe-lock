@@ -12,7 +12,7 @@ import {
 import { useAuth } from '@/context/AuthContext';
 import { api } from '@/lib/api';
 import { ApiError } from '@/lib/apiError';
-import { USE_MOCK_API } from '@/lib/env';
+import { REQUIRE_PHONE_VERIFICATION, USE_MOCK_API } from '@/lib/env';
 import { peekMockPhoneCode } from '@/lib/mockApi';
 import { Button } from '@/components/ui/Button';
 import { FormError } from '@/components/ui/FormError';
@@ -48,7 +48,7 @@ export function PhoneVerificationCard() {
   const alreadyVerified = user?.phoneVerified ?? false;
 
   return (
-    <section className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6 dark:border-slate-800 dark:bg-slate-900">
+    <section className="rounded-2xl border border-brand-200 bg-white p-5 sm:p-6 dark:border-slate-800 dark:bg-slate-900">
       <div className="flex items-start justify-between gap-3">
         <h2 className="text-base font-bold text-slate-900 dark:text-white">
           {alreadyVerified ? 'Phone number' : 'Verify your phone number'}
@@ -344,7 +344,7 @@ function CodeStep({
 export function VerifyPhonePrompt({ className }: { className?: string }) {
   const { user } = useAuth();
 
-  if (!user || user.phoneVerified) return null;
+  if (!user || user.phoneVerified || !REQUIRE_PHONE_VERIFICATION) return null;
 
   return (
     <section

@@ -252,3 +252,90 @@ export interface AdminBookingRow {
   flagged: boolean;
   createdAt: string;
 }
+
+// --- The renter's own booking history ---------------------------------------
+
+/** One payment as the renter sees it on their history and receipts. */
+export interface MyPaymentLine {
+  id: string;
+  purpose: PaymentPurpose;
+  amountPaise: number;
+  currency: string;
+  status: 'PAID' | 'REFUNDED';
+  /** Razorpay's id, so a renter can quote it to support. Null for fake payments. */
+  razorpayPaymentId: string | null;
+  paidAt: string | null;
+}
+
+/** A booking plus the money that moved for it. */
+export interface MyBookingItem {
+  booking: BookingSummary;
+  /** Only `PAID` and `REFUNDED` rows: an abandoned checkout is not a charge. */
+  payments: MyPaymentLine[];
+  /** Sum of `PAID` lines, in paise. Refunded lines are listed but not counted. */
+  totalPaidPaise: number;
+  /** When the booking ended, if it has. */
+  completedAt: string | null;
+}
+
+/** `GET /bookings/mine`. Newest first, capped at `MY_BOOKINGS_LIMIT`. */
+export interface MyBookingsResponse {
+  items: MyBookingItem[];
+}
+
+/** `GET /bookings/:id/receipt`. */
+export interface BookingReceiptResponse {
+  item: MyBookingItem;
+  customer: { name: string; email: string; phoneMasked: string };
+  /** When this receipt was generated, not when anything was paid. */
+  issuedAt: string;
+}
+
+// --- Admin statistics --------------------------------------------------------
+
+export interface AdminStatsDay {
+  /** `YYYY-MM-DD` in India Standard Time. */
+  date: string;
+  /** Bookings whose first payment landed that day. */
+  bookings: number;
+  revenuePaise: number;
+}
+
+export interface AdminStatsDevice {
+  serialNumber: string;
+  status: 'AVAILABLE' | 'NEEDS_INSPECTION' | 'RETIRED';
+  /** Hours held by a booking (including holds and overstays) in the window. */
+  occupiedHours: number;
+  /** `occupiedHours` over the window, 0–100, one decimal. */
+  utilisationPct: number;
+}
+
+/** `GET /admin/stats`. */
+export interface AdminStatsResponse {
+  generatedAt: string;
+  /** Length of the per-day and utilisation windows, in days. */
+  windowDays: number;
+  totals: {
+    users: number;
+    devices: number;
+    liveBookings: number;
+    completedBookings: number;
+    /** All `PAID` payments ever, in paise. Refunded money is excluded. */
+    revenuePaise: number;
+    refundedPaise: number;
+    /** Paid but un-appliable money awaiting a manual refund. */
+    needsRefund: number;
+  };
+  revenueByPurpose: Record<PaymentPurpose, number>;
+  perDay: AdminStatsDay[];
+  devices: AdminStatsDevice[];
+  /** Device events in the window. */
+  activity: {
+    unlocks: number;
+    failedUnlocks: number;
+    locks: number;
+    autoLocks: number;
+    /** Vibration and forced-door events written to renters' feeds. */
+    tamperAlerts: number;
+  };
+}

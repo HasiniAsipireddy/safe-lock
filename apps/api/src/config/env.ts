@@ -101,7 +101,65 @@ const envSchema = z
      * a typo is a boot failure, not a silent fallback to the mock in
      * production — which would look healthy and open nothing.
      */
-    DEVICE_GATEWAY: z.enum(['mock', 'mqtt']).default('mock'),
+    DEVICE_GATEWAY: z.enum(['mock', 'mqtt', 'http', 'sim']).default('mock'),
+
+    /**
+     * `DEVICE_GATEWAY=http`: one ESP32 on the local network, reached by IP.
+     *
+     * A demo bridge, not the production protocol. The ESP32 serves plain HTTP
+     * and authenticates the API with a shared token, so there is no per-command
+     * signature on the wire and no replay protection beyond the LAN. Refused in
+     * production by the superRefine below, exactly like the mock.
+     */
+    ESP32_URL: z.string().optional(),
+    ESP32_SERIAL: z
+      .string()
+      .regex(/^SAFE-[0-9A-Z]{4,12}$/, 'ESP32_SERIAL must look like SAFE-0001')
+      .default('SAFE-0001'),
+    /** Sent as `X-Device-Token`; must match DEVICE_TOKEN in the firmware. */
+    ESP32_TOKEN: z.string().optional(),
+    ESP32_POLL_MS: z.coerce.number().int().min(1_000).max(60_000).default(3_000),
+    ESP32_TIMEOUT_MS: z.coerce.number().int().min(500).max(30_000).default(4_000),
+
+    /**
+     * `DEVICE_GATEWAY=sim` only: the simulated DHT22 climbs to ~50°C and ~88%
+     * humidity, past both alert thresholds, so the sensor alert can be shown
+     * in a demo. Meaningless for any other gateway, which is why it is not
+     * refused in production — `sim` itself is.
+     */
+    SIM_HEAT_SPIKE: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((value) => value === 'true'),
+
+    /**
+     * Whether unlocking needs a verified phone. Default true.
+     *
+     * `false` is a development convenience for demos without WhatsApp: the
+     * unlock code is still generated, hashed and required, and is printed to
+     * the API console (behind `mayPrintOtp`) instead of being messaged.
+     * **Refused in production** — the code has to reach the renter somehow.
+     */
+    /**
+     * `fake` creates orders locally (`order_FAKE…`, no Razorpay call) and
+     * lets the web's "Simulate a successful payment" button settle them
+     * through the normal verify path. Demo only; refused in production.
+     */
+    PAYMENT_PROVIDER: z.enum(['razorpay', 'fake']).default('razorpay'),
+
+    /**
+     * Dev-only: return the unlock code in the unlock-request response so the
+     * dialog can show it. The code is still required. Refused in production.
+     */
+    DEMO_SHOW_OTP: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((value) => value === 'true'),
+
+    PHONE_VERIFICATION_REQUIRED: z
+      .enum(['true', 'false'])
+      .default('true')
+      .transform((value) => value === 'true'),
 
     // --- Device command protocol (docs/device-protocol.md) -------------------
 
@@ -533,7 +591,88 @@ const envSchema = z
       });
     }
 
+    if (
+      value.DEVICE_GATEWAY === 'sim' &&
+      (value.DEVICE_COMMAND_HMAC_SECRET?.trim().length ?? 0) < 32
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['DEVICE_COMMAND_HMAC_SECRET'],
+        message: 'DEVICE_COMMAND_HMAC_SECRET (32+ chars) is required when DEVICE_GATEWAY=sim',
+      });
+    }
+
+    if (value.DEVICE_GATEWAY === 'http') {
+      const url = value.ESP32_URL?.trim();
+      if (!url || !/^http:\/\/[^/\s]+\/?$/i.test(url)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['ESP32_URL'],
+          message: 'ESP32_URL is required when DEVICE_GATEWAY=http, e.g. http://192.168.1.50',
+        });
+      }
+
+      if (!value.ESP32_TOKEN || value.ESP32_TOKEN.trim().length < 16) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['ESP32_TOKEN'],
+          message: 'ESP32_TOKEN (16+ chars, same as DEVICE_TOKEN in the firmware) is required when DEVICE_GATEWAY=http',
+        });
+      }
+
+      // The gateway signs the acks it relays with the device's derived key,
+      // so the inbound handler verifies them exactly as it would over MQTT.
+      if ((value.DEVICE_COMMAND_HMAC_SECRET?.trim().length ?? 0) < 32) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['DEVICE_COMMAND_HMAC_SECRET'],
+          message: 'DEVICE_COMMAND_HMAC_SECRET (32+ chars) is required when DEVICE_GATEWAY=http',
+        });
+      }
+    }
+
     if (value.NODE_ENV !== 'production') return;
+
+    if (value.DEVICE_GATEWAY === 'http') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['DEVICE_GATEWAY'],
+        message:
+          'DEVICE_GATEWAY=http is not allowed in production; it is an unsigned LAN bridge for demos',
+      });
+    }
+
+    if (value.DEVICE_GATEWAY === 'sim') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['DEVICE_GATEWAY'],
+        message: 'DEVICE_GATEWAY=sim is not allowed in production; there is no safe behind it',
+      });
+    }
+
+    if (value.PAYMENT_PROVIDER === 'fake') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['PAYMENT_PROVIDER'],
+        message: 'PAYMENT_PROVIDER=fake is not allowed in production; it takes no money',
+      });
+    }
+
+    if (value.DEMO_SHOW_OTP) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['DEMO_SHOW_OTP'],
+        message: 'DEMO_SHOW_OTP=true is not allowed in production; it returns unlock codes to the browser',
+      });
+    }
+
+    if (!value.PHONE_VERIFICATION_REQUIRED) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['PHONE_VERIFICATION_REQUIRED'],
+        message: 'PHONE_VERIFICATION_REQUIRED=false is not allowed in production',
+      });
+    }
 
     /**
      * The mock gateway must be unreachable in production, exactly as the fake

@@ -197,6 +197,8 @@ export const ERROR_CODES = {
    * inspection is exactly one an admin may need to close.
    */
   DEVICE_NOT_OPERABLE: 'DEVICE_NOT_OPERABLE',
+  /** A demo scenario was requested for a safe that is not simulated. */
+  SIMULATION_UNAVAILABLE: 'SIMULATION_UNAVAILABLE',
   /** No command with that id, or it does not belong to the caller. */
   COMMAND_NOT_FOUND: 'COMMAND_NOT_FOUND',
   /**
@@ -319,3 +321,52 @@ export const ADMIN_COMMAND_HISTORY_LIMIT = 20;
  * registered accounts.
  */
 export const GENERIC_LOGIN_ERROR = 'Invalid credentials. Please check your details and try again.';
+
+// --- Auto-lock, sensor alerts ------------------------------------------------
+
+/**
+ * A safe left unlocked this long after a confirmed unlock is locked by the
+ * server, as a system command with the ordinary retry and escalation.
+ *
+ * Shared rather than env because the dashboard promises it in words ("locks
+ * itself in 2 minutes") and counts down to it, and two copies of a promise
+ * drift. Skipped while the door is reported OPEN — a bolt thrown into an open
+ * door secures nothing.
+ */
+export const AUTO_LOCK_AFTER_MINUTES = 2;
+
+/**
+ * DHT22 readings at or above these raise an in-app alert to the renter.
+ * Shared because the chart draws the same lines the server alerts on.
+ */
+export const SENSOR_ALERT_TEMPERATURE_C = 45;
+export const SENSOR_ALERT_HUMIDITY_PCT = 80;
+
+/** At most one alert of each kind per renter in this window. */
+export const SENSOR_ALERT_COOLDOWN_MINUTES = 30;
+
+/** Readings are polled every few seconds but stored at most this often. */
+export const SENSOR_SAMPLE_INTERVAL_SECONDS = 60;
+
+/** The furthest back `GET /devices/sensor-history` will look. */
+export const SENSOR_HISTORY_MAX_HOURS = 24;
+
+/** How many bookings `GET /bookings/mine` returns. A renter has few. */
+export const MY_BOOKINGS_LIMIT = 50;
+
+/** The admin stats window, in days. */
+export const ADMIN_STATS_WINDOW_DAYS = 14;
+
+// --- Tamper detection --------------------------------------------------------
+
+/**
+ * One tampering incident alerts once: repeat readings of the same kind within
+ * this window extend the incident instead of sending another alert.
+ */
+export const TAMPER_ALERT_COOLDOWN_MINUTES = 5;
+
+/** The dashboard shows a tamper banner for this long after the last reading. */
+export const TAMPER_BANNER_MINUTES = 30;
+
+/** An admin flag stays on a device for this long after the last reading. */
+export const TAMPER_FLAG_HOURS = 24;

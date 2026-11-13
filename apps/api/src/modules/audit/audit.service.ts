@@ -199,6 +199,14 @@ export const AUDIT_ACTIONS = {
    * a reconciling lock was issued. See docs/device-protocol.md §8.3.
    */
   DEVICE_UNEXPECTED_UNLOCKED_RECONCILED: 'device.unexpected_unlocked.reconciled',
+  /** A safe left open past AUTO_LOCK_AFTER_MINUTES was sent a system LOCK. */
+  DEVICE_AUTO_LOCK_ISSUED: 'device.auto_lock.issued',
+  /** A DHT22 reading crossed an alert threshold and the renter was told. */
+  DEVICE_SENSOR_ALERT: 'device.sensor.alert',
+  /** Vibration or a forced door while locked; see security.service.ts. */
+  DEVICE_TAMPER_DETECTED: 'device.tamper.detected',
+  /** An admin triggered a demo scenario on the simulated safe. */
+  ADMIN_DEVICE_SIMULATION: 'admin.device.simulation',
   /**
    * A system lock exhausted its retries. The safe may be standing open, so the
    * device is flagged and sent for inspection.

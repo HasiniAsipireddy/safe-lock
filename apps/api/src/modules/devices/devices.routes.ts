@@ -2,6 +2,9 @@ import { Router } from 'express';
 import {
   confirmUnlockSchema,
   historyQuerySchema,
+  sensorHistoryQuerySchema,
+  type SensorHistoryQuery,
+  type SensorHistoryResponse,
   type ConfirmUnlockInput,
   type HistoryQuery,
   type CommandAcceptedResponse,
@@ -18,6 +21,7 @@ import { routeParam } from '../../lib/routeParam';
 import { AUDIT_ACTIONS, auditContext, writeAudit } from '../audit/audit.service';
 import { readCommandStatus } from '../commands/command.mapper';
 import { getHistoryPage } from './history.service';
+import { sensorHistoryFor } from './sensor.service';
 import {
   UnlockFailed,
   confirmUnlock,
@@ -63,6 +67,28 @@ export function createDevicesRouter(limiters: Limiters): Router {
       next(error);
     }
   });
+
+  /**
+   * Temperature and humidity inside the caller's safe, for the dashboard chart.
+   *
+   * Empty rather than an error with no live booking, like `/history`. Never
+   * reaches back before the caller's booking started.
+   */
+  router.get(
+    '/sensor-history',
+    requireAuth,
+    limiters.deviceHistory,
+    validateQuery(sensorHistoryQuerySchema),
+    async (req, res, next) => {
+      try {
+        const { hours } = req.query as unknown as SensorHistoryQuery;
+        const response: SensorHistoryResponse = await sensorHistoryFor(req.user!.id, hours);
+        res.status(200).json(response);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
 
   /**
    * The caller's lock/unlock activity, newest first, cursor-paginated.
